@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 393" width="820" height="393">
+  <defs>
+    <clipPath id="clip-dryrun"><rect width="820" height="393" rx="8"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip-dryrun)">
+    <rect width="820" height="393" fill="#0C0C0C"/>
+    <rect width="820" height="36" fill="#1E1E1E"/>
+    <line x1="0" y1="36" x2="820" y2="36" stroke="#333" stroke-width="0.5"/>
+    <circle cx="20" cy="18" r="6" fill="#FF5F56"/>
+    <circle cx="38" cy="18" r="6" fill="#FFBD2E"/>
+    <circle cx="56" cy="18" r="6" fill="#27C93F"/>
+    <text x="410" y="24" font-family="'Segoe UI','Helvetica Neue',sans-serif" font-size="12" fill="#999" text-anchor="middle">PowerShell — updatescript.ps1 -DryRun</text>
+    <g font-family="'Cascadia Code','Consolas','Courier New',monospace" font-size="13" xml:space="preserve">
+      <text x="18" y="56" fill="#61D6D6">======================================================</text>
+      <text x="18" y="73" fill="#61D6D6">  Update-Everything v2.2.0  |  2026-03-04 15:54</text>
+      <text x="18" y="90" fill="#F9F1A5">  Running as standard user (some tasks skipped)</text>
+      <text x="18" y="107" fill="#61D6D6">======================================================</text>
+      <text x="18" y="134" fill="#C678DD">[DRY-RUN MODE] No changes will be made.</text>
+      <text x="18" y="161" fill="#767676">======================================================</text>
+      <text x="18" y="178" fill="#61D6D6"> Winget</text>
+      <text x="18" y="195" fill="#767676">======================================================</text>
+      <text x="18" y="212" fill="#CCCCCC">[*] [DRY-RUN] Would update: Winget</text>
+      <text x="18" y="229" fill="#767676">======================================================</text>
+      <text x="18" y="246" fill="#61D6D6"> npm (Node.js)</text>
+      <text x="18" y="263" fill="#767676">======================================================</text>
+      <text x="18" y="280" fill="#CCCCCC">[*] [DRY-RUN] Would update: npm</text>
+      <text x="18" y="297" fill="#767676">======================================================</text>
+      <text x="18" y="314" fill="#61D6D6"> Rust</text>
+      <text x="18" y="331" fill="#767676">======================================================</text>
+      <text x="18" y="348" fill="#CCCCCC">[*] [DRY-RUN] Would update: Rust</text>
+      <text x="18" y="365" fill="#767676">======================================================</text>
+      <text x="18" y="382" fill="#61D6D6"> Python / pip</text>
+    </g>
+  </g>
+  <rect width="820" height="393" rx="8" fill="none" stroke="#333" stroke-width="1"/>
+</svg>

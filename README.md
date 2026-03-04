@@ -2,7 +2,20 @@
 
 A comprehensive, all-in-one PowerShell script that updates **everything** on your Windows system in a single run — package managers, system components, development tools, and more.
 
-![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green)
+![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green) ![Version](https://img.shields.io/badge/Version-2.2.0-orange)
+
+<p align="center">
+  <img src="assets/demo-banner.svg" alt="Update-Everything — terminal demo" width="820">
+</p>
+
+---
+
+## Quick Install
+
+```powershell
+# One-liner install (downloads to ~/scripts and adds to PATH)
+irm https://raw.githubusercontent.com/YoshKoz/windows-update-script/main/install.ps1 | iex
+```
 
 ---
 
@@ -158,6 +171,10 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 
 ## How It Works
 
+<p align="center">
+  <img src="assets/flow-diagram.svg" alt="Execution flow diagram" width="820">
+</p>
+
 1. **Self-elevation** — If `-AutoElevate` is passed and the script isn't running as admin, it relaunches itself elevated via UAC, forwarding all parameters.
 2. **Smart detection** — Each update section checks whether its tool is installed (`Test-Command`) before attempting updates. Missing tools are silently skipped.
 3. **Managed-install detection** — For tools like Deno, Go, uv, Oh My Posh, etc., the script detects whether they're managed by Scoop or winget and skips redundant self-updates.
@@ -170,6 +187,18 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 ---
 
 ## Example Output
+
+### Dry-Run Mode
+
+<p align="center">
+  <img src="assets/demo-dryrun.svg" alt="Dry-run output preview" width="820">
+</p>
+
+### Completion Summary
+
+<p align="center">
+  <img src="assets/demo-summary.svg" alt="Update summary report" width="820">
+</p>
 
 ```
 ======================================================
@@ -227,4 +256,16 @@ This creates a Windows Scheduled Task named `DailySystemUpdate` that runs elevat
 
 ## License
 
-MIT License — free to use, modify, and distribute.
+MIT License — free to use, modify, and distribute. See [LICENSE](LICENSE).
+
+---
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
