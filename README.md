@@ -2,7 +2,7 @@
 
 A comprehensive, all-in-one PowerShell script that updates **everything** on your Windows system in a single run — package managers, system components, development tools, and more.
 
-![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green) ![Version](https://img.shields.io/badge/Version-2.6.3-orange)
+![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green) ![Version](https://img.shields.io/badge/Version-5.1.0-orange)
 
 <p align="center">
   <img src="assets/demo-banner.svg" alt="Update-Everything — terminal demo" width="820">
@@ -15,6 +15,13 @@ A comprehensive, all-in-one PowerShell script that updates **everything** on you
 ```powershell
 # One-liner install (downloads to ~/scripts and adds to PATH)
 irm https://raw.githubusercontent.com/YoshKoz/windows-update-script/main/install.ps1 | iex
+```
+
+Quick speed presets:
+
+```powershell
+updatescript.ps1 -FastMode
+updatescript.ps1 -UltraFast
 ```
 
 ---
@@ -84,7 +91,7 @@ irm https://raw.githubusercontent.com/YoshKoz/windows-update-script/main/install
 
 ## Requirements
 
-- **PowerShell 7+** (recommended for parallel dev-tool updates and `-Parallel` support; falls back to Windows PowerShell)
+- **PowerShell 7+** (recommended for parallel dev-tool updates, live status rows, and compact output; falls back to Windows PowerShell)
 - **Administrator** privileges for: Windows Update, Chocolatey, WSL, Defender, Store apps, DISM cleanup
 - **PSWindowsUpdate** module for Windows Update (`Install-Module PSWindowsUpdate -Force`)
 
@@ -141,6 +148,18 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 .\updatescript.ps1 -LogPath "C:\Logs\update.log"
 ```
 
+### Retry only the last failed or pending items
+
+```powershell
+.\updatescript.ps1 -RetryFailed
+```
+
+### Run only one section with compact output
+
+```powershell
+.\updatescript.ps1 -Only Winget -Compact
+```
+
 ---
 
 ## Parameters
@@ -154,7 +173,6 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 | `-NoElevate` | Switch | `$false` | Prevent auto-elevation even with `-AutoElevate` |
 | `-AutoElevate` | Switch | `$false` | Relaunch the script as Administrator (opens new window) |
 | `-NoPause` | Switch | `$false` | Skip the "Press Enter to close" prompt (for CI / VS Code) |
-| `-Parallel` | Switch | `$false` | Enable parallel updates where supported (PS7+) |
 | `-SkipWSL` | Switch | `$false` | Skip WSL kernel update |
 | `-SkipWSLDistros` | Switch | `$false` | Skip updating packages inside WSL distros |
 | `-SkipDefender` | Switch | `$false` | Skip Defender signature update |
@@ -170,6 +188,10 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 | `-Schedule` | Switch | `$false` | Register a daily scheduled task |
 | `-ScheduleTime` | String | `"03:00"` | Time for the scheduled task |
 | `-LogPath` | String | | Path to write a transcript log file |
+| `-Only` | String[] | | Run only matching sections (supports names, titles, and wildcards like `Winget`, `dotnet`, `Windows*`) |
+| `-RetryFailed` | Switch | `$false` | Retry only the failed or pending items saved from the last non-dry run |
+| `-Compact` | Switch | `$false` | Suppress section banners and most tool output; keep status lines and summary |
+| `-RawOutput` | Switch | `$false` | Print raw tool output instead of the filtered/cleaned view |
 | `-SkipNode` | Switch | `$false` | Skip Node.js ecosystem updates (`npm`, `pnpm`, `bun`, `deno`, `fnm`, `volta`) |
 | `-SkipRust` | Switch | `$false` | Skip Rust toolchain updates |
 | `-SkipGo` | Switch | `$false` | Skip Go toolchain updates |
@@ -178,7 +200,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 | `-DeepClean` | Switch | `$false` | Run DISM, Delivery Optimization cleanup, and prefetch cleanup |
 | `-UpdateOllamaModels` | Switch | `$false` | Opt in to updating every installed Ollama model |
 | `-WhatChanged` | Switch | `$false` | Show winget package version changes since the previous run |
-| `-NoParallel` | Switch | `$false` | Disable parallel execution for independent dev-tool updates |
+| `-ParallelThrottle` | Int | `4` | Maximum number of parallel dev-tool jobs to run at once |
 | `-DryRun` | Switch | `$false` | Print which sections would run without executing them |
 
 ---
@@ -195,9 +217,11 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 4. **Winget timeout protection** — Winget calls use `Start-Process` with file-based I/O redirection and a configurable timeout to prevent hanging on stuck installers.
 5. **Automatic retry** — Failed winget packages are detected by parsing output and retried individually with `--force`.
 6. **Windows Update resilience** — Uses `-IgnoreReboot` to prevent `0x800704c7` (ERROR_CANCELLED), with automatic service restart and retry.
-7. **Clean output** — ANSI escape sequences, progress bars, and spinner frames are stripped from tool output for clean terminal display.
-8. **Accurate failure reporting** — Per-distro WSL failures and timeouts now bubble up to the main summary instead of being shown as success.
-9. **Summary report** — At the end, a color-coded summary shows updated, checked, failed, and skipped components with total elapsed time and per-section timings.
+7. **Focused reruns** — `-Only` lets you target specific sections, and `-RetryFailed` replays the last failed or pending items from saved state.
+8. **Live CLI feedback** — Parallel batches now show a live status row while jobs are running, with optional compact mode for terse output.
+9. **Clean or raw output** — By default ANSI escape sequences, progress bars, and spinner frames are filtered; `-RawOutput` shows the unfiltered stream when you need it.
+10. **Issue tracking** — Failed and pending items are persisted between runs, surfaced at startup, and summarized with one-line remediation hints.
+11. **Summary report** — At the end, a color-coded summary shows updated, pending, checked, failed, and skipped components with total elapsed time and per-section timings.
 
 ---
 
@@ -211,8 +235,8 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 
 ```
 ======================================================
-  Update-Everything v2.6.3  |  2026-03-23 16:30
-  Running as Administrator
+  Update-Everything v5.1.0  |  2026-04-07 16:30
+  Mode: admin | compact | only: Winget
 ======================================================
 
 ======================================================
@@ -234,6 +258,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update
 ======================================================
 
 [OK] Succeeded (15): Scoop, Winget, Chocolatey, WindowsUpdate, ...
+[!] Pending   (1): dotnet (repair failed: dotnet-ef)
 [!] Skipped   (3): WSL, Poetry, Composer
 ```
 
