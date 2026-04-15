@@ -1,302 +1,85 @@
-# Windows Update Script (Update-Everything)
+# updateEverything
 
-A comprehensive, all-in-one PowerShell script that updates **everything** on your Windows system in a single run — package managers, system components, development tools, and more.
+Simple Windows update script for package managers, system components, and dev tools.
 
-![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![License](https://img.shields.io/badge/License-MIT-green) ![Version](https://img.shields.io/badge/Version-5.1.0-orange)
-
-<p align="center">
-  <img src="assets/demo-banner.svg" alt="Update-Everything — terminal demo" width="820">
-</p>
-
----
-
-## Quick Install
+## Quick start
 
 ```powershell
-# One-liner install (downloads to ~/scripts and adds to PATH)
-irm https://raw.githubusercontent.com/YoshKoz/windows-update-script/main/install.ps1 | iex
+./updatescript.ps1
+./updatescript.ps1 -AutoElevate
+./updatescript.ps1 -FastMode
+./updatescript.ps1 -UltraFast
 ```
 
-Quick speed presets:
+## What it updates
+
+- Package managers: Winget, Scoop, Chocolatey
+- System: Windows Update, Store apps, WSL, Defender
+- Dev tools: npm/pnpm/bun/deno, rust, go, dotnet, python/pip, uv, pipx, gh extensions, VS Code extensions, and more
+- Cleanup: temp files, DNS cache, recycle bin, optional deep clean
+
+## Common options
 
 ```powershell
-updatescript.ps1 -FastMode
-updatescript.ps1 -UltraFast
+./updatescript.ps1 -SkipWindowsUpdate -SkipCleanup
+./updatescript.ps1 -SkipNode -SkipRust -SkipGo
+./updatescript.ps1 -DryRun
+./updatescript.ps1 -WhatChanged
+./updatescript.ps1 -Schedule -ScheduleTime "03:00"
 ```
 
----
+## Parameters (actual script)
 
-## Features
-
-### Package Managers
-
-| Manager | What it does |
-|---|---|
-| **Winget** | Upgrades all packages (winget + MS Store sources) with timeout protection, automatic retry of failed packages, and more reliable long-name package detection |
-| **Scoop** | Updates all buckets and packages, cleans up old versions and cache |
-| **Chocolatey** | Upgrades all packages (requires admin) |
-
-### Windows Components
-
-| Component | What it does |
-|---|---|
-| **Windows Update** | Installs all non-driver updates via PSWindowsUpdate with retry logic for 0x800704c7 errors |
-| **Microsoft Store Apps** | Triggers Store app update scans via MDM/CIM |
-| **WSL** | Updates the WSL kernel and optionally runs `apt-get upgrade` / `pacman -Syu` / `zypper update` inside each distro, preflighting broken distros and skipping non-interactive `sudo` prompts instead of hanging |
-| **Microsoft Defender** | Updates antivirus signatures |
-
-### Development Tools
-
-| Tool | What it does |
-|---|---|
-| **npm** | Updates npm itself and all global packages |
-| **pnpm** | Updates global pnpm packages |
-| **Bun** | Self-upgrades Bun |
-| **Deno** | Self-upgrades Deno (detects Scoop/winget-managed installs) |
-| **Python / pip** | Upgrades pip itself and all outdated global pip packages (auto-detects Python install location) |
-| **uv** | Self-updates the uv package manager |
-| **uv tools** | Upgrades all uv-managed tool installs |
-| **Rust / rustup** | Runs `rustup update` |
-| **Cargo binaries** | Updates global Cargo binaries via `cargo-update` |
-| **Go** | Updates Go via winget (detects Scoop-managed installs) |
-| **.NET tools** | Updates all global .NET tools, checks NuGet API for latest versions |
-| **.NET workloads** | Runs `dotnet workload update` |
-| **GitHub CLI extensions** | Runs `gh extension upgrade --all` |
-| **VS Code extensions** | Runs the VS Code CLI shim (`code.cmd` / `code-insiders.cmd`) to update extensions without launching the UI |
-| **pipx** | Upgrades all pipx-managed Python CLI tools |
-| **Poetry** | Self-updates Poetry |
-| **Composer** | Self-updates Composer and global PHP packages |
-| **RubyGems** | Updates RubyGems system and all gems |
-| **Oh My Posh** | Self-upgrades Oh My Posh |
-| **yt-dlp** | Updates yt-dlp (detects pip/scoop/standalone installs) |
-| **fnm** | Detects and reports fnm management method |
-| **mise** | Self-updates mise and upgrades all plugins/tools |
-| **juliaup** | Updates Julia via juliaup |
-| **PowerShell modules** | Updates all installed PSResources (PSResourceGet) and PowerShellGet modules, with parallel support |
-
-### System Cleanup
-
-| Action | What it does |
-|---|---|
-| **Temp files** | Removes temp files older than 7 days |
-| **DNS cache** | Flushes the DNS client cache |
-| **Recycle Bin** | Empties the Recycle Bin |
-| **Crash dumps** | Clears local crash dump files |
-| **WER reports** | Clears Windows Error Reporting queue |
-| **DISM** | Cleans the WinSxS component store (admin only) |
-| **Delivery Optimization** | Clears the DO cache (admin only) |
-| **Prefetch** | Clears prefetch files (admin only, unless `-SkipDestructive`) |
-
----
+- SkipWindowsUpdate
+- SkipReboot
+- SkipDestructive
+- FastMode
+- UltraFast
+- NoElevate
+- AutoElevate
+- NoPause
+- SkipWSL
+- SkipWSLDistros
+- SkipDefender
+- SkipStoreApps
+- SkipUVTools
+- SkipVSCodeExtensions
+- SkipPoetry
+- SkipComposer
+- SkipRuby
+- SkipPowerShellModules
+- SkipCleanup
+- WingetTimeoutSec (default: 300)
+- Schedule
+- ScheduleTime (default: 03:00)
+- LogPath
+- SkipNode
+- SkipRust
+- SkipGo
+- SkipFlutter
+- SkipGitLFS
+- DeepClean
+- UpdateOllamaModels
+- WhatChanged
+- DryRun
+- ParallelThrottle (1-10, default: 4)
 
 ## Requirements
 
-- **PowerShell 7+** (recommended for parallel dev-tool updates, live status rows, and compact output; falls back to Windows PowerShell)
-- **Administrator** privileges for: Windows Update, Chocolatey, WSL, Defender, Store apps, DISM cleanup
-- **PSWindowsUpdate** module for Windows Update (`Install-Module PSWindowsUpdate -Force`)
+- Windows
+- PowerShell 7+ recommended
+- Admin rights recommended for full run
+- PSWindowsUpdate module for Windows Update section
 
----
+## Notes
 
-## Installation
-
-```powershell
-# Clone this repo
-git clone https://github.com/YoshKoz/windows-update-script.git
-cd windows-update-script
-
-# Or just download the script directly
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YoshKoz/windows-update-script/main/updatescript.ps1" -OutFile updatescript.ps1
-```
-
----
-
-## Usage
-
-### Basic (run in current terminal)
-
-```powershell
-.\updatescript.ps1
-```
-
-### Run elevated (opens a new UAC-prompt window)
-
-```powershell
-.\updatescript.ps1 -AutoElevate
-```
-
-### Quick run (skip slow operations)
-
-```powershell
-.\updatescript.ps1 -FastMode
-```
-
-### Skip specific components
-
-```powershell
-.\updatescript.ps1 -SkipWindowsUpdate -SkipWSL -SkipCleanup
-```
-
-### Schedule daily automatic updates
-
-```powershell
-.\updatescript.ps1 -Schedule -ScheduleTime "03:00"
-```
-
-### Log output to file
-
-```powershell
-.\updatescript.ps1 -LogPath "C:\Logs\update.log"
-```
-
-### Retry only the last failed or pending items
-
-```powershell
-.\updatescript.ps1 -RetryFailed
-```
-
-### Run only one section with compact output
-
-```powershell
-.\updatescript.ps1 -Only Winget -Compact
-```
-
----
-
-## Parameters
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `-SkipWindowsUpdate` | Switch | `$false` | Skip Windows Update |
-| `-SkipReboot` | Switch | `$false` | Suppress automatic reboot after updates |
-| `-SkipDestructive` | Switch | `$false` | Skip destructive cleanup tasks (Go mod cache, prefetch) |
-| `-FastMode` | Switch | `$false` | Skip slow operations (RubyGems, Volta, fnm, mise, etc.) |
-| `-NoElevate` | Switch | `$false` | Prevent auto-elevation even with `-AutoElevate` |
-| `-AutoElevate` | Switch | `$false` | Relaunch the script as Administrator (opens new window) |
-| `-NoPause` | Switch | `$false` | Skip the "Press Enter to close" prompt (for CI / VS Code) |
-| `-SkipWSL` | Switch | `$false` | Skip WSL kernel update |
-| `-SkipWSLDistros` | Switch | `$false` | Skip updating packages inside WSL distros |
-| `-SkipDefender` | Switch | `$false` | Skip Defender signature update |
-| `-SkipStoreApps` | Switch | `$false` | Skip Microsoft Store app scan |
-| `-SkipUVTools` | Switch | `$false` | Skip uv tool upgrades |
-| `-SkipVSCodeExtensions` | Switch | `$false` | Skip VS Code extension updates |
-| `-SkipPoetry` | Switch | `$false` | Skip Poetry self-update |
-| `-SkipComposer` | Switch | `$false` | Skip Composer updates |
-| `-SkipRuby` | Switch | `$false` | Skip RubyGems updates |
-| `-SkipPowerShellModules` | Switch | `$false` | Skip PowerShell module updates |
-| `-SkipCleanup` | Switch | `$false` | Skip the system cleanup section |
-| `-WingetTimeoutSec` | Int | `300` | Per-call timeout for winget in seconds |
-| `-Schedule` | Switch | `$false` | Register a daily scheduled task |
-| `-ScheduleTime` | String | `"03:00"` | Time for the scheduled task |
-| `-LogPath` | String | | Path to write a transcript log file |
-| `-Only` | String[] | | Run only matching sections (supports names, titles, and wildcards like `Winget`, `dotnet`, `Windows*`) |
-| `-RetryFailed` | Switch | `$false` | Retry only the failed or pending items saved from the last non-dry run |
-| `-Compact` | Switch | `$false` | Suppress section banners and most tool output; keep status lines and summary |
-| `-RawOutput` | Switch | `$false` | Print raw tool output instead of the filtered/cleaned view |
-| `-SkipNode` | Switch | `$false` | Skip Node.js ecosystem updates (`npm`, `pnpm`, `bun`, `deno`, `fnm`, `volta`) |
-| `-SkipRust` | Switch | `$false` | Skip Rust toolchain updates |
-| `-SkipGo` | Switch | `$false` | Skip Go toolchain updates |
-| `-SkipFlutter` | Switch | `$false` | Skip Flutter SDK updates |
-| `-SkipGitLFS` | Switch | `$false` | Skip Git LFS updates |
-| `-DeepClean` | Switch | `$false` | Run DISM, Delivery Optimization cleanup, and prefetch cleanup |
-| `-UpdateOllamaModels` | Switch | `$false` | Opt in to updating every installed Ollama model |
-| `-WhatChanged` | Switch | `$false` | Show winget package version changes since the previous run |
-| `-ParallelThrottle` | Int | `4` | Maximum number of parallel dev-tool jobs to run at once |
-| `-DryRun` | Switch | `$false` | Print which sections would run without executing them |
-
----
-
-## How It Works
-
-<p align="center">
-  <img src="assets/flow-diagram.svg" alt="Execution flow diagram" width="820">
-</p>
-
-1. **Self-elevation** — If `-AutoElevate` is passed and the script isn't running as admin, it relaunches itself elevated via UAC, forwarding all parameters.
-2. **Smart detection** — Each update section checks whether its tool is installed (`Test-Command`) before attempting updates. Missing tools are silently skipped.
-3. **Managed-install detection** — For tools like Deno, Go, uv, Oh My Posh, etc., the script detects whether they're managed by Scoop or winget and skips redundant self-updates.
-4. **Winget timeout protection** — Winget calls use `Start-Process` with file-based I/O redirection and a configurable timeout to prevent hanging on stuck installers.
-5. **Automatic retry** — Failed winget packages are detected by parsing output and retried individually with `--force`.
-6. **Windows Update resilience** — Uses `-IgnoreReboot` to prevent `0x800704c7` (ERROR_CANCELLED), with automatic service restart and retry.
-7. **Focused reruns** — `-Only` lets you target specific sections, and `-RetryFailed` replays the last failed or pending items from saved state.
-8. **Live CLI feedback** — Parallel batches now show a live status row while jobs are running, with optional compact mode for terse output.
-9. **Clean or raw output** — By default ANSI escape sequences, progress bars, and spinner frames are filtered; `-RawOutput` shows the unfiltered stream when you need it.
-10. **Issue tracking** — Failed and pending items are persisted between runs, surfaced at startup, and summarized with one-line remediation hints.
-11. **Summary report** — At the end, a color-coded summary shows updated, pending, checked, failed, and skipped components with total elapsed time and per-section timings.
-
----
-
-## Example Output
-
-### Completion Summary
-
-<p align="center">
-  <img src="assets/demo-summary.svg" alt="Update summary report" width="820">
-</p>
-
-```
-======================================================
-  Update-Everything v5.1.0  |  2026-04-07 16:30
-  Mode: admin | compact | only: Winget
-======================================================
-
-======================================================
- Scoop
-======================================================
-[OK] Scoop updated (12.3s)
-
-======================================================
- Winget
-======================================================
-  Upgrading all (winget source, timeout: 300s)...
-  Successfully installed Package.Name v1.2.3
-[OK] Winget updated (45.2s)
-
-...
-
-======================================================
- UPDATE COMPLETE -- 00:03:42
-======================================================
-
-[OK] Succeeded (15): Scoop, Winget, Chocolatey, WindowsUpdate, ...
-[!] Pending   (1): dotnet (repair failed: dotnet-ef)
-[!] Skipped   (3): WSL, Poetry, Composer
-```
-
----
-
-## Scheduling
-
-To run the script automatically every day at 3 AM:
-
-```powershell
-.\updatescript.ps1 -Schedule -ScheduleTime "03:00"
-```
-
-This creates a Windows Scheduled Task named `DailySystemUpdate` that runs elevated with `-SkipReboot`.
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|---|---|
-| `0x800704c7` during Windows Update | Already handled with retry logic; ensure no pending reboots |
-| Winget hangs indefinitely | Increase `-WingetTimeoutSec` or check for stuck installers in Task Manager |
-| `PSWindowsUpdate module not found` | Run `Install-Module PSWindowsUpdate -Force` |
-| Admin-only tasks skipped | Run with `-AutoElevate` or start terminal as Administrator |
-| Scoop/winget not found | Install them first: [scoop.sh](https://scoop.sh), [winget](https://aka.ms/getwinget) |
-
----
+- This repo includes helper scripts for installer repair:
+  - fix_installer.ps1
+  - force_reinstall.ps1
 
 ## License
 
-MIT License — free to use, modify, and distribute. See [LICENSE](LICENSE).
-
----
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+MIT. See LICENSE.
 
 ---
 

@@ -1,0 +1,11 @@
+{
+  "WingetSkipPackages": [
+    "Microsoft.VisualStudio.BuildTools"
+  ],
+  "PipIgnoreHealthPackages": [
+    "pogotransfer",
+    "fastapi",
+    "hf-gradio",
+    "mega-py"
+  ]
+}
