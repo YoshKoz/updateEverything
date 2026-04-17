@@ -93,7 +93,7 @@ $script:Config = @{
     LogMaxSizeMB            = 10
     TempCleanupDays         = 7
     PipAllowPackages        = @()
-    PipSkipPackages         = @('tesserocr')
+    PipSkipPackages         = @()
     PipIgnoreHealthPackages = @()
     WingetSkipPackages      = @()
     SkipManagers            = @()
@@ -158,6 +158,11 @@ if (Test-Path $configFile) {
     }
     catch { Write-Warning "Failed to load config file: $_" }
 }
+
+# Force skip lists empty regardless of defaults or update-config.json: update everything.
+$script:Config.WingetSkipPackages = @()
+$script:Config.PipSkipPackages = @()
+$script:Config.SkipManagers = @()
 
 # --- Elevation -----------------------------------------------------------------
 if (-not $isAdmin -and $AutoElevate -and -not $NoElevate) {
