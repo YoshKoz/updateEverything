@@ -1,6 +1,12 @@
 # updateEverything
 
+![banner](assets/demo-banner.svg)
+
 A single PowerShell script that keeps your entire Windows machine up to date — package managers, system components, and dev toolchains — in one run.
+
+![dry run demo](assets/demo-dryrun.svg)
+
+![summary demo](assets/demo-summary.svg)
 
 ## Quick start
 
@@ -75,6 +81,8 @@ Supported keys mirror the `$script:Config` hashtable in the script. Any key set 
 ```
 
 The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` so it completes unattended.
+
+![flow diagram](assets/flow-diagram.svg)
 
 ## All parameters
 
