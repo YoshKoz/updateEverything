@@ -429,7 +429,7 @@ if (-not $SkipWinget) {
         # Auto-reinstall technology-mismatch packages (uninstall then install)
         $noiseRx = $WG_NOISE_PATTERN
         foreach ($id in @($upgradeIds | Where-Object { $allManual.Contains($_) })) {
-            Write-Info "$id: technology mismatch — reinstalling..."
+            Write-Info "${id}: technology mismatch — reinstalling..."
             $phases = @(
                 @{ Label='uninstalling'; Args=@('uninstall','--id',$id,'--silent','--disable-interactivity','--accept-source-agreements') }
                 @{ Label='installing';   Args=@('install',  '--id',$id,'--silent','--disable-interactivity','--accept-source-agreements','--accept-package-agreements') }
