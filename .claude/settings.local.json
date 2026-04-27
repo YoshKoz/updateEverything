@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(powershell -NoProfile -ExecutionPolicy Bypass -Command \"[System.IO.Directory]::Exists\\(''C:\\\\Windows\\\\Installer''\\)\")",
-      "WebSearch"
+      "WebSearch",
+      "PowerShell(pwsh -NoProfile -ExecutionPolicy Bypass -File C:/Development/updateEverything/updatescript.ps1 -DryRun -NoPause 2>&1 | Select-Object -Last 80)",
+      "PowerShell(\\([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent\\(\\)\\).IsInRole\\([Security.Principal.WindowsBuiltInRole]'Administrator'\\))",
+      "Bash(pwsh *)",
+      "Bash(winget upgrade *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(where winget *)",
+      "Bash(winget --version)"
     ]
   }
 }
