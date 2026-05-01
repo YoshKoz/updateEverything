@@ -598,7 +598,17 @@ if (`$failed.Count -gt 0) { throw "pip failed packages: `$(`$failed -join ', ')"
             } -Tags @('python'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'uv' -Category 'python' -RequiresCommand 'uv' -Script {
-                uv self update
+                $out = uv self update 2>&1 | Out-String
+                $ec  = $LASTEXITCODE
+                if ($ec -ne 0 -and $out -match 'standalone installation') {
+                    # uv installed via pip/Python package — self-update not supported; skip cleanly
+                    $uvPath = (Get-Command uv -ErrorAction SilentlyContinue).Source
+                    Write-Output "uv self-update skipped: '$uvPath' is a managed install (use pip/uv-pip to upgrade)"
+                    $global:LASTEXITCODE = 0
+                    return
+                }
+                if ($ec -ne 0) { throw "uv self update failed with exit code $ec" }
+                Write-Output $out.Trim()
             } -Tags @('python'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'uv-tools' -Category 'python' -RequiresCommand 'uv' -Disabled:$SkipUVTools -DisabledReason 'disabled by -SkipUVTools' -Script {

@@ -1,3 +1,10 @@
 {
-	"folders": []
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"git.ignoreLimitWarning": true
+	}
 }

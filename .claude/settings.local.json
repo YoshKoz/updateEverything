@@ -9,7 +9,8 @@
       "Bash(winget upgrade *)",
       "Bash(echo \"EXIT=$?\")",
       "Bash(where winget *)",
-      "Bash(winget --version)"
+      "Bash(winget --version)",
+      "Bash(git *)"
     ]
   }
 }
