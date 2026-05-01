@@ -10,7 +10,19 @@
       "Bash(echo \"EXIT=$?\")",
       "Bash(where winget *)",
       "Bash(winget --version)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything remote -v)",
+      "PowerShell(git -C C:\\\\Development rev-parse --show-toplevel 2>&1)",
+      "PowerShell(git -C C:\\\\Development remote -v 2>&1)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything ls-files)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything log --oneline --name-status)",
+      "PowerShell(git -C C:\\\\Repos\\\\updateEverything status)",
+      "PowerShell(git -C C:\\\\Repos\\\\updateEverything status --short)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything diff HEAD --stat)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything diff --cached --stat)",
+      "PowerShell(code C:\\\\Repos\\\\updateEverything)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything status --porcelain)",
+      "PowerShell(git -C C:\\\\Development\\\\updateEverything diff .claude/settings.local.json)"
     ]
   }
 }
