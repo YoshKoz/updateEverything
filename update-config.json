@@ -2,6 +2,9 @@
   "WingetSkipPackages": [
     "Microsoft.VisualStudio.BuildTools"
   ],
+  "PipSkipPackages": [
+    "tokenizers"
+  ],
   "PipIgnoreHealthPackages": [
     "pogotransfer",
     "fastapi",
