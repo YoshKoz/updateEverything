@@ -30,19 +30,20 @@ A single PowerShell script that keeps your entire Windows machine up to date —
 |----------|-------|
 | Package managers | Winget, Scoop, Chocolatey |
 | System | Windows Update, Microsoft Store apps, WSL distros, Windows Defender signatures |
-| JavaScript | npm, pnpm, bun, deno, Volta, fnm, mise |
-| Python | pip (top-level packages only), uv, uv tools, uv Python versions, pipx, Poetry |
+| JavaScript | npm, pnpm, yarn, bun, deno |
+| Python | pip, pipx, uv, uv tools, Poetry |
 | Systems languages | Rust + cargo binaries, Go |
 | .NET | dotnet tools, dotnet workloads |
-| Other runtimes | Flutter, Ruby gems, Composer, juliaup |
-| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs, git-credential-manager, oh-my-posh, yt-dlp, tldr |
-| Cleanup | Temp files, DNS cache, Recycle Bin (optional deep clean) |
+| Other runtimes | Flutter, Ruby gems, Composer |
+| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs |
+| AI | Ollama models when `-UpdateOllamaModels` is supplied |
+| Cleanup | Temp files, DNS cache, Recycle Bin, optional DISM component cleanup |
 
 ## Speed modes
 
 | Mode | What it skips |
 |------|---------------|
-| *(default)* | Nothing |
+| *(default)* | Optional Ollama model pulls; admin-only tasks still require elevation |
 | `-FastMode` | Chocolatey, WSL distros, npm, pnpm, bun, deno, Rust, Go, pip, uv, VS Code extensions, PowerShell modules, and more slow steps |
 | `-UltraFast` | Everything FastMode skips + Windows Update, Store apps, WSL, cleanup |
 
@@ -102,7 +103,7 @@ The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` 
 | `-SkipWSLDistros` | Skip updating WSL distros |
 | `-SkipDefender` | Skip Defender signature update |
 | `-SkipStoreApps` | Skip Microsoft Store app updates |
-| `-SkipNode` | Skip Node.js ecosystem (npm, pnpm, bun, deno, Volta, fnm, mise) |
+| `-SkipNode` | Skip Node.js ecosystem (npm, pnpm, yarn, bun, deno) |
 | `-SkipRust` | Skip Rust + cargo binaries |
 | `-SkipGo` | Skip Go |
 | `-SkipFlutter` | Skip Flutter |
@@ -114,13 +115,22 @@ The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` 
 | `-SkipRuby` | Skip Ruby gems |
 | `-SkipPowerShellModules` | Skip PowerShell module updates |
 | `-SkipCleanup` | Skip all cleanup steps |
-| `-DeepClean` | Run extra cleanup (Downloads age check, prefetch, event logs) |
-| `-UpdateOllamaModels` | Pull updates for installed Ollama models |
+| `-DeepClean` | Run extra cleanup with DISM component cleanup and Delivery Optimization cache cleanup |
+| `-UpdateOllamaModels` | Pull updates for installed Ollama models; skipped by default |
 | `-Schedule` | Register as a daily scheduled task |
 | `-ScheduleTime` | Time for scheduled task (default: `03:00`) |
 | `-LogPath` | Custom log file path |
-| `-WingetTimeoutSec` | Per-package winget timeout in seconds (default: 300) |
-| `-ParallelThrottle` | Max parallel jobs 1–10 (default: auto from CPU count) |
+| `-JsonSummaryPath` | Custom JSON summary path |
+| `-StateDir` | Custom state directory for logs and summaries |
+| `-WingetTimeoutSec` | Winget task timeout in seconds (default: 600) |
+| `-TaskTimeoutSec` | Default per-task timeout in seconds (default: 1800) |
+| `-OllamaTimeoutSec` | Per-command Ollama timeout in seconds (default: 600) |
+| `-ParallelThrottle` | Max parallel jobs 0–16; 0 auto-selects from CPU count |
+| `-RetryCount` | Task retry count for transient failures (default: 1) |
+| `-Only` | Run only matching task names, categories, or tags |
+| `-Skip` | Skip matching task names, categories, or tags |
+| `-ListTasks` | Show planned/skipped tasks and write a summary |
+| `-SelfTest` | Run a minimal internal task through the scheduler |
 
 ## Requirements
 
