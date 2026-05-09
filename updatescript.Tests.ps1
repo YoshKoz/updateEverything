@@ -197,18 +197,35 @@ Describe 'Invoke-TaskQueue' {
         $results[0].Status | Should -Be 'Succeeded'
         $results[0].OutputPreview | Should -Contain 'ok'
     }
+
+    It 'makes process and command helper functions available inside task jobs' {
+        $task = New-UpdateTask -Name 'helper-self-test' -Category 'diagnostics' -Script {
+            $pwshPath = Get-ToolCommandPath -Name 'pwsh'
+            if (-not $pwshPath) {
+                throw 'pwsh command was not resolved inside the task job'
+            }
+            Invoke-UpdateProcess -FilePath $pwshPath -ArgumentList @('-NoProfile', '-Command', 'Write-Output helper-ok')
+        } -TimeoutSec 30
+        $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{} -Force
+
+        $results = Invoke-TaskQueue -Tasks @($task) -Throttle 1 -Confirm:$false
+
+        $results | Should -HaveCount 1
+        $results[0].Status | Should -Be 'Succeeded'
+        $results[0].OutputPreview | Should -Contain 'helper-ok'
+    }
 }
 
 Describe 'Script integration' {
     It 'runs SelfTest cleanly' {
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -SelfTest -NoPause -NoElevate 2>&1
+        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -SelfTest -NoElevate 2>&1
         $LASTEXITCODE | Should -Be 0
         ($output | Out-String) | Should -Match 'All runnable tasks completed'
         ($output | Out-String) | Should -Not -Match 'WARNING:'
     }
 
     It 'treats empty filtered runs as informational' {
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -DryRun -NoPause -NoElevate -Only winget 2>&1
+        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -DryRun -NoElevate -Only definitely-not-a-real-update-task 2>&1
         $LASTEXITCODE | Should -Be 0
         ($output | Out-String) | Should -Match 'No runnable update tasks were found'
         ($output | Out-String) | Should -Not -Match 'WARNING:'
