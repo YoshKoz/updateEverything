@@ -4,10 +4,12 @@
     Updates common Windows 11 package managers, developer tools, runtimes, WSL distros, Defender, and maintenance tasks.
 
 .VERSION
-    Update-Everything v6.3.1-fixed
+    Update-Everything v6.3.2-fixed
 
 .NOTES
     Main fixes versus v6.2.0:
+      - Refreshes process PATH from Machine/User environment values before task discovery.
+      - Prefers real Python installs over the Microsoft Store app execution alias.
       - Correctly launches .cmd/.bat shims such as VS Code's code.cmd through cmd.exe.
       - Finds VS Code CLI from PATH and common install locations.
       - Avoids stale $LASTEXITCODE leakage between tasks.
@@ -27,7 +29,6 @@ param(
     [switch]$UltraFast,
     [switch]$NoElevate,
     [switch]$AutoElevate,
-    [switch]$NoPause,
     [switch]$SkipWSL,
     [switch]$SkipWSLDistros,
     [switch]$SkipDefender,
@@ -93,7 +94,7 @@ try
     Write-Verbose "Console encoding setup skipped: $($_.Exception.Message)"
 }
 
-$script:Version = '6.3.1-fixed'
+$script:Version = '6.3.2-fixed'
 $script:StartTime = Get-Date
 $script:RunId = $script:StartTime.ToString('yyyyMMdd-HHmmss-fff')
 $script:CommandCache = @{}
@@ -142,6 +143,42 @@ $script:Config = [ordered]@{
     NpmSkipPackages    = @()
     LogRetentionDays   = 14
     TempCleanupDays    = 7
+}
+
+function Initialize-ProcessPath
+{
+    $segments = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($scope in @('Process', 'Machine', 'User'))
+    {
+        $rawPath = [Environment]::GetEnvironmentVariable('Path', $scope)
+        if ([string]::IsNullOrWhiteSpace($rawPath))
+        { continue
+        }
+
+        foreach ($entry in ($rawPath -split ';'))
+        {
+            if ([string]::IsNullOrWhiteSpace($entry))
+            { continue
+            }
+            $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
+            $normalized = $expanded.TrimEnd('\')
+            if ([string]::IsNullOrWhiteSpace($normalized))
+            { continue
+            }
+            if ($seen.Add($normalized))
+            { $segments.Add($expanded) | Out-Null
+            }
+        }
+    }
+
+    if ($segments.Count -gt 0)
+    {
+        $mergedPath = $segments -join [System.IO.Path]::PathSeparator
+        [Environment]::SetEnvironmentVariable('Path', $mergedPath, 'Process')
+        $env:Path = $mergedPath
+    }
 }
 
 function ConvertTo-StringArray
@@ -381,6 +418,33 @@ function Get-VSCodeCommandPath
     return ($candidates | Select-Object -First 1)
 }
 
+function Get-PreferredCommandPath
+{
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ($Name -eq 'code')
+    { return Get-VSCodeCommandPath
+    }
+
+    if ($Name -eq 'python')
+    {
+        $candidates = @(@(
+            'C:\Program Files\Python314\python.exe',
+            'C:\Program Files\Python313\python.exe',
+            'C:\Program Files\Python312\python.exe',
+            (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python314\python.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+
+        if ($candidates.Count -gt 0)
+        { return ($candidates | Select-Object -First 1)
+        }
+    }
+
+    return $null
+}
+
 function Test-Command
 {
     param([Parameter(Mandatory)][string]$Name)
@@ -389,7 +453,11 @@ function Test-Command
     }
 
     $found = $false
-    if ($Name -eq 'code')
+    $preferred = Get-PreferredCommandPath -Name $Name
+    if ($preferred)
+    {
+        $found = $true
+    } elseif ($Name -eq 'code')
     {
         $found = -not [string]::IsNullOrWhiteSpace((Get-VSCodeCommandPath))
     } else
@@ -403,9 +471,11 @@ function Test-Command
 function Get-CommandPath
 {
     param([Parameter(Mandatory)][string]$Name)
-    if ($Name -eq 'code')
-    { return Get-VSCodeCommandPath
+    $preferred = Get-PreferredCommandPath -Name $Name
+    if ($preferred)
+    { return $preferred
     }
+
     $command = Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command)
     {
@@ -513,18 +583,20 @@ function Get-UpdateTasks
         }
 
         if ($skipSet.Count -gt 0)
-        { Write-Output "Winget skip list detected: $($skipSet -join ', ')"
+        { Write-Output "Config skip list ($($skipSet.Count)): $($skipSet -join ', ')"
         }
 
+        Write-Output 'Scanning for available winget upgrades...'
         $listOutput = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--include-unknown', '--accept-source-agreements') -SuccessExitCodes @(0, -1978335189)
         $ids = [System.Collections.Generic.List[string]]::new()
         $inTable = $false
         $idColumnStart = $null
         $idColumnEnd = $null
+        $ansiPattern = '\x1b\[[0-9;?]*[a-zA-Z]'
 
         foreach ($line in $listOutput)
         {
-            $text = [string]$line
+            $text = ([regex]::Replace([string]$line, $ansiPattern, '')).Trim()
             if ($text -match 'No installed package found matching input criteria|No available upgrade found|No applicable update found')
             {
                 continue
@@ -563,34 +635,49 @@ function Get-UpdateTasks
             }
         }
 
-        if ($ids.Count -eq 0)
-        {
-            Write-Output 'No winget upgrades found.'
-            return
-        }
-
-        $failed = [System.Collections.Generic.List[string]]::new()
+        $toUpgrade = [System.Collections.Generic.List[string]]::new()
+        $toSkipIds = [System.Collections.Generic.List[string]]::new()
         foreach ($id in ($ids | Sort-Object -Unique))
         {
             if ($skipSet.Contains($id))
-            {
-                Write-Output "Skipping winget package: $id"
-                continue
+            { [void]$toSkipIds.Add($id)
+            } else
+            { [void]$toUpgrade.Add($id)
             }
+        }
 
-            Write-Output "Upgrading winget package: $id"
+        if (($toUpgrade.Count + $toSkipIds.Count) -eq 0)
+        {
+            Write-Output 'No winget upgrades available.'
+            return
+        }
+
+        Write-Output ("Found {0} package(s): {1} to upgrade, {2} suppressed by config." -f ($toUpgrade.Count + $toSkipIds.Count), $toUpgrade.Count, $toSkipIds.Count)
+        if ($toSkipIds.Count -gt 0)
+        { Write-Output "  Config-suppressed: $($toSkipIds -join ', ')"
+        }
+        if ($toUpgrade.Count -eq 0)
+        { Write-Output 'All available upgrades are suppressed by the skip list.'; return
+        }
+
+        $failed = [System.Collections.Generic.List[string]]::new()
+        $upgradeIndex = 0
+        foreach ($id in $toUpgrade)
+        {
+            $upgradeIndex++
+            Write-Output ("[{0}/{1}] Upgrading: {2}" -f $upgradeIndex, $toUpgrade.Count, $id)
             try
             {
                 Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--id', $id, '--exact', '--include-unknown', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements') -Retries 1
             } catch
             {
-                Write-Output $_.Exception.Message
+                Write-Output "  FAILED: $($_.Exception.Message)"
                 [void]$failed.Add($id)
             }
         }
 
         if ($failed.Count -gt 0)
-        { throw "winget failed packages: $($failed -join ', ')"
+        { throw "winget upgrade failed for: $($failed -join ', ')"
         }
     }
     $tasks.Add((New-UpdateTask -Name 'winget' -Category 'package-manager' -RequiresCommand 'winget' -TimeoutSec $WingetTimeoutSec -Script $wingetScript -Tags @('windows') -Resources @('winget'))) | Out-Null
@@ -678,21 +765,23 @@ function Get-UpdateTasks
             } -Tags @('windows', 'security') -Resources @('defender'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'wsl' -Category 'system' -RequiresCommand 'wsl' -Disabled:$SkipWSL -DisabledReason 'disabled by -SkipWSL' -Script {
-                $wslOutput = Invoke-UpdateProcess -FilePath 'wsl' -ArgumentList @('--update') -Retries 0 -SuccessExitCodes @(0, -1)
-                $wslText = ($wslOutput | Out-String).Trim()
-                if ($wslText)
-                { Write-Output $wslText
-                }
-                $wslExitCode = [int]$global:LASTEXITCODE
-                if ($wslExitCode -ne 0)
+                try
                 {
-                    if ($wslText -match 'Forbidden \(403\)|0x80190193|Wsl/UpdatePackage')
+                    $wslOutput = Invoke-UpdateProcess -FilePath 'wsl' -ArgumentList @('--update') -Retries 0 -SuccessExitCodes @(0, -1)
+                    $wslText = ($wslOutput | Out-String).Trim()
+                    if ($wslText)
+                    { Write-Output $wslText
+                    }
+                } catch
+                {
+                    $errMsg = $_.Exception.Message
+                    Write-Output "wsl --update: $errMsg"
+                    if ($errMsg -match 'Forbidden|403|0x80190193|Wsl/UpdatePackage')
                     {
-                        Write-Output 'WSL kernel/package update endpoint returned 403. Treating as non-fatal; installed WSL distros can still be updated.'
-                        $global:LASTEXITCODE = 0
+                        Write-Output 'WSL kernel update endpoint error. Treating as non-fatal; installed WSL distros can still be updated by the wsl-distros task.'
                         return
                     }
-                    throw "wsl --update failed with exit code $wslExitCode"
+                    throw
                 }
             } -Tags @('windows', 'linux') -Resources @('wsl'))) | Out-Null
 
@@ -1329,6 +1418,20 @@ function Start-UpdateTaskJob
                 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
                 return ($candidates | Select-Object -First 1)
             }
+            if ($Name -eq 'python')
+            {
+                $candidates = @(@(
+                    'C:\Program Files\Python314\python.exe',
+                    'C:\Program Files\Python313\python.exe',
+                    'C:\Program Files\Python312\python.exe',
+                    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python314\python.exe'),
+                    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
+                    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
+                ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+                if ($candidates.Count -gt 0)
+                { return ($candidates | Select-Object -First 1)
+                }
+            }
             $command = Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($command)
             {
@@ -1814,7 +1917,7 @@ function Register-UpdateSchedule
     $taskName = 'DailySystemUpdate'
     $taskArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
-        '-SkipReboot', '-NoPause', '-SkipWSL', '-SkipWindowsUpdate', '-Quiet'
+        '-SkipReboot', '-SkipWSL', '-SkipWindowsUpdate', '-Quiet'
     ) -join ' '
 
     if ($script:IsSimulation)
@@ -1872,6 +1975,7 @@ function Invoke-SelfElevation
 }
 
 # Main
+Initialize-ProcessPath
 Import-UpdateConfig
 Initialize-RunStorage
 
@@ -1948,6 +2052,12 @@ if ($script:IsSimulation)
 }
 
 Write-Status ("Dispatching {0} task(s). Skipped: {1}" -f $plannedTasks.Count, $skippedTasks.Count) -Level Info
+if ($skippedTasks.Count -gt 0)
+{
+    foreach ($s in $skippedTasks)
+    { Write-Status ("  Skip: {0} — {1}" -f $s.Name, $s.Reason) -Level Muted
+    }
+}
 $results = Invoke-TaskQueue -Tasks $plannedTasks -Throttle $ParallelThrottle
 $summary = Save-RunSummary -Results $results -Skipped $skippedTasks -Planned $plannedTasks
 
