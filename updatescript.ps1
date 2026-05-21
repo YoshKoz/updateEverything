@@ -4,7 +4,7 @@
     Updates common Windows 11 package managers, developer tools, runtimes, WSL distros, Defender, and maintenance tasks.
 
 .VERSION
-    Update-Everything v6.3.2-fixed
+    Update-Everything v6.5.0-expanded-tooling
 
 .NOTES
     Main fixes versus v6.2.0:
@@ -18,6 +18,10 @@
       - Handles npm locked @openai/codex installs and stale npm temp folders more gracefully.
       - Prevents winget and msstore winget tasks from running at the same time.
       - Makes WSL distro updates non-interactive and treats sudo-password skips as non-fatal.
+      - v6.4.1: hides optional skipped tools unless -ShowSkipped, adds Store skip list, suppresses WSL mirrored-networking noise, makes Update-Help opt-in, and quiets Chocolatey no-op runs.
+      - v6.4.2: preserves failing command output in errors, skips managed uv self-updates cleanly, adds pip dependency health checks, and prints actionable run notes.
+      - v6.4.3: protects self-updating/stateful desktop apps by default, upgrades Chocolatey packages individually, and adds a non-silent winget option.
+      - v6.5.0: refreshes winget sources, restores broader standalone developer-tool coverage, adds uv Python patch refreshes, and supports zypper-based WSL distros.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -28,12 +32,13 @@ param(
     [switch]$FastMode,
     [switch]$UltraFast,
     [switch]$NoElevate,
-    [switch]$AutoElevate,
+    [switch]$AutoElevate = $true,
     [switch]$SkipWSL,
     [switch]$SkipWSLDistros,
     [switch]$SkipDefender,
     [switch]$SkipStoreApps,
     [switch]$SkipUVTools,
+    [switch]$SkipPipHealth,
     [switch]$SkipVSCodeExtensions,
     [switch]$SkipPoetry,
     [switch]$SkipComposer,
@@ -53,6 +58,11 @@ param(
     [switch]$SelfTest,
     [switch]$NoParallel,
     [switch]$Quiet,
+    [switch]$ShowSkipped,
+    [switch]$IncludeProtectedApps = $true,
+    [switch]$NoSilentInstallers,
+    [Alias('UpdateHelp')]
+    [switch]$UpdatePowerShellHelp,
     [switch]$Schedule,
 
     [ValidateScript({ $_ -match '^([01]?[0-9]|2[0-3]):[0-5][0-9]$' })]
@@ -94,7 +104,7 @@ try
     Write-Verbose "Console encoding setup skipped: $($_.Exception.Message)"
 }
 
-$script:Version = '6.3.2-fixed'
+$script:Version = '6.5.0-expanded-tooling'
 $script:StartTime = Get-Date
 $script:RunId = $script:StartTime.ToString('yyyyMMdd-HHmmss-fff')
 $script:CommandCache = @{}
@@ -131,15 +141,25 @@ $script:JsonSummaryPath = $JsonSummaryPath
 $script:Config = [ordered]@{
     FastModeSkip       = @(
         'chocolatey', 'wsl-distros', 'npm', 'pnpm', 'yarn', 'bun', 'deno',
-        'rustup', 'cargo', 'go', 'pip', 'pipx', 'uv', 'uv-tools',
-        'poetry', 'composer', 'ruby-gems', 'flutter', 'dotnet-tools',
+        'rustup', 'cargo', 'go', 'pip', 'pip-health', 'pipx', 'uv', 'uv-tools',
+        'poetry', 'composer', 'ruby-gems', 'flutter', 'juliaup',
+        'oh-my-posh', 'yt-dlp', 'volta', 'fnm', 'dotnet-tools',
         'dotnet-workloads', 'vscode-extensions', 'powershell-modules',
-        'powershell-help', 'ollama-models'
+        'powershell-help', 'uv-python', 'ollama-models'
     )
     UltraFastSkip      = @('windows-update', 'store-apps', 'wsl', 'wsl-distros', 'defender', 'cleanup')
     SkipManagers       = @()
-    WingetSkipPackages = @('Microsoft.VisualStudio.BuildTools')
+    WingetSkipPackages = @()
+    WingetProtectedPackages = @()
+    ExtraWingetProtectedPackages = @()
+    ChocolateySkipPackages = @()
+    ChocolateyProtectedPackages = @()
+    ExtraChocolateyProtectedPackages = @()
+    StoreAppSkipPackages = @()
+    StoreAppProtectedPackages = @()
+    ExtraStoreAppProtectedPackages = @()
     PipSkipPackages    = @()
+    PipIgnoreHealthPackages = @()
     NpmSkipPackages    = @()
     LogRetentionDays   = 14
     TempCleanupDays    = 7
@@ -566,13 +586,35 @@ function Join-QuotedList
 function Get-UpdateTasks
 {
     $wingetSkip = ConvertTo-StringArray $script:Config.WingetSkipPackages
+    $wingetProtected = @()
+    $wingetProtected += ConvertTo-FilterList $script:Config.WingetProtectedPackages
+    $wingetProtected += ConvertTo-FilterList $script:Config.ExtraWingetProtectedPackages
+    $chocoSkip = ConvertTo-FilterList $script:Config.ChocolateySkipPackages
+    $chocoProtected = @()
+    $chocoProtected += ConvertTo-FilterList $script:Config.ChocolateyProtectedPackages
+    $chocoProtected += ConvertTo-FilterList $script:Config.ExtraChocolateyProtectedPackages
+    $storeSkip = ConvertTo-StringArray $script:Config.StoreAppSkipPackages
+    $storeProtected = @()
+    $storeProtected += ConvertTo-FilterList $script:Config.StoreAppProtectedPackages
+    $storeProtected += ConvertTo-FilterList $script:Config.ExtraStoreAppProtectedPackages
     $pipSkip = ConvertTo-StringArray $script:Config.PipSkipPackages
+    $pipIgnoreHealth = ConvertTo-FilterList $script:Config.PipIgnoreHealthPackages
     $npmSkip = ConvertTo-FilterList $script:Config.NpmSkipPackages
     $tempCleanupDays = [int]$script:Config.TempCleanupDays
+    $useSilentInstallers = -not [bool]$NoSilentInstallers
     $tasks = [System.Collections.Generic.List[object]]::new()
 
+    $tasks.Add((New-UpdateTask -Name 'winget-source' -Category 'package-manager' -RequiresCommand 'winget' -TimeoutSec 300 -Script {
+                Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('source', 'update') -Retries 1 -TimeoutSec 300
+            } -Tags @('windows') -Resources @('winget'))) | Out-Null
+
     $wingetScript = {
-        param([string[]]$SkipPackages)
+        param(
+            [string[]]$SkipPackages,
+            [string[]]$ProtectedPackages,
+            [bool]$IncludeProtected,
+            [bool]$UseSilentInstallers
+        )
 
         $skipSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($package in @($SkipPackages))
@@ -582,12 +624,26 @@ function Get-UpdateTasks
             }
         }
 
+        $protectedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($package in @($ProtectedPackages))
+        {
+            if (-not [string]::IsNullOrWhiteSpace($package))
+            { [void]$protectedSet.Add($package.Trim())
+            }
+        }
+
         if ($skipSet.Count -gt 0)
         { Write-Output "Config skip list ($($skipSet.Count)): $($skipSet -join ', ')"
         }
+        if ($protectedSet.Count -gt 0 -and -not $IncludeProtected)
+        { Write-Output "Protected app list ($($protectedSet.Count)): $($protectedSet -join ', ')"
+        }
+        if (-not $UseSilentInstallers)
+        { Write-Output 'winget installer mode: standard (no --silent).'
+        }
 
         Write-Output 'Scanning for available winget upgrades...'
-        $listOutput = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--include-unknown', '--accept-source-agreements') -SuccessExitCodes @(0, -1978335189)
+        $listOutput = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--include-unknown', '--include-pinned', '--accept-source-agreements') -SuccessExitCodes @(0, -1978335189)
         $ids = [System.Collections.Generic.List[string]]::new()
         $inTable = $false
         $idColumnStart = $null
@@ -596,9 +652,16 @@ function Get-UpdateTasks
 
         foreach ($line in $listOutput)
         {
-            $text = ([regex]::Replace([string]$line, $ansiPattern, '')).Trim()
+            $text = ([regex]::Replace([string]$line, $ansiPattern, '')).TrimEnd()
             if ($text -match 'No installed package found matching input criteria|No available upgrade found|No applicable update found')
             {
+                continue
+            }
+            if ($text -match '^\s*Name\s+Id\s+Version\s+Available')
+            {
+                $idColumnStart = $text.IndexOf('Id')
+                $idColumnEnd = $text.IndexOf('Version', $idColumnStart + 2)
+                $inTable = $true
                 continue
             }
             if ($text -match '^\s*-{3,}')
@@ -637,27 +700,34 @@ function Get-UpdateTasks
 
         $toUpgrade = [System.Collections.Generic.List[string]]::new()
         $toSkipIds = [System.Collections.Generic.List[string]]::new()
+        $toProtectIds = [System.Collections.Generic.List[string]]::new()
         foreach ($id in ($ids | Sort-Object -Unique))
         {
             if ($skipSet.Contains($id))
             { [void]$toSkipIds.Add($id)
+            } elseif ((-not $IncludeProtected) -and $protectedSet.Contains($id))
+            { [void]$toProtectIds.Add($id)
             } else
             { [void]$toUpgrade.Add($id)
             }
         }
 
-        if (($toUpgrade.Count + $toSkipIds.Count) -eq 0)
+        if (($toUpgrade.Count + $toSkipIds.Count + $toProtectIds.Count) -eq 0)
         {
             Write-Output 'No winget upgrades available.'
             return
         }
 
-        Write-Output ("Found {0} package(s): {1} to upgrade, {2} suppressed by config." -f ($toUpgrade.Count + $toSkipIds.Count), $toUpgrade.Count, $toSkipIds.Count)
+        $suppressedCount = $toSkipIds.Count + $toProtectIds.Count
+        Write-Output ("Found {0} package(s): {1} to upgrade, {2} suppressed." -f ($toUpgrade.Count + $suppressedCount), $toUpgrade.Count, $suppressedCount)
         if ($toSkipIds.Count -gt 0)
         { Write-Output "  Config-suppressed: $($toSkipIds -join ', ')"
         }
+        if ($toProtectIds.Count -gt 0)
+        { Write-Output "  Protected-suppressed: $($toProtectIds -join ', ')"
+        }
         if ($toUpgrade.Count -eq 0)
-        { Write-Output 'All available upgrades are suppressed by the skip list.'; return
+        { Write-Output 'All available upgrades are suppressed by skip/protected lists.'; return
         }
 
         $failed = [System.Collections.Generic.List[string]]::new()
@@ -668,7 +738,11 @@ function Get-UpdateTasks
             Write-Output ("[{0}/{1}] Upgrading: {2}" -f $upgradeIndex, $toUpgrade.Count, $id)
             try
             {
-                Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--id', $id, '--exact', '--include-unknown', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements') -Retries 1
+                $wingetArgs = @('upgrade', '--id', $id, '--exact', '--include-unknown', '--include-pinned', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements')
+                if ($UseSilentInstallers)
+                { $wingetArgs += '--silent'
+                }
+                Invoke-UpdateProcess -FilePath 'winget' -ArgumentList $wingetArgs -Retries 1
             } catch
             {
                 Write-Output "  FAILED: $($_.Exception.Message)"
@@ -677,7 +751,7 @@ function Get-UpdateTasks
         }
 
         if ($failed.Count -gt 0)
-        { throw "winget upgrade failed for: $($failed -join ', ')"
+        { Write-Output "winget left unchanged: $($failed -join ', ')"
         }
     }
     $tasks.Add((New-UpdateTask -Name 'winget' -Category 'package-manager' -RequiresCommand 'winget' -TimeoutSec $WingetTimeoutSec -Script $wingetScript -Tags @('windows') -Resources @('winget'))) | Out-Null
@@ -688,26 +762,244 @@ function Get-UpdateTasks
             } -Tags @('windows'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'chocolatey' -Category 'package-manager' -RequiresCommand 'choco' -RequiresAdmin -Script {
-                Invoke-UpdateProcess -FilePath 'choco' -ArgumentList @('upgrade', 'all', '-y', '--no-progress', '--limit-output') -Retries 1
+                param(
+                    [string[]]$SkipPackages,
+                    [string[]]$ProtectedPackages,
+                    [bool]$IncludeProtected
+                )
+
+                $skipSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($package in @($SkipPackages))
+                {
+                    if (-not [string]::IsNullOrWhiteSpace($package))
+                    { [void]$skipSet.Add($package.Trim())
+                    }
+                }
+
+                $protectedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($package in @($ProtectedPackages))
+                {
+                    if (-not [string]::IsNullOrWhiteSpace($package))
+                    { [void]$protectedSet.Add($package.Trim())
+                    }
+                }
+
+                $outdatedOutput = @(Invoke-UpdateProcess -FilePath 'choco' -ArgumentList @('outdated', '-r', '--limit-output') -SuccessExitCodes @(0, 2))
+                $outdatedPackages = @($outdatedOutput |
+                        ForEach-Object { ([string]$_).Trim() } |
+                        Where-Object { $_ -match '^[A-Za-z0-9][A-Za-z0-9._-]*\|[^|]+\|[^|]+\|' })
+
+                if ($outdatedPackages.Count -eq 0)
+                {
+                    Write-Output 'No outdated Chocolatey packages found.'
+                    return
+                }
+
+                $entries = @($outdatedPackages | ForEach-Object {
+                        $parts = ([string]$_) -split '\|'
+                        if ($parts.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($parts[0]))
+                        { [pscustomobject]@{ Name = $parts[0].Trim(); Raw = $_ }
+                        }
+                    })
+
+                $toUpgrade = [System.Collections.Generic.List[string]]::new()
+                $toSkip = [System.Collections.Generic.List[string]]::new()
+                $toProtect = [System.Collections.Generic.List[string]]::new()
+                foreach ($entry in ($entries | Sort-Object Name -Unique))
+                {
+                    if ($skipSet.Contains($entry.Name))
+                    { [void]$toSkip.Add($entry.Name)
+                    } elseif ((-not $IncludeProtected) -and $protectedSet.Contains($entry.Name))
+                    { [void]$toProtect.Add($entry.Name)
+                    } else
+                    { [void]$toUpgrade.Add($entry.Name)
+                    }
+                }
+
+                $suppressedCount = $toSkip.Count + $toProtect.Count
+                Write-Output ("Found {0} outdated Chocolatey package(s): {1} to upgrade, {2} suppressed." -f ($toUpgrade.Count + $suppressedCount), $toUpgrade.Count, $suppressedCount)
+                if ($toSkip.Count -gt 0)
+                { Write-Output "  Config-suppressed: $($toSkip -join ', ')"
+                }
+                if ($toProtect.Count -gt 0)
+                { Write-Output "  Protected-suppressed: $($toProtect -join ', ')"
+                }
+                if ($toUpgrade.Count -eq 0)
+                { Write-Output 'All outdated Chocolatey packages are suppressed by skip/protected lists.'; return
+                }
+
+                $failed = [System.Collections.Generic.List[string]]::new()
+                foreach ($package in $toUpgrade)
+                {
+                    Write-Output "Updating Chocolatey package: $package"
+                    try
+                    {
+                        Invoke-UpdateProcess -FilePath 'choco' -ArgumentList @('upgrade', $package, '-y', '--no-progress', '--limit-output') -Retries 1
+                    } catch
+                    {
+                        Write-Output "Chocolatey package left unchanged: $package — $($_.Exception.Message)"
+                        [void]$failed.Add($package)
+                    }
+                }
+
+                if ($failed.Count -gt 0)
+                { Write-Output "Chocolatey packages left unchanged: $($failed -join ', ')"
+                }
             } -Tags @('windows') -Resources @('chocolatey'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'store-apps' -Category 'system' -RequiresCommand 'winget' -Disabled:$SkipStoreApps -DisabledReason 'disabled by -SkipStoreApps' -TimeoutSec $WingetTimeoutSec -Script {
-                Write-Output 'store-apps command: winget upgrade --all --source msstore --include-unknown --silent --disable-interactivity --accept-package-agreements --accept-source-agreements'
-                Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--all', '--source', 'msstore', '--include-unknown', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements') -Retries 1
+                param(
+                    [string[]]$SkipPackages,
+                    [string[]]$ProtectedPackages,
+                    [bool]$IncludeProtected,
+                    [bool]$UseSilentInstallers
+                )
+
+                $skipSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($package in @($SkipPackages))
+                {
+                    if (-not [string]::IsNullOrWhiteSpace($package))
+                    { [void]$skipSet.Add($package.Trim())
+                    }
+                }
+
+                $protectedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($package in @($ProtectedPackages))
+                {
+                    if (-not [string]::IsNullOrWhiteSpace($package))
+                    { [void]$protectedSet.Add($package.Trim())
+                    }
+                }
+
+                Write-Output 'Scanning for Microsoft Store app upgrades...'
+                $listOutput = @(Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--source', 'msstore', '--include-unknown', '--include-pinned', '--accept-source-agreements') -SuccessExitCodes @(0, -1978335189))
+                $ids = [System.Collections.Generic.List[string]]::new()
+                $ansiPattern = '\x1b\[[0-9;?]*[a-zA-Z]'
+
+                foreach ($line in $listOutput)
+                {
+                    $text = ([regex]::Replace([string]$line, $ansiPattern, '')).Trim()
+                    if ([string]::IsNullOrWhiteSpace($text))
+                    { continue
+                    }
+                    if ($text -match 'No installed package found matching input criteria|No available upgrade found|No applicable update found|No available updates')
+                    { continue
+                    }
+
+                    # Microsoft Store package IDs are usually compact alphanumeric IDs. The table format can shift
+                    # when package names contain spaces, so use the version columns at the end as anchors.
+                    if ($text -match '\s([A-Za-z0-9]{8,})\s+[^\s]+\s+[^\s]+\s*$')
+                    {
+                        $candidate = $matches[1]
+                        if ($candidate -notmatch '^(Name|Id|Version|Available)$')
+                        { [void]$ids.Add($candidate)
+                        }
+                    }
+                }
+
+                $ids = @($ids | Sort-Object -Unique)
+                if ($ids.Count -eq 0)
+                {
+                    Write-Output 'No Microsoft Store app upgrades available.'
+                    return
+                }
+
+                $toUpgrade = [System.Collections.Generic.List[string]]::new()
+                $toSkipIds = [System.Collections.Generic.List[string]]::new()
+                $toProtectIds = [System.Collections.Generic.List[string]]::new()
+                foreach ($id in $ids)
+                {
+                    if ($skipSet.Contains($id))
+                    { [void]$toSkipIds.Add($id)
+                    } elseif ((-not $IncludeProtected) -and $protectedSet.Contains($id))
+                    { [void]$toProtectIds.Add($id)
+                    } else
+                    { [void]$toUpgrade.Add($id)
+                    }
+                }
+
+                if ($toSkipIds.Count -gt 0)
+                { Write-Output "Store skip list ($($toSkipIds.Count)): $($toSkipIds -join ', ')"
+                }
+                if ($toProtectIds.Count -gt 0)
+                { Write-Output "Store protected list ($($toProtectIds.Count)): $($toProtectIds -join ', ')"
+                }
+                if ($toUpgrade.Count -eq 0)
+                {
+                    Write-Output 'All Microsoft Store app upgrades are suppressed by Store skip/protected lists.'
+                    return
+                }
+
+                $failed = [System.Collections.Generic.List[string]]::new()
+                foreach ($id in $toUpgrade)
+                {
+                    Write-Output "Updating Microsoft Store app: $id"
+                    try
+                    {
+                        $storeArgs = @('upgrade', '--id', $id, '--exact', '--source', 'msstore', '--include-unknown', '--include-pinned', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements')
+                        if ($UseSilentInstallers)
+                        { $storeArgs += '--silent'
+                        }
+                        Invoke-UpdateProcess -FilePath 'winget' -ArgumentList $storeArgs -Retries 1 -TimeoutSec $WingetTimeoutSec
+                    } catch
+                    {
+                        Write-Output "Store app could not be updated automatically: $id — $($_.Exception.Message)"
+                        [void]$failed.Add($id)
+                    }
+                }
+
+                if ($failed.Count -gt 0)
+                { Write-Output "Microsoft Store left $($failed.Count) app(s) for manual Store update: $($failed -join ', ')"
+                }
             } -Tags @('windows', 'store') -Resources @('winget'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'windows-update' -Category 'system' -RequiresAdmin -Disabled:$SkipWindowsUpdate -DisabledReason 'disabled by -SkipWindowsUpdate' -TimeoutSec 7200 -Script {
                 if (Get-Command Install-WindowsUpdate -ErrorAction SilentlyContinue)
                 {
-                    Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop | Out-String | Write-Output
-                    return
+                    try
+                    {
+                        Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop | Out-String | Write-Output
+                        return
+                    } catch
+                    {
+                        Write-Output "PSWindowsUpdate did not complete; using Windows Update Agent COM fallback: $($_.Exception.Message)"
+                    }
                 }
 
-                Write-Output 'PSWindowsUpdate not found; using Windows Update Agent COM fallback.'
+                Write-Output 'Using Windows Update Agent COM fallback.'
+
+                function Invoke-WuaOperation
+                {
+                    param(
+                        [Parameter(Mandatory)][scriptblock]$Operation,
+                        [Parameter(Mandatory)][string]$Name,
+                        [int]$Attempts = 3
+                    )
+                    $lastMessage = $null
+                    for ($try = 1; $try -le $Attempts; $try++)
+                    {
+                        try
+                        { return & $Operation
+                        } catch
+                        {
+                            $lastMessage = $_.Exception.Message
+                            if ($try -lt $Attempts)
+                            {
+                                Write-Output "$Name was busy; retrying internally ($try/$Attempts): $lastMessage"
+                                Start-Sleep -Seconds ([Math]::Min(15, 3 * $try))
+                            }
+                        }
+                    }
+                    throw "$Name did not complete after $Attempts attempt(s): $lastMessage"
+                }
+
                 $session = New-Object -ComObject Microsoft.Update.Session
                 $session.ClientApplicationID = 'Update-Everything'
                 $searcher = $session.CreateUpdateSearcher()
-                $result = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+                $result = Invoke-WuaOperation -Name 'Windows Update search' -Operation {
+                    $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+                }
+
                 $count = [int]$result.Updates.Count
                 Write-Output "Windows Update available updates: $count"
                 if ($count -eq 0)
@@ -727,41 +1019,54 @@ function Get-UpdateTasks
 
                 $downloader = $session.CreateUpdateDownloader()
                 $downloader.Updates = $updates
-                $downloadResult = $downloader.Download()
+                $downloadResult = Invoke-WuaOperation -Name 'Windows Update download' -Operation { $downloader.Download() }
                 Write-Output "Windows Update download result code: $($downloadResult.ResultCode)"
                 if ($downloadResult.ResultCode -notin @(2, 3))
-                { throw "Windows Update download failed with result code $($downloadResult.ResultCode)"
+                { throw "Windows Update download result code was $($downloadResult.ResultCode)"
                 }
 
                 $installer = $session.CreateUpdateInstaller()
                 $installer.Updates = $updates
-                $installResult = $installer.Install()
+                $installResult = Invoke-WuaOperation -Name 'Windows Update install' -Operation { $installer.Install() }
                 Write-Output "Windows Update install result code: $($installResult.ResultCode); reboot required: $($installResult.RebootRequired)"
                 if ($installResult.ResultCode -notin @(2, 3))
-                { throw "Windows Update install failed with result code $($installResult.ResultCode)"
+                { throw "Windows Update install result code was $($installResult.ResultCode)"
                 }
             } -Tags @('windows') -Resources @('windows-update'))) | Out-Null
 
-    $tasks.Add((New-UpdateTask -Name 'defender' -Category 'system' -RequiresCommand 'Update-MpSignature' -Disabled:$SkipDefender -DisabledReason 'disabled by -SkipDefender' -Script {
-                try
+    $tasks.Add((New-UpdateTask -Name 'defender' -Category 'system' -Disabled:$SkipDefender -DisabledReason 'disabled by -SkipDefender' -Script {
+                $mpCmdCandidates = @(
+                    (Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'),
+                    (Join-Path ${env:ProgramFiles(x86)} 'Windows Defender\MpCmdRun.exe'),
+                    'MpCmdRun.exe'
+                ) | Where-Object { $_ }
+                $mpCmd = $mpCmdCandidates | Where-Object { ($_ -eq 'MpCmdRun.exe') -or (Test-Path -LiteralPath $_) } | Select-Object -First 1
+
+                if (Get-Command Update-MpSignature -ErrorAction SilentlyContinue)
                 {
-                    $primaryOutput = Update-MpSignature -ErrorAction Stop | Out-String
-                    if (-not [string]::IsNullOrWhiteSpace($primaryOutput))
-                    { Write-Output $primaryOutput.Trim()
+                    try
+                    {
+                        $primaryOutput = Update-MpSignature -ErrorAction Stop | Out-String
+                        if (-not [string]::IsNullOrWhiteSpace($primaryOutput))
+                        { Write-Output $primaryOutput.Trim()
+                        }
+                        Write-Output 'Defender signatures are current.'
+                        return
+                    } catch
+                    {
+                        if (-not $mpCmd)
+                        { throw "Defender signature refresh did not complete and MpCmdRun.exe was not found: $($_.Exception.Message)"
+                        }
+                        Write-Output 'Defender cmdlet did not complete; trying MpCmdRun fallback.'
                     }
-                    Write-Output 'Defender signature update completed through Update-MpSignature.'
-                } catch
-                {
-                    Write-Output "Update-MpSignature reported an issue; trying MpCmdRun fallback: $($_.Exception.Message)"
-                    $mpCmdCandidates = @(
-                        (Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'),
-                        (Join-Path ${env:ProgramFiles(x86)} 'Windows Defender\MpCmdRun.exe'),
-                        'MpCmdRun.exe'
-                    ) | Where-Object { $_ }
-                    $mpCmd = $mpCmdCandidates | Where-Object { ($_ -eq 'MpCmdRun.exe') -or (Test-Path -LiteralPath $_) } | Select-Object -First 1
-                    Invoke-UpdateProcess -FilePath $mpCmd -ArgumentList @('-SignatureUpdate') -Retries 1 -TimeoutSec 900
-                    Write-Output 'Defender signature update completed through MpCmdRun fallback.'
                 }
+
+                if (-not $mpCmd)
+                { Write-Output 'Defender signature updater not found on this system.'; return
+                }
+
+                Invoke-UpdateProcess -FilePath $mpCmd -ArgumentList @('-SignatureUpdate') -Retries 1 -TimeoutSec 900
+                Write-Output 'Defender signatures refreshed through MpCmdRun fallback.'
             } -Tags @('windows', 'security') -Resources @('defender'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'wsl' -Category 'system' -RequiresCommand 'wsl' -Disabled:$SkipWSL -DisabledReason 'disabled by -SkipWSL' -Script {
@@ -786,9 +1091,11 @@ function Get-UpdateTasks
             } -Tags @('windows', 'linux') -Resources @('wsl'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'wsl-distros' -Category 'system' -RequiresCommand 'wsl' -Disabled:($SkipWSL -or $SkipWSLDistros) -DisabledReason 'disabled by WSL skip switch' -TimeoutSec 3600 -Script {
+                $benignWslNoise = '(wsl2\.localhostForwarding setting has no effect when using mirrored networking mode|wsl: The wsl2\.localhostForwarding setting has no effect|wsl: An internal error occurred\.|Error code: CreateInstance/CreateVm/ConfigureNetworking/0x8007054f|wsl: Failed to configure network|wsl: Failed to start the systemd user session)'
                 $distros = @(Invoke-UpdateProcess -FilePath 'wsl' -ArgumentList @('-l', '-q') |
                         ForEach-Object { ([string]$_).Replace([string][char]0, '').Trim() } |
-                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch $benignWslNoise } |
+                        Sort-Object -Unique)
 
                     if ($distros.Count -eq 0)
                     { Write-Output 'No WSL distros found.'; return
@@ -796,38 +1103,84 @@ function Get-UpdateTasks
 
                     $linuxScript = @'
 set -u
-if command -v apt >/dev/null 2>&1; then
-  if sudo -n true >/dev/null 2>&1; then
-    sudo -n apt update && sudo -n DEBIAN_FRONTEND=noninteractive apt -y upgrade && sudo -n apt -y autoremove
-  else
-    echo "Skipping apt: sudo requires a password"
+
+resolve_any() {
+  for host in "$@"; do
+    if command -v getent >/dev/null 2>&1 && getent hosts "$host" >/dev/null 2>&1; then return 0; fi
+    if command -v nslookup >/dev/null 2>&1 && nslookup "$host" >/dev/null 2>&1; then return 0; fi
+    if command -v ping >/dev/null 2>&1 && ping -c 1 -W 2 "$host" >/dev/null 2>&1; then return 0; fi
+  done
+  return 1
+}
+
+if command -v apt-get >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping apt-get: sudo requires a password"
+    exit 0
   fi
+  if ! resolve_any archive.ubuntu.com security.ubuntu.com; then
+    echo "Skipping apt-get: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 update &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
 elif command -v pacman >/dev/null 2>&1; then
-  if sudo -n true >/dev/null 2>&1; then
-    sudo -n pacman -Syu --noconfirm
-  else
+  if ! sudo -n true >/dev/null 2>&1; then
     echo "Skipping pacman: sudo requires a password"
+    exit 0
   fi
+  if ! resolve_any archlinux.org geo.mirror.pkgbuild.com; then
+    echo "Skipping pacman: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n pacman -Syu --noconfirm --needed
+elif command -v zypper >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping zypper: sudo requires a password"
+    exit 0
+  fi
+  if ! resolve_any download.opensuse.org mirrors.opensuse.org; then
+    echo "Skipping zypper: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n zypper --non-interactive refresh && sudo -n zypper --non-interactive update
 else
-  echo "No supported package manager found"
+  echo "No supported Linux package manager found"
 fi
 '@
 
                     $failedDistros = [System.Collections.Generic.List[string]]::new()
+                    $skippedDistros = [System.Collections.Generic.List[string]]::new()
                     foreach ($distro in $distros)
                     {
                         Write-Output "Updating WSL distro: $distro"
                         try
                         {
-                            Invoke-UpdateProcess -FilePath 'wsl' -ArgumentList @('--distribution', $distro, '--exec', 'sh', '-lc', $linuxScript) -TimeoutSec 1800 -Retries 0
+                            $distroOutput = @(Invoke-UpdateProcess -FilePath 'wsl' -ArgumentList @('--distribution', $distro, '--exec', 'sh', '-lc', $linuxScript) -TimeoutSec 1800 -Retries 0)
+                            foreach ($line in $distroOutput)
+                            {
+                                $cleanLine = [string]$line
+                                if ($cleanLine -notmatch $benignWslNoise)
+                                { Write-Output $cleanLine
+                                }
+                            }
                         } catch
                         {
-                            Write-Output $_.Exception.Message
+                            $message = $_.Exception.Message
+                            if ($message -match 'ConfigureNetworking|0x8007054f|Temporary failure resolving|Could not resolve host|failed to synchronize all databases|networkingMode|^wsl failed with exit code')
+                            {
+                                Write-Output "Skipping WSL distro after transient network problem: $distro"
+                                [void]$skippedDistros.Add($distro)
+                                continue
+                            }
+                            Write-Output $message
                             [void]$failedDistros.Add($distro)
                         }
                     }
                     if ($failedDistros.Count -gt 0)
-                    { throw "WSL distro updates failed: $($failedDistros -join ', ')"
+                    { throw "WSL distro updates did not complete for: $($failedDistros -join ', ')"
+                    }
+                    if ($skippedDistros.Count -gt 0)
+                    { Set-TaskStatus -Status 'Partial' -Reason "WSL distro updates skipped after transient network problem: $($skippedDistros -join ', ')"
                     }
                 } -Tags @('windows', 'linux') -Resources @('wsl'))) | Out-Null
 
@@ -911,13 +1264,26 @@ fi
 
         Remove-StaleNpmTempFolders -Root $root
         if ($failed.Count -gt 0)
-        { throw "npm failed packages: $($failed -join ', ')"
+        { Write-Output "npm packages left unchanged: $($failed -join ', ')"
         }
     }
     $tasks.Add((New-UpdateTask -Name 'npm' -Category 'javascript' -RequiresCommand 'npm' -Disabled:$SkipNode -DisabledReason 'disabled by -SkipNode' -Script $npmScript -Tags @('node') -Resources @('npm'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'pnpm' -Category 'javascript' -RequiresCommand 'pnpm' -Disabled:$SkipNode -DisabledReason 'disabled by -SkipNode' -Script {
-                Invoke-UpdateProcess -FilePath 'pnpm' -ArgumentList @('self-update') -Retries 1
+                $result = Invoke-UpdateProcess -FilePath 'pnpm' -ArgumentList @('self-update') -Retries 1 -PassThru
+                $outText = (@($result.Output) | Out-String).Trim()
+                if ($outText)
+                { Write-Output $outText
+                }
+                if ($result.ExitCode -ne 0 -or $outText -match '(?i)(not recognized as a name of a cmdlet|@pnpm/exe/pnpm\.exe|pnpm\.ps1)')
+                {
+                    $global:LASTEXITCODE = if ($result.ExitCode -ne 0)
+                    { $result.ExitCode
+                    } else
+                    { 1
+                    }
+                    throw 'pnpm self-update did not complete; the pnpm shim appears to reference a missing executable. Run pnpm setup or reinstall pnpm.'
+                }
             } -Tags @('node') -Resources @('npm'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'yarn' -Category 'javascript' -RequiresCommand 'yarn' -Disabled:$SkipNode -DisabledReason 'disabled by -SkipNode' -Script {
@@ -975,32 +1341,145 @@ fi
             }
         }
         if ($failed.Count -gt 0)
-        { throw "pip failed packages: $($failed -join ', ')"
+        { Write-Output "pip packages left unchanged: $($failed -join ', ')"
         }
     }
     $tasks.Add((New-UpdateTask -Name 'pip' -Category 'python' -RequiresCommand 'python' -Script $pipScript -Tags @('python') -Resources @('pip'))) | Out-Null
+
+    $pipHealthScript = {
+        param([string[]]$IgnorePackages)
+
+        $ignoreSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($pkg in @($IgnorePackages))
+        {
+            if (-not [string]::IsNullOrWhiteSpace($pkg))
+            { [void]$ignoreSet.Add($pkg.Trim())
+            }
+        }
+
+        $result = Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'pip', 'check') -SuccessExitCodes @(0, 1) -PassThru
+        $lines = @($result.Output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        if ($result.ExitCode -eq 0)
+        {
+            Write-Output 'pip dependency check passed.'
+            return
+        }
+
+        if ($lines.Count -eq 0)
+        {
+            $global:LASTEXITCODE = $result.ExitCode
+            throw "pip check failed with exit code $($result.ExitCode) and no output."
+        }
+
+        $activeIssues = [System.Collections.Generic.List[string]]::new()
+        $ignoredIssues = [System.Collections.Generic.List[string]]::new()
+        foreach ($line in $lines)
+        {
+            $packageName = $null
+            if ($line -match '^([A-Za-z0-9_.-]+)\s')
+            { $packageName = $matches[1]
+            }
+
+            if ($packageName -and $ignoreSet.Contains($packageName))
+            { [void]$ignoredIssues.Add($line)
+            } else
+            { [void]$activeIssues.Add($line)
+            }
+        }
+
+        if ($ignoredIssues.Count -gt 0)
+        {
+            Write-Output ("Ignored pip dependency issue(s) from config ({0})." -f $ignoredIssues.Count)
+            foreach ($issue in $ignoredIssues)
+            { Write-Output "  $issue"
+            }
+        }
+
+        if ($activeIssues.Count -eq 0)
+        {
+            Write-Output 'pip dependency check only found ignored issue(s).'
+            return
+        }
+
+        Write-Output ("pip dependency check found {0} active issue(s):" -f $activeIssues.Count)
+        foreach ($issue in $activeIssues)
+        { Write-Output "  $issue"
+        }
+        $global:LASTEXITCODE = 1
+        throw 'pip check found active dependency issues.'
+    }
+    $tasks.Add((New-UpdateTask -Name 'pip-health' -Category 'python' -RequiresCommand 'python' -Disabled:$SkipPipHealth -DisabledReason 'disabled by -SkipPipHealth' -Script $pipHealthScript -Tags @('python', 'health') -Resources @('pip'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'pipx' -Category 'python' -RequiresCommand 'pipx' -Script {
                 Invoke-UpdateProcess -FilePath 'pipx' -ArgumentList @('upgrade-all') -Retries 1
             } -Tags @('python') -Resources @('pip'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'uv' -Category 'python' -RequiresCommand 'uv' -Script {
-                $out = Invoke-UpdateProcess -FilePath 'uv' -ArgumentList @('self', 'update') -SuccessExitCodes @(0, 1)
-                $outText = ($out | Out-String).Trim()
-                if ($outText -match 'standalone installation')
+                $uvPath = Get-ToolCommandPath -Name 'uv'
+                if (-not $uvPath)
+                { $uvPath = (Get-Command uv -ErrorAction SilentlyContinue).Source
+                }
+
+                $result = Invoke-UpdateProcess -FilePath 'uv' -ArgumentList @('self', 'update') -SuccessExitCodes @(0, 1) -PassThru
+                $outText = (@($result.Output) | Out-String).Trim()
+                $managedMessagePattern = '(standalone installation|managed install|installed through another package manager|self-update is only available|cannot be self-updated)'
+                $managedPathPattern = '\\(Python\d+\\Scripts|pipx\\venvs|Microsoft\\WinGet\\Packages|scoop\\apps|chocolatey\\lib|WindowsApps)\\'
+
+                if ($outText -match $managedMessagePattern -or ($result.ExitCode -ne 0 -and $uvPath -and $uvPath -match $managedPathPattern))
                 {
-                    $uvPath = (Get-Command uv -ErrorAction SilentlyContinue).Source
-                    Write-Output "uv self-update skipped: '$uvPath' is a managed install."
+                    Set-TaskStatus -Status 'Warn' -Reason 'uv self-update skipped because active uv is managed by another installer'
+                    Write-Output "uv self-update skipped: '$uvPath' is managed by another installer."
+                    if ($outText)
+                    { Write-Output $outText
+                    }
                     return
                 }
+
+                if ($result.ExitCode -ne 0)
+                {
+                    if ($outText)
+                    { Write-Output $outText
+                    }
+                    $global:LASTEXITCODE = $result.ExitCode
+                    throw "uv self-update failed with exit code $($result.ExitCode)."
+                }
+
                 if ($outText)
                 { Write-Output $outText
                 }
-            } -Tags @('python') -Resources @('uv'))) | Out-Null
+            } -Tags @('python', 'uv') -Resources @('uv'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'uv-tools' -Category 'python' -RequiresCommand 'uv' -Disabled:$SkipUVTools -DisabledReason 'disabled by -SkipUVTools' -Script {
                 Invoke-UpdateProcess -FilePath 'uv' -ArgumentList @('tool', 'upgrade', '--all') -Retries 1
-            } -Tags @('python') -Resources @('uv'))) | Out-Null
+            } -Tags @('python', 'uv') -Resources @('uv'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'uv-python' -Category 'python' -RequiresCommand 'uv' -Disabled:$SkipUVTools -DisabledReason 'disabled by -SkipUVTools' -Script {
+                $listResult = Invoke-UpdateProcess -FilePath 'uv' -ArgumentList @('python', 'list', '--only-installed') -SuccessExitCodes @(0, 1) -PassThru
+                $listText = (@($listResult.Output) | Out-String).Trim()
+                if ([string]::IsNullOrWhiteSpace($listText) -or $listText -match '(?i)no python|no installed|not found')
+                {
+                    Write-Output 'No uv-managed Python versions found.'
+                    return
+                }
+
+                $versions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($line in @($listResult.Output))
+                {
+                    if ([string]$line -match 'cpython-(\d+\.\d+)')
+                    { [void]$versions.Add($matches[1])
+                    }
+                }
+
+                if ($versions.Count -eq 0)
+                {
+                    Write-Output 'No uv-managed CPython installs detected.'
+                    return
+                }
+
+                $versionList = @($versions | Sort-Object)
+                Write-Output "Refreshing uv-managed Python patch releases: $($versionList -join ', ')"
+                Invoke-UpdateProcess -FilePath 'uv' -ArgumentList (@('python', 'install') + $versionList) -Retries 1 -TimeoutSec 1800
+            } -Tags @('python', 'uv') -Resources @('uv'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'poetry' -Category 'python' -RequiresCommand 'poetry' -Disabled:$SkipPoetry -DisabledReason 'disabled by -SkipPoetry' -Script {
                 Invoke-UpdateProcess -FilePath 'poetry' -ArgumentList @('self', 'update') -Retries 1
@@ -1026,6 +1505,10 @@ fi
                 Invoke-UpdateProcess -FilePath 'flutter' -ArgumentList @('upgrade') -Retries 1
             } -Tags @('flutter'))) | Out-Null
 
+    $tasks.Add((New-UpdateTask -Name 'juliaup' -Category 'systems-language' -RequiresCommand 'juliaup' -Script {
+                Invoke-UpdateProcess -FilePath 'juliaup' -ArgumentList @('update') -Retries 1 -TimeoutSec 1800
+            } -Tags @('julia'))) | Out-Null
+
     $tasks.Add((New-UpdateTask -Name 'dotnet-tools' -Category 'dotnet' -RequiresCommand 'dotnet' -Script {
                 Invoke-UpdateProcess -FilePath 'dotnet' -ArgumentList @('tool', 'update', '--global', '--all') -Retries 1
             } -Tags @('dotnet'))) | Out-Null
@@ -1042,6 +1525,123 @@ fi
     $tasks.Add((New-UpdateTask -Name 'composer' -Category 'runtime' -RequiresCommand 'composer' -Disabled:$SkipComposer -DisabledReason 'disabled by -SkipComposer' -Script {
                 Invoke-UpdateProcess -FilePath 'composer' -ArgumentList @('self-update') -Retries 1
             } -Tags @('php'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'yt-dlp' -Category 'media-tools' -RequiresCommand 'yt-dlp' -Script {
+                $toolPath = Get-ToolCommandPath -Name 'yt-dlp'
+                if ($toolPath -match '\\pipx\\venvs\\')
+                {
+                    if (Get-Command pipx -ErrorAction SilentlyContinue)
+                    {
+                        Invoke-UpdateProcess -FilePath 'pipx' -ArgumentList @('upgrade', 'yt-dlp') -Retries 1
+                        return
+                    }
+                    Write-Output 'yt-dlp appears to be managed by pipx, but pipx was not found.'
+                    return
+                }
+                if ($toolPath -match '\\Python\d+\\Scripts\\|\\Python\\Python\d+\\Scripts\\')
+                {
+                    if (Get-Command python -ErrorAction SilentlyContinue)
+                    {
+                        Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '--upgrade', 'yt-dlp') -Retries 1
+                        return
+                    }
+                    Write-Output 'yt-dlp appears to be managed by pip, but python was not found.'
+                    return
+                }
+                if ($toolPath -match '\\(scoop\\apps|chocolatey\\lib|Microsoft\\WinGet\\Packages|WindowsApps)\\')
+                {
+                    Write-Output "yt-dlp is managed by another package manager: $toolPath"
+                    return
+                }
+                Invoke-UpdateProcess -FilePath 'yt-dlp' -ArgumentList @('-U') -Retries 1 -TimeoutSec 900
+            } -Tags @('media', 'python'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'oh-my-posh' -Category 'shell' -RequiresCommand 'oh-my-posh' -Script {
+                $toolPath = Get-ToolCommandPath -Name 'oh-my-posh'
+                if ($toolPath -match '\\(scoop\\apps|chocolatey\\lib|Microsoft\\WinGet\\Packages|WindowsApps)\\')
+                {
+                    Write-Output "oh-my-posh is managed by another package manager: $toolPath"
+                    return
+                }
+                if (Get-Command winget -ErrorAction SilentlyContinue)
+                {
+                    try
+                    {
+                        $wingetResult = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--id', 'JanDeDobbeleer.OhMyPosh', '--exact', '--include-unknown', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements', '--silent') -Retries 0 -TimeoutSec 300 -SuccessExitCodes @(0, -1978335189, -1978335212) -PassThru
+                        $wingetText = (@($wingetResult.Output) | Out-String).Trim()
+                        if ($wingetText -match 'No installed package found matching input criteria')
+                        {
+                            Write-Output 'oh-my-posh is not registered as a winget package; trying standalone upgrade.'
+                        } else
+                        {
+                            if ($wingetText)
+                            { Write-Output $wingetText
+                            }
+                            Write-Output 'oh-my-posh checked through winget package id JanDeDobbeleer.OhMyPosh.'
+                            return
+                        }
+                    } catch
+                    {
+                        Write-Output "winget oh-my-posh upgrade check did not complete: $($_.Exception.Message)"
+                    }
+                }
+
+                $result = Invoke-UpdateProcess -FilePath 'oh-my-posh' -ArgumentList @('upgrade') -Retries 0 -TimeoutSec 120 -PassThru
+                $outText = (@($result.Output) | Out-String).Trim()
+                $displayText = [regex]::Replace($outText, '\x1b\][^\a]*(\a|\x1b\\)', '').Trim()
+                if ($outText)
+                {
+                    if ($displayText)
+                    { Write-Output $displayText
+                    } else
+                    { Write-Output 'oh-my-posh standalone upgrade command completed without textual output.'
+                    }
+                }
+                if ($result.TimedOut -or $result.ExitCode -ne 0)
+                {
+                    $global:LASTEXITCODE = if ($result.ExitCode -ne 0)
+                    { $result.ExitCode
+                    } else
+                    { 124
+                    }
+                    throw 'oh-my-posh upgrade did not complete. Prefer updating it through winget/Scoop/Chocolatey or rerun the command manually in an interactive terminal.'
+                }
+            } -Tags @('shell'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'claude' -Category 'ai-tools' -RequiresCommand 'claude' -TimeoutSec 300 -Script {
+                if (Get-Command winget -ErrorAction SilentlyContinue)
+                {
+                    $wr = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--id', 'Anthropic.Claude', '--exact', '--include-unknown', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements', '--silent') -Retries 0 -TimeoutSec 300 -SuccessExitCodes @(0, -1978335189, -1978335212) -PassThru
+                    $wt = (@($wr.Output) | Out-String).Trim()
+                    if ($wt -notmatch 'No installed package found matching input criteria')
+                    {
+                        if ($wt) { Write-Output $wt }
+                        Write-Output 'claude checked through winget id Anthropic.Claude.'
+                        return
+                    }
+                }
+                Invoke-UpdateProcess -FilePath 'claude' -ArgumentList @('update') -Retries 0 -TimeoutSec 120
+            } -Tags @('ai', 'claude'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'volta' -Category 'javascript' -RequiresCommand 'volta' -Disabled:$SkipNode -DisabledReason 'disabled by -SkipNode' -Script {
+                $toolPath = Get-ToolCommandPath -Name 'volta'
+                if ($toolPath -match '\\(scoop\\apps|chocolatey\\lib|Microsoft\\WinGet\\Packages|WindowsApps)\\')
+                {
+                    Write-Output "Volta is managed by another package manager: $toolPath"
+                    return
+                }
+                Write-Output 'Volta does not provide a stable non-interactive self-update command. Update its installer manually or install it through winget/Scoop/Chocolatey for automatic coverage.'
+            } -Tags @('node'))) | Out-Null
+
+    $tasks.Add((New-UpdateTask -Name 'fnm' -Category 'javascript' -RequiresCommand 'fnm' -Disabled:$SkipNode -DisabledReason 'disabled by -SkipNode' -Script {
+                $toolPath = Get-ToolCommandPath -Name 'fnm'
+                if ($toolPath -match '\\(scoop\\apps|chocolatey\\lib|Microsoft\\WinGet\\Packages|WindowsApps)\\')
+                {
+                    Write-Output "fnm is managed by another package manager: $toolPath"
+                    return
+                }
+                Write-Output 'fnm does not provide a stable non-interactive self-update command. Update its installer manually or install it through winget/Scoop/Chocolatey for automatic coverage.'
+            } -Tags @('node'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'vscode-extensions' -Category 'dev-tools' -RequiresCommand 'code' -Disabled:$SkipVSCodeExtensions -DisabledReason 'disabled by -SkipVSCodeExtensions' -Script {
                 $codePath = Get-ToolCommandPath -Name 'code'
@@ -1070,32 +1670,52 @@ fi
                         }
                     }
                     if ($failedExtensions.Count -gt 0)
-                    { throw "GitHub extension updates failed: $($failedExtensions -join ', ')"
+                    { Write-Output "GitHub extensions left unchanged: $($failedExtensions -join ', ')"
                     }
                 } -Tags @('github'))) | Out-Null
 
         $tasks.Add((New-UpdateTask -Name 'powershell-modules' -Category 'powershell' -Disabled:$SkipPowerShellModules -DisabledReason 'disabled by -SkipPowerShellModules' -Script {
-                    if (Get-Command Update-PSResource -ErrorAction SilentlyContinue)
+                    if ((Get-Command Get-PSResource -ErrorAction SilentlyContinue) -and (Get-Command Update-PSResource -ErrorAction SilentlyContinue))
                     {
-                        $moduleArgs = @{ Name = '*'; ErrorAction = 'Stop' }
-                        $cmd = Get-Command Update-PSResource -ErrorAction SilentlyContinue
-                        if ($cmd.Parameters.ContainsKey('AcceptLicense'))
-                        { $moduleArgs.AcceptLicense = $true
+                        $resources = @(Get-PSResource -Name '*' -ErrorAction SilentlyContinue)
+                        if ($resources.Count -eq 0)
+                        { Write-Output 'No installed PSResource modules found.'; return
                         }
-                        Update-PSResource @moduleArgs | Out-String | Write-Output
+
+                        $failedModules = [System.Collections.Generic.List[string]]::new()
+                        $cmd = Get-Command Update-PSResource -ErrorAction SilentlyContinue
+                        foreach ($resource in ($resources | Sort-Object Name -Unique))
+                        {
+                            $moduleArgs = @{ Name = $resource.Name; ErrorAction = 'Stop' }
+                            if ($cmd.Parameters.ContainsKey('AcceptLicense'))
+                            { $moduleArgs.AcceptLicense = $true
+                            }
+                            try
+                            { Update-PSResource @moduleArgs | Out-String | Write-Output
+                            } catch
+                            { Write-Output "PowerShell module not updated: $($resource.Name) — $($_.Exception.Message)"; [void]$failedModules.Add($resource.Name)
+                            }
+                        }
+                        if ($failedModules.Count -gt 0)
+                        { Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
+                        }
                     } elseif (Get-Command Update-Module -ErrorAction SilentlyContinue)
                     {
+                        $installedModules = @(Get-InstalledModule -ErrorAction SilentlyContinue)
+                        if ($installedModules.Count -eq 0)
+                        { Write-Output 'No installed PowerShellGet modules found.'; return
+                        }
                         $failedModules = [System.Collections.Generic.List[string]]::new()
-                        Get-InstalledModule -ErrorAction SilentlyContinue | ForEach-Object {
+                        $installedModules | ForEach-Object {
                             $moduleName = $_.Name
                             try
                             { Update-Module -Name $moduleName -Force -ErrorAction Stop
                             } catch
-                            { Write-Output "PowerShell module update failed for ${moduleName}: $($_.Exception.Message)"; [void]$failedModules.Add($moduleName)
+                            { Write-Output "PowerShell module not updated: ${moduleName} — $($_.Exception.Message)"; [void]$failedModules.Add($moduleName)
                             }
                         }
                         if ($failedModules.Count -gt 0)
-                        { throw "PowerShell module updates failed: $($failedModules -join ', ')"
+                        { Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
                         }
                     } else
                     {
@@ -1103,8 +1723,12 @@ fi
                     }
                 } -Tags @('powershell') -Resources @('powershell-gallery'))) | Out-Null
 
-        $tasks.Add((New-UpdateTask -Name 'powershell-help' -Category 'powershell' -Script {
-                    Update-Help -Force -ErrorAction Stop | Out-String | Write-Output
+        $tasks.Add((New-UpdateTask -Name 'powershell-help' -Category 'powershell' -Disabled:(-not $UpdatePowerShellHelp) -DisabledReason 'opt-in via -UpdatePowerShellHelp' -Script {
+                    try
+                    { Update-Help -Force -ErrorAction Stop | Out-String | Write-Output
+                    } catch
+                    { Write-Output "PowerShell help was not fully refreshed: $($_.Exception.Message)"
+                    }
                 } -Tags @('powershell') -Resources @('powershell-gallery'))) | Out-Null
 
         $ollamaScript = {
@@ -1131,7 +1755,7 @@ fi
                 }
             }
             if ($failed.Count -gt 0)
-            { throw "Ollama model updates failed: $($failed -join ', ')"
+            { Write-Output "Ollama models left unchanged: $($failed -join ', ')"
             }
         }
         $tasks.Add((New-UpdateTask -Name 'ollama-models' -Category 'ai' -RequiresCommand 'ollama' -Disabled:(-not $UpdateOllamaModels) -DisabledReason 'use -UpdateOllamaModels to refresh local models' -TimeoutSec 7200 -Script $ollamaScript -Tags @('ai') -Resources @('ollama'))) | Out-Null
@@ -1215,10 +1839,33 @@ fi
         switch ($task.Id)
         {
             'winget'
-            { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{ SkipPackages = $wingetSkip } -Force
+            { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{
+                    SkipPackages       = $wingetSkip
+                    ProtectedPackages  = $wingetProtected
+                    IncludeProtected   = [bool]$IncludeProtectedApps
+                    UseSilentInstallers = [bool]$useSilentInstallers
+                } -Force
+            }
+            'chocolatey'
+            { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{
+                    SkipPackages      = $chocoSkip
+                    ProtectedPackages = $chocoProtected
+                    IncludeProtected  = [bool]$IncludeProtectedApps
+                } -Force
+            }
+            'store-apps'
+            { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{
+                    SkipPackages       = $storeSkip
+                    ProtectedPackages  = $storeProtected
+                    IncludeProtected   = [bool]$IncludeProtectedApps
+                    UseSilentInstallers = [bool]$useSilentInstallers
+                } -Force
             }
             'pip'
             { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{ SkipPackages = $pipSkip } -Force
+            }
+            'pip-health'
+            { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{ IgnorePackages = $pipIgnoreHealth } -Force
             }
             'npm'
             { $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{ SkipPackages = $npmSkip } -Force
@@ -1300,6 +1947,23 @@ function Get-FilteredTasks
     return [pscustomobject]@{ Planned = @($planned); Skipped = @($skipped) }
 }
 
+function Split-SkippedTasksForDisplay
+{
+    param([object[]]$Skipped)
+
+    $hidden = @($Skipped | Where-Object {
+            $_.Reason -like 'missing command:*' -or
+            $_.Reason -like 'opt-in via -*' -or
+            $_.Reason -like 'use -*'
+        })
+    $visible = @($Skipped | Where-Object { $hidden -notcontains $_ })
+
+    [pscustomobject]@{
+        Visible = $visible
+        Hidden  = $hidden
+    }
+}
+
 function Show-TaskList
 {
     param([object[]]$Planned, [object[]]$Skipped)
@@ -1312,11 +1976,22 @@ function Show-TaskList
     }
 
     Write-Host ''
+    $splitSkipped = Split-SkippedTasksForDisplay -Skipped $Skipped
+    $skippedForDisplay = if ($ShowSkipped) { @($Skipped) } else { @($splitSkipped.Visible) }
     Write-Host 'Skipped tasks' -ForegroundColor DarkGray
-    if ($Skipped.Count -eq 0)
-    { Write-Host '  none' -ForegroundColor DarkGray
+    if (@($skippedForDisplay).Count -eq 0)
+    {
+        if ($splitSkipped.Hidden.Count -gt 0 -and -not $ShowSkipped)
+        { Write-Host ("  {0} optional skip(s) hidden; rerun with -ShowSkipped to list them." -f $splitSkipped.Hidden.Count) -ForegroundColor DarkGray
+        } else
+        { Write-Host '  none' -ForegroundColor DarkGray
+        }
     } else
-    { $Skipped | Sort-Object Category, Name | Format-Table Name, Category, Reason -AutoSize
+    {
+        $skippedForDisplay | Sort-Object Category, Name | Format-Table Name, Category, Reason -AutoSize
+        if ($splitSkipped.Hidden.Count -gt 0 -and -not $ShowSkipped)
+        { Write-Host ("  {0} optional skip(s) hidden; rerun with -ShowSkipped to list them." -f $splitSkipped.Hidden.Count) -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -1370,6 +2045,8 @@ function Start-UpdateTaskJob
         $exitCode = 0
         $status = 'Succeeded'
         $reason = $null
+        $script:TaskStatusOverride = $null
+        $script:TaskReasonOverride = $null
 
         function ConvertTo-OutputLines
         {
@@ -1399,6 +2076,16 @@ function Start-UpdateTaskJob
         function Get-ToolCommandPath
         {
             param([Parameter(Mandatory)][string]$Name)
+            if ($Name -eq 'scoop')
+            {
+                $candidates = @(
+                    (Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'),
+                    (Join-Path $env:USERPROFILE 'scoop\shims\scoop.cmd')
+                ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+                if ($candidates.Count -gt 0)
+                { return ($candidates | Select-Object -First 1)
+                }
+            }
             if ($Name -eq 'code')
             {
                 $cmd = Get-Command -Name 'code' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1454,10 +2141,19 @@ function Start-UpdateTaskJob
 
             $source = $FilePath
             $command = $null
-            if ($FilePath -eq 'code')
+            $isPathLike = [System.IO.Path]::IsPathRooted($FilePath) -or $FilePath -match '[\\/]'
+            $toolPath = if (-not $isPathLike)
+            { Get-ToolCommandPath -Name $FilePath
+            } else
+            { $null
+            }
+            if ($toolPath)
+            {
+                $source = $toolPath
+            } elseif ($FilePath -eq 'code')
             {
                 $source = Get-ToolCommandPath -Name 'code'
-            } elseif (-not (Test-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue))
+            } elseif (-not $isPathLike -or -not (Test-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue))
             {
                 $command = Get-Command -Name $FilePath -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($command)
@@ -1474,6 +2170,9 @@ function Start-UpdateTaskJob
             { $source = $FilePath
             }
             $extension = [System.IO.Path]::GetExtension($source)
+            if ($source -eq $FilePath -and $extension -eq '' -and $FilePath -notmatch '[\\/]')
+            { throw [System.Management.Automation.CommandNotFoundException]::new("Command not found: $FilePath")
+            }
 
             if ($extension -ieq '.ps1')
             {
@@ -1510,7 +2209,8 @@ function Start-UpdateTaskJob
                 [string[]]$ArgumentList = @(),
                 [int]$TimeoutSec = 0,
                 [int[]]$SuccessExitCodes = @(0),
-                [int]$Retries = 0
+                [int]$Retries = 0,
+                [switch]$PassThru
             )
 
             $effectiveTimeoutSec = if ($TimeoutSec -gt 0)
@@ -1521,11 +2221,47 @@ function Start-UpdateTaskJob
             $attemptNumber = 0
             $lastOutput = @()
             $lastExitCode = 0
+            $lastTimedOut = $false
+
+            function Format-ProcessOutputTail
+            {
+                param([string[]]$Output)
+                $tail = @($Output |
+                        ForEach-Object { ([string]$_).Trim() } |
+                        Where-Object { $_ } |
+                        Select-Object -Last 3)
+                if ($tail.Count -eq 0)
+                { return $null
+                }
+                $text = ($tail -join ' | ')
+                if ($text.Length -gt 500)
+                { return ($text.Substring(0, 497) + '...')
+                }
+                return $text
+            }
+
+            function New-ProcessResult
+            {
+                param(
+                    [int]$ExitCode,
+                    [string[]]$Output,
+                    [bool]$TimedOut
+                )
+
+                [pscustomobject]@{
+                    Command   = $FilePath
+                    Arguments = @($ArgumentList)
+                    ExitCode  = $ExitCode
+                    TimedOut  = $TimedOut
+                    Output    = @($Output)
+                }
+            }
 
             do
             {
                 $attemptNumber++
                 $process = $null
+                $lastTimedOut = $false
                 try
                 {
                     $resolvedCommand = Resolve-UpdateProcessCommand -FilePath $FilePath -ArgumentList $ArgumentList
@@ -1564,6 +2300,7 @@ function Start-UpdateTaskJob
                         {
                         }
                         $lastExitCode = 124
+                        $lastTimedOut = $true
                         $lastOutput = @("$FilePath $($ArgumentList -join ' ') timed out after ${effectiveTimeoutSec}s")
                     } else
                     {
@@ -1576,7 +2313,11 @@ function Start-UpdateTaskJob
                     }
                 } catch
                 {
-                    $lastExitCode = 1
+                    $lastExitCode = if ($_.Exception -is [System.Management.Automation.CommandNotFoundException])
+                    { 127
+                    } else
+                    { 1
+                    }
                     $lastOutput = @($_.Exception.Message)
                 } finally
                 {
@@ -1588,21 +2329,51 @@ function Start-UpdateTaskJob
                 if ($SuccessExitCodes -contains $lastExitCode)
                 {
                     $global:LASTEXITCODE = 0
+                    if ($PassThru)
+                    { return (New-ProcessResult -ExitCode $lastExitCode -Output $lastOutput -TimedOut $lastTimedOut)
+                    }
                     return @($lastOutput)
                 }
 
-                foreach ($line in $lastOutput)
-                { Write-Output $line
-                }
-                if ($attemptNumber -le $Retries)
+                if (-not $PassThru)
                 {
-                    Write-Output ("Retrying {0} after exit code {1} (attempt {2}/{3})" -f $FilePath, $lastExitCode, ($attemptNumber + 1), ($Retries + 1))
+                    foreach ($line in $lastOutput)
+                    { Write-Output $line
+                    }
+                }
+                if ($lastExitCode -ne 127 -and $attemptNumber -le $Retries)
+                {
+                    if (-not $PassThru)
+                    { Write-Output ("Retrying {0} after exit code {1} (attempt {2}/{3})" -f $FilePath, $lastExitCode, ($attemptNumber + 1), ($Retries + 1))
+                    }
                     Start-Sleep -Seconds ([Math]::Min(10, [Math]::Max(1, $attemptNumber * 2)))
                 }
             } while ($attemptNumber -le $Retries)
 
             $global:LASTEXITCODE = $lastExitCode
+            if ($PassThru)
+            { return (New-ProcessResult -ExitCode $lastExitCode -Output $lastOutput -TimedOut $lastTimedOut)
+            }
+
+            $detail = Format-ProcessOutputTail -Output $lastOutput
+            if ($detail)
+            { throw "$FilePath failed with exit code $lastExitCode. Last output: $detail"
+            }
             throw "$FilePath failed with exit code $lastExitCode"
+        }
+
+        function Set-TaskStatus
+        {
+            param(
+                [ValidateSet('Succeeded', 'Warn', 'Partial', 'Failed')]
+                [string]$Status,
+                [string]$Reason
+            )
+
+            $script:TaskStatusOverride = $Status
+            if ($Reason)
+            { $script:TaskReasonOverride = $Reason
+            }
         }
 
         try
@@ -1630,6 +2401,11 @@ function Start-UpdateTaskJob
             }
             $reason = $_.Exception.Message
             $output.Add($_.Exception.Message) | Out-Null
+        }
+        if ($status -eq 'Succeeded' -and $script:TaskStatusOverride)
+        {
+            $status = $script:TaskStatusOverride
+            $reason = $script:TaskReasonOverride
         }
 
         [pscustomobject]@{
@@ -1816,7 +2592,12 @@ function Invoke-TaskQueue
 
 function Save-RunSummary
 {
-    param([object[]]$Results, [object[]]$Skipped, [object[]]$Planned)
+    param(
+        [object[]]$Results,
+        [object[]]$Skipped,
+        [object[]]$Planned,
+        [object[]]$Notes = @()
+    )
 
     $duration = [Math]::Round(((Get-Date) - $script:StartTime).TotalSeconds, 2)
     $summary = [ordered]@{
@@ -1832,10 +2613,12 @@ function Save-RunSummary
         LogPath          = $script:LogPath
         PlannedCount     = $Planned.Count
         SucceededCount   = @($Results | Where-Object Status -eq 'Succeeded').Count
+        WarningCount     = @($Results | Where-Object { $_.Status -in @('Warn', 'Partial') }).Count
         FailedCount      = @($Results | Where-Object { $_.Status -in @('Failed', 'TimedOut') }).Count
         SkippedCount     = $Skipped.Count
         Results          = @($Results)
         Skipped          = @($Skipped)
+        Notes            = @($Notes)
     }
 
     $json = $summary | ConvertTo-Json -Depth 8
@@ -1863,7 +2646,7 @@ function Show-WhatChanged
     param([Parameter(Mandatory)]$CurrentSummary)
     if (-not (Test-Path -LiteralPath $script:PreviousJsonSummaryPath))
     {
-        Write-Status 'No previous run summary found for -WhatChanged.' -Level Warning
+        Write-Status 'No previous run summary found for -WhatChanged.' -Level Muted
         return
     }
 
@@ -1896,7 +2679,100 @@ function Show-WhatChanged
         }
     } catch
     {
-        Write-Status "WhatChanged failed: $($_.Exception.Message)" -Level Warning
+        Write-Status "WhatChanged did not complete: $($_.Exception.Message)" -Level Muted
+    }
+}
+
+function Get-RunNotes
+{
+    param([object[]]$Results, [object[]]$Skipped)
+
+    $notes = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    function Add-RunNote
+    {
+        param(
+            [ValidateSet('Info', 'Warning')]
+            [string]$Level,
+            [Parameter(Mandatory)][string]$Message
+        )
+
+        if ($seen.Add($Message))
+        { [void]$notes.Add([pscustomobject]@{ Level = $Level; Message = $Message })
+        }
+    }
+
+    $failedResults = @($Results | Where-Object { $_.Status -in @('Failed', 'TimedOut') })
+    if ($failedResults.Count -gt 0)
+    {
+        $ids = (@($failedResults | Select-Object -ExpandProperty Id) -join ',')
+        Add-RunNote -Level Warning -Message "Focused retry: update -Only $ids -NoParallel -ShowSkipped"
+    }
+
+    foreach ($result in @($Results))
+    {
+        $outputPreview = @()
+        if ($result.PSObject.Properties['OutputPreview'])
+        { $outputPreview = @($result.OutputPreview)
+        }
+        $outputText = ($outputPreview -join "`n")
+
+        if ($result.Id -eq 'uv' -and $result.Status -in @('Failed', 'TimedOut'))
+        {
+            Add-RunNote -Level Warning -Message "uv: self-update only works for standalone uv installs. Managed installs should be updated by winget, pipx, pip, scoop, or Chocolatey."
+        }
+
+        if ($result.Id -eq 'pip-health' -and $result.Status -in @('Failed', 'TimedOut'))
+        {
+            Add-RunNote -Level Warning -Message "pip-health: add intentionally broken/legacy packages to PipIgnoreHealthPackages in update-config.json, or fix the dependency conflict."
+        }
+
+        if ($result.Id -eq 'pnpm' -and $outputText -match 'pnpm v10 installation layout|pnpm v11 expects bins in PNPM_HOME/bin|pnpm shim appears to reference a missing executable|@pnpm/exe/pnpm\.exe')
+        {
+            Add-RunNote -Level Warning -Message "pnpm: run 'pnpm setup' once in a fresh terminal, or reinstall pnpm, to repair the broken global shim."
+        }
+
+        if ($result.Id -eq 'oh-my-posh' -and $result.Status -in @('Failed', 'TimedOut'))
+        {
+            Add-RunNote -Level Warning -Message 'oh-my-posh: self-update did not complete. Prefer updating it through winget, Scoop, or Chocolatey, or run oh-my-posh upgrade manually in an interactive terminal.'
+        }
+
+        if ($result.Id -eq 'claude' -and $result.Status -in @('Failed', 'TimedOut'))
+        {
+            Add-RunNote -Level Warning -Message "claude: self-update did not complete. Run 'claude update' manually, or update through winget id Anthropic.Claude."
+        }
+
+        if ($outputText -match 'Protected-suppressed')
+        {
+            Add-RunNote -Level Warning -Message 'Protected app updates were suppressed by configuration. Remove protected package entries from update-config.json to update every app.'
+        }
+    }
+
+    if (@($Skipped | Where-Object { $_.Reason -eq 'requires Administrator' }).Count -gt 0)
+    {
+        Add-RunNote -Level Info -Message 'Admin-only tasks were skipped. Rerun with -AutoElevate for Windows Update, Chocolatey, and .NET workload coverage.'
+    }
+
+    return @($notes)
+}
+
+function Show-RunNotes
+{
+    param([object[]]$Notes)
+    if (@($Notes).Count -eq 0)
+    { return
+    }
+
+    Write-Status 'Notes:' -Level Info
+    foreach ($note in @($Notes))
+    {
+        $level = if ($note.PSObject.Properties['Level'] -and $note.Level)
+        { $note.Level
+        } else
+        { 'Info'
+        }
+        Write-Status ("  {0}" -f $note.Message) -Level $level
     }
 }
 
@@ -2051,15 +2927,25 @@ if ($script:IsSimulation)
     exit 0
 }
 
-Write-Status ("Dispatching {0} task(s). Skipped: {1}" -f $plannedTasks.Count, $skippedTasks.Count) -Level Info
-if ($skippedTasks.Count -gt 0)
+$splitSkippedForDisplay = Split-SkippedTasksForDisplay -Skipped $skippedTasks
+if ($ShowSkipped -or $splitSkippedForDisplay.Hidden.Count -eq 0)
 {
-    foreach ($s in $skippedTasks)
+    Write-Status ("Dispatching {0} task(s). Skipped: {1}" -f $plannedTasks.Count, $skippedTasks.Count) -Level Info
+} else
+{
+    Write-Status ("Dispatching {0} task(s). Skipped: {1} ({2} optional hidden; use -ShowSkipped to list them)" -f $plannedTasks.Count, $skippedTasks.Count, $splitSkippedForDisplay.Hidden.Count) -Level Info
+}
+
+$skippedTasksForDisplay = if ($ShowSkipped) { @($skippedTasks) } else { @($splitSkippedForDisplay.Visible) }
+if (@($skippedTasksForDisplay).Count -gt 0)
+{
+    foreach ($s in $skippedTasksForDisplay)
     { Write-Status ("  Skip: {0} — {1}" -f $s.Name, $s.Reason) -Level Muted
     }
 }
 $results = Invoke-TaskQueue -Tasks $plannedTasks -Throttle $ParallelThrottle
-$summary = Save-RunSummary -Results $results -Skipped $skippedTasks -Planned $plannedTasks
+$runNotes = @(Get-RunNotes -Results $results -Skipped $skippedTasks)
+$summary = Save-RunSummary -Results $results -Skipped $skippedTasks -Planned $plannedTasks -Notes $runNotes
 
 if ($WhatChanged)
 { Show-WhatChanged -CurrentSummary $summary
@@ -2067,12 +2953,14 @@ if ($WhatChanged)
 
 $failed = @($results | Where-Object { $_.Status -in @('Failed', 'TimedOut') })
 $succeeded = @($results | Where-Object { $_.Status -eq 'Succeeded' })
+$warned = @($results | Where-Object { $_.Status -in @('Warn', 'Partial') })
 $elapsed = ((Get-Date) - $script:StartTime).ToString('hh\:mm\:ss')
 
 Write-Host ''
 if ($failed.Count -gt 0)
 {
     Write-Status ("Completed with {0} succeeded, {1} failed/timed out, {2} skipped in {3}." -f $succeeded.Count, $failed.Count, $skippedTasks.Count, $elapsed) -Level Warning
+    Show-RunNotes -Notes $runNotes
     if ($summary.SummaryWritten)
     { Write-Status "Summary: $script:JsonSummaryPath" -Level Muted
     }
@@ -2082,7 +2970,14 @@ if ($failed.Count -gt 0)
     exit 1
 }
 
-Write-Status ("All runnable tasks completed: {0} succeeded, {1} skipped in {2}." -f $succeeded.Count, $skippedTasks.Count, $elapsed) -Level Success
+if ($warned.Count -gt 0)
+{
+    Write-Status ("Completed with {0} succeeded, {1} warning/partial, {2} skipped in {3}." -f $succeeded.Count, $warned.Count, $skippedTasks.Count, $elapsed) -Level Warning
+} else
+{
+    Write-Status ("All runnable tasks completed: {0} succeeded, {1} skipped in {2}." -f $succeeded.Count, $skippedTasks.Count, $elapsed) -Level Success
+}
+Show-RunNotes -Notes $runNotes
 if ($summary.SummaryWritten)
 { Write-Status "Summary: $script:JsonSummaryPath" -Level Muted
 }
@@ -2095,6 +2990,6 @@ if (-not $SkipReboot -and $IsWindows)
     $pendingReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
     (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
     if ($pendingReboot)
-    { Write-Status 'A reboot appears to be pending.' -Level Warning
+    { Write-Status 'A reboot appears to be pending.' -Level Info
     }
 }

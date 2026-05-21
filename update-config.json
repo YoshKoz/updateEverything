@@ -1,14 +1,8 @@
 {
-  "WingetSkipPackages": [
-    "Microsoft.VisualStudio.BuildTools"
-  ],
+  "WingetSkipPackages": [],
+  "SkipManagers": [],
   "PipSkipPackages": [
-    "tokenizers"
+    "astroid"
   ],
-  "PipIgnoreHealthPackages": [
-    "pogotransfer",
-    "fastapi",
-    "hf-gradio",
-    "mega-py"
-  ]
+  "PipIgnoreHealthPackages": []
 }
