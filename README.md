@@ -28,14 +28,14 @@ A single PowerShell script that keeps your entire Windows machine up to date —
 
 | Category | Tools |
 |----------|-------|
-| Package managers | Winget, Scoop, Chocolatey |
+| Package managers | Winget source refresh + upgrades, Scoop, Chocolatey |
 | System | Windows Update, Microsoft Store apps, WSL distros, Windows Defender signatures |
-| JavaScript | npm, pnpm, yarn, bun, deno |
-| Python | pip, pipx, uv, uv tools, Poetry |
-| Systems languages | Rust + cargo binaries, Go |
+| JavaScript | npm, pnpm, yarn, bun, deno, Volta, fnm |
+| Python | pip, pipx, uv, uv tools, uv-managed Python patch releases, Poetry |
+| Systems languages | Rust + cargo binaries, Go, Julia via juliaup |
 | .NET | dotnet tools, dotnet workloads |
 | Other runtimes | Flutter, Ruby gems, Composer |
-| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs |
+| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs, Oh My Posh, yt-dlp |
 | AI | Ollama models when `-UpdateOllamaModels` is supplied |
 | Cleanup | Temp files, DNS cache, Recycle Bin, optional DISM component cleanup |
 
@@ -44,7 +44,7 @@ A single PowerShell script that keeps your entire Windows machine up to date —
 | Mode | What it skips |
 |------|---------------|
 | *(default)* | Optional Ollama model pulls; admin-only tasks still require elevation |
-| `-FastMode` | Chocolatey, WSL distros, npm, pnpm, bun, deno, Rust, Go, pip, uv, VS Code extensions, PowerShell modules, and more slow steps |
+| `-FastMode` | Chocolatey, WSL distros, npm, pnpm, bun, deno, Rust, Go, pip, uv, Julia, VS Code extensions, PowerShell modules, and more slow steps |
 | `-UltraFast` | Everything FastMode skips + Windows Update, Store apps, WSL, cleanup |
 
 ## DryRun and WhatChanged
@@ -81,7 +81,7 @@ Supported keys mirror the `$script:Config` hashtable in the script. Any key set 
 .\updatescript.ps1 -AutoElevate -Schedule -ScheduleTime "03:00"
 ```
 
-The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` so it completes unattended.
+The scheduled task runs with `-SkipReboot -SkipWSL -SkipWindowsUpdate -Quiet` so it completes unattended.
 
 ![flow diagram](assets/flow-diagram.svg)
 
@@ -95,7 +95,6 @@ The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` 
 | `-NoElevate` | Force run without elevation (some steps skipped) |
 | `-FastMode` | Skip slow optional tools |
 | `-UltraFast` | Skip everything FastMode does + system tasks |
-| `-NoPause` | Don't wait for keypress at end |
 | `-SkipWindowsUpdate` | Skip Windows Update |
 | `-SkipReboot` | Never prompt to reboot |
 | `-SkipDestructive` | Skip actions that modify system state |
@@ -103,12 +102,12 @@ The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` 
 | `-SkipWSLDistros` | Skip updating WSL distros |
 | `-SkipDefender` | Skip Defender signature update |
 | `-SkipStoreApps` | Skip Microsoft Store app updates |
-| `-SkipNode` | Skip Node.js ecosystem (npm, pnpm, yarn, bun, deno) |
+| `-SkipNode` | Skip Node.js ecosystem (npm, pnpm, yarn, bun, deno, Volta, fnm) |
 | `-SkipRust` | Skip Rust + cargo binaries |
 | `-SkipGo` | Skip Go |
 | `-SkipFlutter` | Skip Flutter |
 | `-SkipGitLFS` | Skip git-lfs |
-| `-SkipUVTools` | Skip uv tool upgrade |
+| `-SkipUVTools` | Skip uv tool and uv-managed Python upgrades |
 | `-SkipVSCodeExtensions` | Skip VS Code extension updates |
 | `-SkipPoetry` | Skip Poetry |
 | `-SkipComposer` | Skip Composer |
@@ -129,6 +128,7 @@ The scheduled task runs with `-SkipReboot -NoPause -SkipWSL -SkipWindowsUpdate` 
 | `-RetryCount` | Task retry count for transient failures (default: 1) |
 | `-Only` | Run only matching task names, categories, or tags |
 | `-Skip` | Skip matching task names, categories, or tags |
+| `-IncludeProtectedApps` | Backward-compatible no-op; protected apps are included by default |
 | `-ListTasks` | Show planned/skipped tasks and write a summary |
 | `-SelfTest` | Run a minimal internal task through the scheduler |
 

@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [6.5.0] — 2026-05-18
+
+### Added
+
+- **Winget source refresh** — runs `winget source update` as its own serialized package-manager task before winget upgrade scans.
+- **Broader developer-tool coverage** — adds tasks for `yt-dlp`, `oh-my-posh`, `juliaup`, `volta`, and `fnm`.
+- **uv-managed Python refresh** — detects installed uv CPython major/minor versions and reinstalls latest patch releases.
+- **WSL zypper support** — WSL distro updates now cover openSUSE-style distros in addition to apt and pacman.
+
+### Changed
+
+- Fast mode now skips the new slower optional tool refresh tasks.
+- Protected desktop apps are no longer skipped by default; the built-in protected app lists are empty and `-IncludeProtectedApps` remains only for backward compatibility.
+
+### Fixed
+
+- **oh-my-posh timeout reporting** — avoids 15-minute silent self-update hangs where possible, checks the winget package first, and fails the task if standalone upgrade times out.
+- **pnpm broken shim detection** — treats missing `@pnpm/exe/pnpm.exe` shim output as a task failure even when the wrapper exits successfully.
+
 ## [2.6.3] — 2026-03-23
 
 ### Fixed
