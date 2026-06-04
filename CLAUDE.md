@@ -34,7 +34,7 @@ Use `$PSVersionTable.PSVersion` to report PS version when filing issues. PowerSh
 1. `param(...)` block — all flags.
 2. Encoding/globals/`$updateResults` buckets (`Success`, `Failed`, `Checked`, `Skipped`, `Details`).
 3. `$script:Config` hashtable (line 88) — timeouts, skip lists, `FastModeSkip`/`UltraFastSkip` name lists, `WingetUpgradeHooks` (per-package Pre/Post scriptblocks).
-4. `update-config.json` merged into `$script:Config` if present. **Note:** lines 215–217 force-clear `WingetSkipPackages`, `PipSkipPackages`, `SkipManagers` after merge — user config exclusions in those fields are intentionally ignored (comment line 214: "update everything"). Do not "fix" this without asking.
+4. `update-config.json` merged into `$script:Config` if present. Array properties (e.g. `WingetSkipPackages`, `PipSkipPackages`, `PipIgnoreHealthPackages`) replace defaults with config values via `ConvertTo-FilterList`. User config values are respected.
 5. Elevation / `-Schedule` branch / param normalization.
 6. Helper functions (~line 266–1143): command detection, winget parsing, MSI recovery, logging, state persistence.
 7. `Invoke-Update` (line 1145) — core wrapper for all sequential sections.
