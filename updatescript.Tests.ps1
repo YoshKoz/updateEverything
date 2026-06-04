@@ -3,6 +3,34 @@
 
 BeforeAll {
     $script:ScriptPath = Join-Path $PSScriptRoot 'updatescript.ps1'
+    $script:PwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $script:PwshPath) {
+        $pwshFileName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
+        $script:PwshPath = Join-Path $PSHOME $pwshFileName
+    }
+    $script:InvokeTestPwsh = {
+        param([Parameter(Mandatory)][string[]]$Arguments)
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $script:PwshPath
+        foreach ($argument in $Arguments) {
+            [void]$psi.ArgumentList.Add($argument)
+        }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output   = (($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()) -replace "`0", '')
+        }
+    }
     $errors = $null
     $tokens = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$tokens, [ref]$errors)
@@ -109,6 +137,74 @@ Describe 'New-UpdateTask' {
         $task = New-UpdateTask -Name 't' -Category 'c' -Script {} -Tags @('Tag One', 'TAG-TWO')
         $task.Tags | Should -Contain 'tag-one'
         $task.Tags | Should -Contain 'tag-two'
+    }
+}
+
+# -- ConvertFrom-WingetUpgradeOutput ------------------------------------------------
+
+Describe 'ConvertFrom-WingetUpgradeOutput' {
+    It 'parses regular winget upgrade table rows' {
+        $output = @(
+            'Name                     Id                Version Available Source',
+            '------------------------------------------------------------------',
+            'Git                      Git.Git           2.44.0  2.45.0    winget'
+        )
+
+        $packages = @(ConvertFrom-WingetUpgradeOutput -Output $output)
+
+        $packages | Should -HaveCount 1
+        $packages[0].Id | Should -Be 'Git.Git'
+        $packages[0].Version | Should -Be '2.44.0'
+        $packages[0].Available | Should -Be '2.45.0'
+        $packages[0].IsUnknown | Should -BeFalse
+    }
+
+    It 'parses unknown-version rows with a display version before the package id' {
+        $output = @(
+            'Node.js 22.14.0 OpenJS.NodeJS Unknown 22.15.0 winget'
+        )
+
+        $packages = @(ConvertFrom-WingetUpgradeOutput -Output $output)
+
+        $packages | Should -HaveCount 1
+        $packages[0].Name | Should -Be 'Node.js'
+        $packages[0].Id | Should -Be 'OpenJS.NodeJS'
+        $packages[0].DisplayVersion | Should -Be '22.14.0'
+        $packages[0].IsUnknown | Should -BeTrue
+        $packages[0].InstalledLooksCurrent | Should -BeFalse
+    }
+
+    It 'marks unknown-version rows as current when display and available versions match' {
+        $packages = @(ConvertFrom-WingetUpgradeOutput -Output @('Node.js 22.15.0 OpenJS.NodeJS Unknown 22.15.0 winget'))
+
+        $packages | Should -HaveCount 1
+        $packages[0].InstalledLooksCurrent | Should -BeTrue
+    }
+
+    It 'parses compact Microsoft Store ids from source-filtered output' {
+        $output = @(
+            'Name                     Id           Version Available Source',
+            '-------------------------------------------------------------',
+            'Windows Terminal         9N0DX20HK701 1.20.0  1.21.0    msstore'
+        )
+
+        $packages = @(ConvertFrom-WingetUpgradeOutput -Output $output)
+
+        $packages | Should -HaveCount 1
+        $packages[0].Id | Should -Be '9N0DX20HK701'
+        $packages[0].Source | Should -Be 'msstore'
+    }
+
+    It 'parses rows when winget omits the Source column' {
+        $packages = @(ConvertFrom-WingetUpgradeOutput -Output @(
+                'Name                     Id                Version Available',
+                '----------------------------------------------------------',
+                'Git                      Git.Git           2.44.0  2.45.0'
+            ))
+
+        $packages | Should -HaveCount 1
+        $packages[0].Id | Should -Be 'Git.Git'
+        $packages[0].Source | Should -BeNullOrEmpty
     }
 }
 
@@ -527,16 +623,16 @@ Describe 'Show-WhatChanged' {
 
 Describe 'Script integration' {
     It 'runs SelfTest cleanly' {
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -SelfTest -NoElevate 2>&1
-        $LASTEXITCODE | Should -Be 0
-        ($output | Out-String) | Should -Match 'All runnable tasks completed'
-        ($output | Out-String) | Should -Not -Match 'WARNING:'
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-SelfTest', '-NoElevate')
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'All runnable tasks completed'
+        $result.Output | Should -Not -Match 'WARNING:'
     }
 
     It 'exits 0 and reports no tasks when -Only filter matches nothing' {
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -DryRun -NoElevate -Only definitely-not-a-real-update-task 2>&1
-        $LASTEXITCODE | Should -Be 0
-        ($output | Out-String) | Should -Match 'No runnable update tasks were found'
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-DryRun', '-NoElevate', '-Only', 'definitely-not-a-real-update-task')
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'No runnable update tasks were found'
     }
 
     It 'parses with no syntax errors' {
@@ -548,8 +644,9 @@ Describe 'Script integration' {
 
     It '-ListTasks exits 0 and names expected tasks' {
         $stateDir = Join-Path $script:TestRoot 'listtasks-state'
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -ListTasks -NoElevate -StateDir $stateDir 2>&1 | Out-String
-        $LASTEXITCODE | Should -Be 0
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-ListTasks', '-NoElevate', '-ShowSkipped', '-StateDir', $stateDir)
+        $output = $result.Output
+        $result.ExitCode | Should -Be 0
         $output | Should -Match 'winget-source'
         $output | Should -Match 'uv-python'
         $output | Should -Match 'oh-my-posh'
@@ -561,16 +658,18 @@ Describe 'Script integration' {
 
     It '-SkipNode hides volta and fnm in task list' {
         $stateDir = Join-Path $script:TestRoot 'skipnode-state'
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -ListTasks -NoElevate -ShowSkipped -SkipNode -StateDir $stateDir 2>&1 | Out-String
-        $LASTEXITCODE | Should -Be 0
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-ListTasks', '-NoElevate', '-ShowSkipped', '-SkipNode', '-StateDir', $stateDir)
+        $output = $result.Output
+        $result.ExitCode | Should -Be 0
         ($output | Select-String 'volta' | Where-Object { $_ -match 'Skipped|skipped|disabled' }).Count | Should -BeGreaterThan 0
         ($output | Select-String 'fnm' | Where-Object { $_ -match 'Skipped|skipped|disabled' }).Count | Should -BeGreaterThan 0
     }
 
     It '-SkipUVTools hides uv, uv-tools, and uv-python in task list' {
         $stateDir = Join-Path $script:TestRoot 'skipuv-state'
-        $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath -ListTasks -NoElevate -ShowSkipped -SkipUVTools -StateDir $stateDir 2>&1 | Out-String
-        $LASTEXITCODE | Should -Be 0
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-ListTasks', '-NoElevate', '-ShowSkipped', '-SkipUVTools', '-StateDir', $stateDir)
+        $output = $result.Output
+        $result.ExitCode | Should -Be 0
         $uvSkips = @($output -split '\n' | Where-Object { $_ -match '\buv\b|\buv-tools\b|\buv-python\b' } | Where-Object { $_ -match 'Skipped|skipped|disabled' })
         $uvSkips.Count | Should -BeGreaterThan 0
     }

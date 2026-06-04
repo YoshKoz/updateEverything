@@ -1,8 +1,23 @@
 {
-  "WingetSkipPackages": [],
-  "SkipManagers": [],
-  "PipSkipPackages": [
-    "astroid"
+  "WingetSkipPackages": [
+    "JanDeDobbeleer.OhMyPosh",
+    "Anthropic.Claude",
+    "GitHub.cli",
+    "Microsoft.PowerShell",
+    "OpenAI.Codex",
+    "gerardog.gsudo",
+    "PatchMyPC.PatchMyPC",
+    "ZedIndustries.Zed",
+    "ZedIndustries.Zed.Preview"
   ],
-  "PipIgnoreHealthPackages": []
+  "SkipManagers": ["wsl-distros"],
+  "PipSkipPackages": [
+    "astroid",
+    "pydantic-core"
+  ],
+  "PipIgnoreHealthPackages": [
+    "pylint",
+    "huggingface-hub",
+    "mega-py"
+  ]
 }

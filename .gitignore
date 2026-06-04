@@ -19,3 +19,6 @@ Desktop.ini
 downloads/
 staging/
 backups/
+
+# Rust
+target/
