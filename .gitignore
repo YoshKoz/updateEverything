@@ -14,11 +14,31 @@ Desktop.ini
 *.swp
 *~
 .aider*
+.cline/
+.serena/
 
 # Local working dirs
 downloads/
 staging/
 backups/
+
+# Local tool config / session files
+.claude/*.lock
+.claude/settings.local.json
+
+# Runtime outputs
+run-*.txt
+script_output.txt
+bw_backup_*.json
+github-release-monitor.ps1
+github-release-watcher.ps1
+release-watcher-state.json
+release-monitor.log
+
+# Rewrite build outputs
+rewrites/go/*.exe
+rewrites/go/stdout.txt
+rewrites/go/stderr.txt
 
 # Rust
 target/
