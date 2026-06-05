@@ -304,7 +304,7 @@ func taskGo() *Task {
 			}
 
 			tc.Log("Cleaning Go module cache...")
-			tc.RunCmd("go", RunOpts{
+			_, _ = tc.RunCmd("go", RunOpts{
 				Args:       []string{"clean", "-modcache"},
 				TimeoutSec: 60,
 			})

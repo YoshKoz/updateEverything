@@ -78,13 +78,24 @@ func taskWinget(timeoutSec int, skipPackages []string) *Task {
 			var failed []string
 			for _, id := range toUpgrade {
 				tc.Log("Upgrading winget package: " + id)
-				_, err := tc.RunCmd("winget", RunOpts{
+				res, err := tc.RunCmd("winget", RunOpts{
 					Args:            []string{"upgrade", "--id", id, "--exact", "--include-unknown", "--silent", "--disable-interactivity", "--accept-package-agreements", "--accept-source-agreements", "--force"},
 					SuccessExitCode: []int{0, -1978335189},
 					Retries:         1,
 				})
 				if err != nil {
-					failed = append(failed, id)
+					locked := false
+					for _, l := range res.Lines {
+						if strings.Contains(l, "Access is denied") {
+							locked = true
+							break
+						}
+					}
+					if locked {
+						tc.Log("Skipping " + id + ": file locked (process is running)")
+					} else {
+						failed = append(failed, id)
+					}
 				}
 			}
 			if len(failed) > 0 {
@@ -176,9 +187,9 @@ func taskScoop() *Task {
 				return err
 			}
 			tc.Log("Running scoop cleanup...")
-			tc.RunCmd("scoop", RunOpts{Args: []string{"cleanup", "*"}, TimeoutSec: 300})
+			_, _ = tc.RunCmd("scoop", RunOpts{Args: []string{"cleanup", "*"}, TimeoutSec: 300})
 			tc.Log("Running scoop cache rm *...")
-			tc.RunCmd("scoop", RunOpts{Args: []string{"cache", "rm", "*"}, TimeoutSec: 120})
+			_, _ = tc.RunCmd("scoop", RunOpts{Args: []string{"cache", "rm", "*"}, TimeoutSec: 120})
 			return nil
 		},
 	}

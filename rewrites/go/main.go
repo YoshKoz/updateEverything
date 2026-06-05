@@ -441,12 +441,11 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+var globalCtx context.Context
 var globalCancel context.CancelFunc
 
 func setupSignalHandler() {
-	var ctx context.Context
-	ctx, globalCancel = context.WithCancel(context.Background())
-	_ = ctx
+	globalCtx, globalCancel = context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
