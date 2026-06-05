@@ -189,37 +189,37 @@ func Run(name string, opts RunOpts) (RunResult, error) {
 			time.Sleep(delay)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.TimeoutSec)*time.Second)
-		cmd := exec.CommandContext(ctx, rc.exe, allArgs...)
-		cmd.Stdout = &bytes.Buffer{}
-		cmd.Stderr = &bytes.Buffer{}
-		if opts.Stdin != nil {
-			cmd.Stdin = opts.Stdin
-		}
-		if len(opts.Env) > 0 {
-			cmd.Env = append(os.Environ(), opts.Env...)
-		}
-		if name != "winget" {
-			setSysProcAttr(cmd)
-		}
-
-		runErr := cmd.Run()
-		cancel()
-
-		exitCode := 0
-		if runErr != nil {
-			if exitErr, ok := runErr.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
-			} else if ctx.Err() == context.DeadlineExceeded {
-				exitCode = 124
-			} else {
-				exitCode = 1
+		exitCode, lines := func() (int, []string) {
+			ctx, cancel := context.WithTimeout(globalCtx, time.Duration(opts.TimeoutSec)*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, rc.exe, allArgs...)
+			cmd.Stdout = &bytes.Buffer{}
+			cmd.Stderr = &bytes.Buffer{}
+			if opts.Stdin != nil {
+				cmd.Stdin = opts.Stdin
 			}
-		}
+			if len(opts.Env) > 0 {
+				cmd.Env = append(os.Environ(), opts.Env...)
+			}
+			if name != "winget" {
+				setSysProcAttr(cmd)
+			}
+			runErr := cmd.Run()
+			code := 0
+			if runErr != nil {
+				if exitErr, ok := runErr.(*exec.ExitError); ok {
+					code = int(int32(exitErr.ExitCode()))
+				} else if ctx.Err() == context.DeadlineExceeded {
+					code = 124
+				} else {
+					code = 1
+				}
+			}
+			stdout := cmd.Stdout.(*bytes.Buffer).String()
+			stderr := cmd.Stderr.(*bytes.Buffer).String()
+			return code, splitLines(stdout + "\n" + stderr)
+		}()
 
-		stdout := cmd.Stdout.(*bytes.Buffer).String()
-		stderr := cmd.Stderr.(*bytes.Buffer).String()
-		lines := splitLines(stdout + "\n" + stderr)
 		lastResult = RunResult{Lines: lines, ExitCode: exitCode}
 
 		for _, code := range opts.SuccessExitCode {

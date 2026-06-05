@@ -34,8 +34,10 @@ func initLog(path string) error {
 	if info, err := os.Stat(path); err == nil {
 		if info.Size() > maxLogSizeMB*1024*1024 {
 			rotatedPath := path + ".1"
-			os.Remove(rotatedPath)
-			os.Rename(path, rotatedPath)
+			_ = os.Remove(rotatedPath)
+			if err := os.Rename(path, rotatedPath); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: log rotation failed: %v\n", err)
+			}
 		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
