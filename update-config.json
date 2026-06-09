@@ -1,6 +1,6 @@
 {
   "WingetSkipPackages": [],
-  "SkipManagers": ["go", "vscode-extensions"],
+  "SkipManagers": [],
   "PipSkipPackages": [],
   "PipIgnoreHealthPackages": [
     "pylint",
