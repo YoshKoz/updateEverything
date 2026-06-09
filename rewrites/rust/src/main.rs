@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -73,6 +73,9 @@ struct Config {
     skip_managers: Vec<String>,
     #[serde(default)]
     pip_skip_packages: Vec<String>,
+    /// Alias for pip_skip_packages — matches PS1 PipIgnoreHealthPackages field
+    #[serde(default)]
+    pip_ignore_health_packages: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +86,8 @@ struct Task {
     command: &'static str,
     args: Vec<String>,
     requires: &'static str,
+    /// Named lock acquired before running in parallel mode ("" = no lock)
+    resource: &'static str,
     skip_reason: Option<String>,
 }
 
@@ -178,12 +183,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_tasks(
-    tasks: Vec<Task>,
-    cli: &Cli,
-    jobs: usize,
-    timeout: Duration,
-) -> Vec<TaskSummary> {
+fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec<TaskSummary> {
     let mut results: Vec<TaskSummary> = Vec::with_capacity(tasks.len());
 
     if cli.dry_run {
@@ -206,7 +206,6 @@ fn run_tasks(
         return results;
     }
 
-    let multi = jobs > 1;
     let (skipped, to_run): (Vec<_>, Vec<_>) =
         tasks.into_iter().partition(|t| t.skip_reason.is_some());
 
@@ -220,29 +219,42 @@ fn run_tasks(
 
     if jobs <= 1 {
         for task in to_run {
-            let r = run_task_streaming(&task, cli.quiet, timeout, false);
+            let r = run_task_streaming(&task, cli.quiet, timeout, false, &HashMap::new());
             results.push(r);
         }
     } else {
-        let queue: Arc<Mutex<Vec<Task>>> = Arc::new(Mutex::new(to_run));
+        // Build resource locks: tasks sharing a resource name run serially
+        let mut resource_locks: HashMap<String, Arc<Mutex<()>>> = HashMap::new();
+        for task in &to_run {
+            if !task.resource.is_empty() {
+                resource_locks
+                    .entry(task.resource.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(())));
+            }
+        }
+        let resource_locks = Arc::new(resource_locks);
+
+        let queue: Arc<Mutex<VecDeque<Task>>> = Arc::new(Mutex::new(to_run.into_iter().collect()));
         let out: Arc<Mutex<Vec<TaskSummary>>> = Arc::new(Mutex::new(Vec::new()));
 
         let mut handles = vec![];
-        let worker_count = jobs;
-        for _ in 0..worker_count {
+        for _ in 0..jobs {
             let queue = Arc::clone(&queue);
             let out = Arc::clone(&out);
+            let locks = Arc::clone(&resource_locks);
             let quiet = cli.quiet;
-            let h = thread::spawn(move || loop {
-                let task = {
-                    let mut q = queue.lock().unwrap();
-                    if q.is_empty() {
-                        break;
-                    }
-                    q.remove(0)
-                };
-                let r = run_task_streaming(&task, quiet, timeout, multi);
-                out.lock().unwrap().push(r);
+            let h = thread::spawn(move || {
+                loop {
+                    let task = {
+                        let mut q = queue.lock().unwrap();
+                        match q.pop_front() {
+                            Some(t) => t,
+                            None => break,
+                        }
+                    };
+                    let r = run_task_streaming(&task, quiet, timeout, true, &locks);
+                    out.lock().unwrap().push(r);
+                }
             });
             handles.push(h);
         }
@@ -256,21 +268,53 @@ fn run_tasks(
     results
 }
 
-fn run_task_streaming(task: &Task, quiet: bool, timeout: Duration, prefix_output: bool) -> TaskSummary {
+fn run_task_streaming(
+    task: &Task,
+    quiet: bool,
+    timeout: Duration,
+    prefix_output: bool,
+    resource_locks: &HashMap<String, Arc<Mutex<()>>>,
+) -> TaskSummary {
     if !quiet {
-        println!("run  {:<22} {} {}", task.id, task.command, shell_join(&task.args));
+        println!(
+            "run  {:<22} {} {}",
+            task.id,
+            task.command,
+            shell_join(&task.args)
+        );
     }
 
+    // Acquire resource lock for the duration of this task
+    let _resource_guard = if !task.resource.is_empty() {
+        resource_locks.get(task.resource).map(|m| m.lock().unwrap())
+    } else {
+        None
+    };
+
     let start = Instant::now();
-    let mut child = match Command::new(task.command)
+    let mut command = Command::new(task.command);
+    command
         .args(&task.args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
     {
+        // Own process group, so a timeout can kill the task's whole process
+        // tree (a plain kill() leaves grandchildren running and holding the
+        // output pipes open).
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            return make_summary(task, "Failed", start.elapsed().as_millis(), Some(127), vec![err.to_string()]);
+            return make_summary(
+                task,
+                "Failed",
+                start.elapsed().as_millis(),
+                Some(127),
+                vec![err.to_string()],
+            );
         }
     };
 
@@ -323,40 +367,77 @@ fn run_task_streaming(task: &Task, quiet: bool, timeout: Duration, prefix_output
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() >= timeout => {
                 timed_out = true;
-                let _ = child.kill();
+                kill_task(&mut child);
                 break;
             }
             Ok(None) => thread::sleep(Duration::from_millis(200)),
             Err(err) => {
-                return make_summary(task, "Failed", start.elapsed().as_millis(), None, vec![err.to_string()]);
+                return make_summary(
+                    task,
+                    "Failed",
+                    start.elapsed().as_millis(),
+                    None,
+                    vec![err.to_string()],
+                );
             }
         }
     }
 
     let exit_status = child.wait().ok();
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-
-    let mut all_lines = Arc::try_unwrap(lines_out).unwrap().into_inner().unwrap();
-    all_lines.extend(Arc::try_unwrap(lines_err).unwrap().into_inner().unwrap());
+    let duration_ms = start.elapsed().as_millis();
+    if !timed_out {
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
+    }
+    // On timeout the reader threads may still be blocked on pipes held open by
+    // surviving grandchildren (Windows kill() is not a tree kill); take what
+    // was captured so far instead of joining.
+    let mut all_lines = lines_out.lock().unwrap().clone();
+    all_lines.extend(lines_err.lock().unwrap().iter().cloned());
 
     let status = if timed_out {
         "TimedOut".to_string()
     } else {
-        exit_status.map(status_name).unwrap_or_else(|| "Failed".to_string())
+        exit_status
+            .map(status_name)
+            .unwrap_or_else(|| "Failed".to_string())
     };
     let code = exit_status.and_then(|s| s.code());
-    let duration_ms = start.elapsed().as_millis();
 
     if !quiet {
-        let secs = duration_ms as f64 / 1000.0;
-        println!("done {:<22} {} ({:.1}s)", task.id, status, secs);
+        println!(
+            "done {:<22} {} ({:.1}s)",
+            task.id,
+            status,
+            duration_ms as f64 / 1000.0
+        );
     }
 
     make_summary(task, &status, duration_ms, code, tail(all_lines, 30))
 }
 
-fn make_summary(task: &Task, status: &str, duration_ms: u128, exit_code: Option<i32>, output_tail: Vec<String>) -> TaskSummary {
+/// Kill a timed-out task. On unix the child was started in its own process
+/// group, so signal the whole group to take grandchildren down with it.
+#[cfg(unix)]
+fn kill_task(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn kill_task(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+fn make_summary(
+    task: &Task,
+    status: &str,
+    duration_ms: u128,
+    exit_code: Option<i32>,
+    output_tail: Vec<String>,
+) -> TaskSummary {
     TaskSummary {
         id: task.id.to_string(),
         category: task.category.to_string(),
@@ -370,6 +451,14 @@ fn make_summary(task: &Task, status: &str, duration_ms: u128, exit_code: Option<
 }
 
 fn build_tasks(config: &Config) -> Vec<Task> {
+    // Merge pip_skip and pip_ignore_health_packages (PS1 compat)
+    let mut pip_skip = config.pip_skip_packages.clone();
+    for pkg in &config.pip_ignore_health_packages {
+        if !pip_skip.contains(pkg) {
+            pip_skip.push(pkg.clone());
+        }
+    }
+
     let winget_upgrade_args = winget_upgrade_args(&config.winget_skip_packages);
     vec![
         Task::new(
@@ -378,14 +467,16 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             &["windows", "winget"],
             "winget",
             &["source", "update"],
-        ),
+        )
+        .with_resource("winget"),
         Task::new_vec(
             "winget",
             "package-manager",
             &["windows", "winget"],
             "winget",
             winget_upgrade_args,
-        ),
+        )
+        .with_resource("winget"),
         Task::new(
             "scoop",
             "package-manager",
@@ -400,6 +491,20 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "choco",
             &["upgrade", "all", "-y"],
         ),
+        // Linux (Arch/WSL) system packages; skipped on Windows where pacman
+        // doesn't exist. Needs sudo, so run interactively (or with NOPASSWD).
+        Task::new_with_requires(
+            "pacman",
+            "package-manager",
+            &["linux", "arch"],
+            "sudo",
+            vec![
+                "pacman".to_string(),
+                "-Syu".to_string(),
+                "--noconfirm".to_string(),
+            ],
+            "pacman",
+        ),
         Task::new("npm", "javascript", &["node"], "npm", &["update", "-g"]),
         Task::new("pnpm", "javascript", &["node"], "pnpm", &["self-update"]),
         Task::new(
@@ -412,12 +517,13 @@ fn build_tasks(config: &Config) -> Vec<Task> {
         Task::new("bun", "javascript", &["node"], "bun", &["upgrade"]),
         Task::new("deno", "javascript", &["node"], "deno", &["upgrade"]),
         Task::new("rustup", "rust", &["rust"], "rustup", &["update"]),
-        Task::new(
+        Task::new_with_requires(
             "cargo",
             "rust",
             &["rust"],
             "cargo",
-            &["install-update", "-a"],
+            vec!["install-update".to_string(), "-a".to_string()],
+            "cargo-install-update",
         ),
         Task::new("pipx", "python", &["python"], "pipx", &["upgrade-all"]),
         Task::new_vec(
@@ -425,7 +531,7 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "python",
             &["python"],
             "python",
-            pip_args(&config.pip_skip_packages),
+            pip_upgrade_args(&pip_skip),
         ),
         Task::new("uv", "python", &["python"], "uv", &["self", "update"]),
         Task::new(
@@ -453,6 +559,14 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "dotnet",
             &["workload", "update"],
         ),
+        Task::new_with_requires(
+            "dotnet-tools",
+            "dotnet",
+            &["dotnet"],
+            "python",
+            dotnet_tools_upgrade_args(),
+            "dotnet",
+        ),
         Task::new(
             "vscode-extensions",
             "editor",
@@ -460,7 +574,15 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "code",
             &["--update-extensions"],
         ),
-        Task::new("git-lfs", "git", &["git"], "git", &["lfs", "update"]),
+        // git lfs install refreshes global hooks; binary itself is managed by winget/scoop
+        Task::new_with_requires(
+            "git-lfs",
+            "git",
+            &["git"],
+            "git",
+            vec!["lfs".to_string(), "install".to_string()],
+            "git-lfs",
+        ),
         Task::new(
             "gh-extensions",
             "github",
@@ -469,9 +591,22 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             &["extension", "upgrade", "--all"],
         ),
         Task::new("yt-dlp", "media", &["media"], "yt-dlp", &["-U"]),
-        Task::new("mise", "version-manager", &["mise"], "mise", &["self-upgrade"]),
-        Task::new("mise-upgrade", "version-manager", &["mise"], "mise", &["upgrade"]),
+        Task::new(
+            "mise",
+            "version-manager",
+            &["mise"],
+            "mise",
+            &["self-upgrade"],
+        ),
+        Task::new(
+            "mise-upgrade",
+            "version-manager",
+            &["mise"],
+            "mise",
+            &["upgrade"],
+        ),
         Task::new("tldr", "dev-tools", &["dev-tools"], "tldr", &["--update"]),
+        // ollama list shows installed models; use --pull-models flag (future) to upgrade them
         Task::new("ollama", "ai", &["ai"], "ollama", &["list"]),
     ]
     .into_iter()
@@ -510,8 +645,34 @@ impl Task {
             command,
             args,
             requires: command,
+            resource: "",
             skip_reason: None,
         }
+    }
+
+    fn new_with_requires(
+        id: &'static str,
+        category: &'static str,
+        tags: &'static [&'static str],
+        command: &'static str,
+        args: Vec<String>,
+        requires: &'static str,
+    ) -> Self {
+        Self {
+            id,
+            category,
+            tags,
+            command,
+            args,
+            requires,
+            resource: "",
+            skip_reason: None,
+        }
+    }
+
+    fn with_resource(mut self, resource: &'static str) -> Self {
+        self.resource = resource;
+        self
     }
 }
 
@@ -519,6 +680,8 @@ fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
     let mut args = vec![
         "upgrade",
         "--all",
+        "--source",
+        "winget",
         "--include-unknown",
         "--include-pinned",
         "--accept-package-agreements",
@@ -538,18 +701,54 @@ fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
     args
 }
 
-fn pip_args(skip_packages: &[String]) -> Vec<String> {
-    let mut args = vec!["-m", "pip", "list", "--outdated", "--format=json"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+/// Generates args for `python -c <script>` that upgrades pip itself then all outdated packages.
+fn pip_upgrade_args(skip_packages: &[String]) -> Vec<String> {
+    let skip_set = skip_packages
+        .iter()
+        .map(|s| format!("\"{}\"", s.to_lowercase().replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    for package in skip_packages {
-        args.push("--exclude".to_string());
-        args.push(package.clone());
-    }
+    // Python script (python -c accepts newlines): upgrade pip, then upgrade
+    // all outdated packages. On PEP 668 externally-managed installs (Arch,
+    // Debian, ...) pip must not touch system site-packages — report and bow
+    // out so the OS package manager keeps ownership. Exits non-zero if any
+    // package upgrade fails, so the task is not reported as Succeeded.
+    let script = format!(
+        r#"
+import json, os, subprocess, sys, sysconfig
+if os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")):
+    print("pip: externally managed environment (PEP 668); system packages are owned by the OS package manager")
+    sys.exit(0)
+skip = {{{skip_set}}}
+subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=False)
+r = subprocess.run([sys.executable, "-m", "pip", "list", "--outdated", "--format=json"], capture_output=True, text=True)
+pkgs = [p["name"] for p in json.loads(r.stdout or "[]") if p["name"].lower() not in skip]
+if not pkgs:
+    print("All pip packages up to date")
+    sys.exit(0)
+failed = []
+for p in pkgs:
+    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-U", p], check=False).returncode
+    print(("upgraded " if rc == 0 else "FAILED ") + p)
+    if rc != 0:
+        failed.append(p)
+sys.exit(1 if failed else 0)
+"#
+    );
 
-    args
+    vec!["-c".to_string(), script]
+}
+
+/// Generates args for `python -c <script>` that lists dotnet global tools and updates each.
+fn dotnet_tools_upgrade_args() -> Vec<String> {
+    let script = "import subprocess,json,sys;\
+r=subprocess.run([\"dotnet\",\"tool\",\"list\",\"--global\"],capture_output=True,text=True);\
+lines=r.stdout.strip().splitlines()[2:];\
+tools=[l.split()[0] for l in lines if l.strip()];\
+print(\"No global dotnet tools installed\") if not tools else [subprocess.run([\"dotnet\",\"tool\",\"update\",\"--global\",t],check=False) for t in tools]";
+
+    vec!["-c".to_string(), script.to_string()]
 }
 
 fn mark_missing(mut task: Task) -> Task {
@@ -625,7 +824,6 @@ fn filter_tasks(
         .collect()
 }
 
-
 fn load_prev_summary(cli: &Cli, repo_root: &Path) -> Option<PrevSummary> {
     let candidates: Vec<PathBuf> = {
         let mut v = vec![];
@@ -633,7 +831,11 @@ fn load_prev_summary(cli: &Cli, repo_root: &Path) -> Option<PrevSummary> {
             v.push(dir.join("last-run.json"));
         }
         if let Some(local) = env::var_os("LOCALAPPDATA") {
-            v.push(PathBuf::from(local).join("Update-Everything").join("last-run.json"));
+            v.push(
+                PathBuf::from(local)
+                    .join("Update-Everything")
+                    .join("last-run.json"),
+            );
         }
         v.push(repo_root.join("staging").join("rust-run-summary.json"));
         v
@@ -643,22 +845,18 @@ fn load_prev_summary(cli: &Cli, repo_root: &Path) -> Option<PrevSummary> {
         if !path.exists() {
             continue;
         }
-        // Reject file if it's older than since_hours
-        if cli.since_hours > 0.0 {
-            if let Ok(meta) = fs::metadata(&path) {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(age) = modified.elapsed() {
-                        if age.as_secs_f64() / 3600.0 > cli.since_hours {
-                            continue;
-                        }
-                    }
-                }
-            }
+        if cli.since_hours > 0.0
+            && let Ok(meta) = fs::metadata(&path)
+            && let Ok(modified) = meta.modified()
+            && let Ok(age) = modified.elapsed()
+            && age.as_secs_f64() / 3600.0 > cli.since_hours
+        {
+            continue;
         }
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(summary) = serde_json::from_str::<PrevSummary>(&text) {
-                return Some(summary);
-            }
+        if let Ok(text) = fs::read_to_string(&path)
+            && let Ok(summary) = serde_json::from_str::<PrevSummary>(&text)
+        {
+            return Some(summary);
         }
     }
     None
@@ -696,8 +894,8 @@ fn write_summary(path: &Path, summary: &RunSummary) -> Result<()> {
 }
 
 fn print_task_list(tasks: &[Task]) {
-    println!("{:<24} {:<18} {}", "Task", "Category", "State");
-    println!("{:<24} {:<18} {}", "----", "--------", "-----");
+    println!("{:<24} {:<18} State", "Task", "Category");
+    println!("{:<24} {:<18} -----", "----", "--------");
     for task in tasks {
         let state = task.skip_reason.as_deref().unwrap_or("planned");
         println!("{:<24} {:<18} {}", task.id, task.category, state);
@@ -711,22 +909,20 @@ fn print_summary(summary: &RunSummary) {
     }
 
     println!();
-    println!(
-        "{:<24} {:<12} {:<10} {}",
-        "Task", "Status", "Time(ms)", "Exit"
-    );
-    println!(
-        "{:<24} {:<12} {:<10} {}",
-        "----", "------", "--------", "----"
-    );
+    println!("{:<24} {:<12} {:<8} Exit", "Task", "Status", "Time(s)");
+    println!("{:<24} {:<12} {:<8} ----", "----", "------", "-------");
     for r in &summary.results {
         let exit = r
             .exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let secs = r.duration_ms as f64 / 1000.0;
         println!(
-            "{:<24} {:<12} {:<10} {}",
-            r.id, r.status, r.duration_ms, exit
+            "{:<24} {:<12} {:<8} {}",
+            r.id,
+            r.status,
+            format!("{:.1}", secs),
+            exit
         );
     }
     println!();
@@ -737,9 +933,9 @@ fn print_summary(summary: &RunSummary) {
     let timed_out = counts.get("TimedOut").copied().unwrap_or_default();
     let skipped = counts.get("Skipped").copied().unwrap_or_default();
     let dry = counts.get("DryRun").copied().unwrap_or_default();
+    let total_secs = summary.duration_ms as f64 / 1000.0;
     println!(
-        "done  total={total}  succeeded={succeeded}  failed={failed}  timed-out={timed_out}  skipped={skipped}  dry={dry}  duration={}ms",
-        summary.duration_ms
+        "done  total={total}  succeeded={succeeded}  failed={failed}  timed-out={timed_out}  skipped={skipped}  dry={dry}  duration={total_secs:.1}s"
     );
 }
 
@@ -760,18 +956,15 @@ fn command_exists(name: &str) -> bool {
                     .collect::<Vec<_>>()
             })
             .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    ".exe".to_string(),
-                    ".cmd".to_string(),
-                    ".bat".to_string(),
-                ]
-            })
+            .unwrap_or_else(|| vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string()])
     } else {
         vec!["".to_string()]
     };
 
     for dir in env::split_paths(&path) {
+        if is_foreign_windows_mount(&dir) {
+            continue;
+        }
         if cfg!(windows) {
             for ext in &extensions {
                 let candidate = dir.join(format!("{name}{ext}"));
@@ -785,6 +978,42 @@ fn command_exists(name: &str) -> bool {
     }
 
     false
+}
+
+/// WSL appends the Windows PATH to the Linux PATH, so Windows-side shims
+/// (scoop, gem, code, ...) probe as "present" but cannot run in the Linux
+/// environment (exec format error / CRLF scripts). When running under WSL,
+/// ignore automounted Windows drives (/mnt/<drive-letter>/...) so those
+/// tasks are reported as skipped instead of failing — the Windows build of
+/// this tool is responsible for them.
+#[cfg(unix)]
+fn is_foreign_windows_mount(dir: &Path) -> bool {
+    use std::sync::OnceLock;
+    static IS_WSL: OnceLock<bool> = OnceLock::new();
+    let is_wsl = *IS_WSL.get_or_init(|| {
+        env::var_os("WSL_DISTRO_NAME").is_some()
+            || env::var_os("WSL_INTEROP").is_some()
+            || fs::read_to_string("/proc/version")
+                .map(|v| v.to_ascii_lowercase().contains("microsoft"))
+                .unwrap_or(false)
+    });
+    is_wsl && is_windows_drive_mount_path(dir)
+}
+
+#[cfg(windows)]
+fn is_foreign_windows_mount(_dir: &Path) -> bool {
+    false
+}
+
+/// True for paths under a WSL drvfs automount: /mnt/<single-drive-letter>[/...]
+fn is_windows_drive_mount_path(dir: &Path) -> bool {
+    let mut comps = dir.components();
+    matches!(comps.next(), Some(std::path::Component::RootDir))
+        && comps.next().is_some_and(|c| c.as_os_str() == "mnt")
+        && comps.next().is_some_and(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s.len() == 1 && s.chars().all(|ch| ch.is_ascii_alphabetic())
+        })
 }
 
 fn matches_any(task: &Task, values: &BTreeSet<String>) -> bool {
@@ -842,4 +1071,93 @@ fn find_repo_root() -> Result<PathBuf> {
         }
     }
     env::current_dir().context("failed to resolve current directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_trims_and_lowercases() {
+        assert_eq!(normalize("  WinGet "), "winget");
+        assert_eq!(normalize(""), "");
+    }
+
+    #[test]
+    fn tail_keeps_last_n() {
+        assert_eq!(tail(vec![1, 2, 3, 4], 2), vec![3, 4]);
+        assert_eq!(tail(vec![1, 2], 5), vec![1, 2]);
+        assert_eq!(tail(Vec::<i32>::new(), 3), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn shell_join_quotes_spaces() {
+        let args = vec!["upgrade".to_string(), "My App".to_string()];
+        assert_eq!(shell_join(&args), "upgrade \"My App\"");
+    }
+
+    #[test]
+    fn windows_drive_mount_paths() {
+        assert!(is_windows_drive_mount_path(Path::new("/mnt/c")));
+        assert!(is_windows_drive_mount_path(Path::new(
+            "/mnt/c/Users/yoshi/scoop/shims"
+        )));
+        assert!(is_windows_drive_mount_path(Path::new("/mnt/D/tools")));
+        assert!(!is_windows_drive_mount_path(Path::new("/mnt")));
+        assert!(!is_windows_drive_mount_path(Path::new("/mnt/wsl")));
+        assert!(!is_windows_drive_mount_path(Path::new("/mnt/cd/x")));
+        assert!(!is_windows_drive_mount_path(Path::new("/usr/bin")));
+        assert!(!is_windows_drive_mount_path(Path::new("mnt/c")));
+    }
+
+    #[test]
+    fn winget_args_include_excludes() {
+        let args = winget_upgrade_args(&["Foo.Bar".to_string(), "Baz.Qux".to_string()]);
+        assert!(args.contains(&"--all".to_string()));
+        let pairs: Vec<_> = args.windows(2).filter(|w| w[0] == "--exclude").collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0][1], "Foo.Bar");
+        assert_eq!(pairs[1][1], "Baz.Qux");
+    }
+
+    #[test]
+    fn pip_args_embed_lowercased_skips() {
+        let args = pip_upgrade_args(&["PyLint".to_string()]);
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("\"pylint\""));
+    }
+
+    #[test]
+    fn matches_any_by_id_category_and_tag() {
+        let task = Task::new("rustup", "rust", &["toolchain"], "rustup", &["update"]);
+        let by_id = normalize_slice(&["RUSTUP"]);
+        let by_cat = normalize_slice(&["Rust"]);
+        let by_tag = normalize_slice(&["toolchain"]);
+        let none = normalize_slice(&["python"]);
+        assert!(matches_any(&task, &by_id));
+        assert!(matches_any(&task, &by_cat));
+        assert!(matches_any(&task, &by_tag));
+        assert!(!matches_any(&task, &none));
+    }
+
+    #[test]
+    fn prev_summary_parses_both_casings() {
+        let ps1_style = r#"{"Results":[{"Id":"winget","Status":"Succeeded"}]}"#;
+        let rust_style = r#"{"results":[{"id":"winget","status":"Succeeded"}]}"#;
+        for text in [ps1_style, rust_style] {
+            let parsed: PrevSummary = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed.results.len(), 1);
+            assert_eq!(parsed.results[0].id, "winget");
+            assert_eq!(parsed.results[0].status, "Succeeded");
+        }
+    }
+
+    #[test]
+    fn config_parses_pascal_case() {
+        let text = r#"{"WingetSkipPackages":["A.B"],"SkipManagers":["scoop"],"PipIgnoreHealthPackages":["pylint"]}"#;
+        let config: Config = serde_json::from_str(text).unwrap();
+        assert_eq!(config.winget_skip_packages, vec!["A.B"]);
+        assert_eq!(config.skip_managers, vec!["scoop"]);
+        assert_eq!(config.pip_ignore_health_packages, vec!["pylint"]);
+    }
 }
