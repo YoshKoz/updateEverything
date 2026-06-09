@@ -2680,20 +2680,23 @@ fi
             Write-Output 'Checking for orphaned binaries in PATH...'
             $pathDirs = @($env:Path -split ';' | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
             $orphanCount = 0
+            $knownManagers = @('scoop\apps', 'chocolatey\lib', 'Microsoft\WinGet\Packages', 'pipx\venvs', 'Python\Scripts', 'Python3', '.cargo\bin', 'node_modules\.bin', '.local\bin', '.dotnet\tools', 'mise', 'uv\bin', 'volta\bin')
+            $excludePrefixes = @('api-ms-win-', 'ext-ms-win-', 'concrt', 'msvcp', 'vcruntime', 'msvcrt')
             foreach ($dir in $pathDirs)
             {
                 $exes = @(Get-ChildItem -LiteralPath $dir -Filter '*.exe' -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
                 foreach ($exe in $exes)
                 {
-                    $knownManagers = @('scoop\apps', 'chocolatey\lib', 'Microsoft\WinGet\Packages', 'pipx\venvs', 'Python\Scripts', 'Python3', '.cargo\bin', 'node_modules\.bin', '.local\bin', '.dotnet\tools', 'mise', 'uv\bin', 'volta\bin')
                     $isManaged = $false
                     foreach ($mgr in $knownManagers) { if ($exe.FullName -match [regex]::Escape($mgr)) { $isManaged = $true; break } }
                     $isSystemPath = $exe.DirectoryName -match '\\system32$|\\system$|\\windows\\'
-                    if (-not $isManaged -and -not $isSystemPath -and $exe.LastWriteTime -lt $cutoff)
+                    $excluded = ($excludePrefixes | Where-Object { $exe.Name -like "$_*" }).Count -gt 0
+                    if (-not $isManaged -and -not $isSystemPath -and -not $excluded -and $exe.LastWriteTime -lt $cutoff)
                     { $orphanCount++ }
                 }
             }
-            Write-Output "Stale binary scan: $orphanCount orphaned .exe(s) older than $Days day(s) found in PATH."
+            if ($orphanCount -gt 0) { Write-Output "Stale binary scan: $orphanCount orphaned .exe(s) older than $Days day(s) found in PATH. Run with -DeepClean to remove them." }
+            else { Write-Output 'Stale binary scan: no orphaned binaries found.' }
         }
     }
     $tasks.Add((New-UpdateTask -Name 'cleanup' -Category 'maintenance' -Disabled:$SkipCleanup -DisabledReason 'disabled by -SkipCleanup' -TimeoutSec 3600 -Script $cleanupScript -Tags @('maintenance'))) | Out-Null
@@ -2712,8 +2715,10 @@ fi
                         Write-Output "Download from: https://github.com/YoshKoz/updateEverything/releases/tag/v$latestTag"
                     } else { Write-Output 'Already at latest version.' }
                 } catch {
-                    if ($_.Exception.Response.StatusCode -eq 404) {
+                    if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
                         Write-Output 'Self-update check skipped: no releases found on GitHub.'
+                    } elseif ($_.Exception -match '(404|Not Found)') {
+                        Write-Output 'Self-update check skipped: repository not found or no releases configured.'
                     } else {
                         Write-Output "Self-update check skipped: $($_.Exception.Message)"
                     }
@@ -2749,7 +2754,7 @@ fi
                     try {
                         $manifest = Get-AppxPackageManifest -Package $pkg -ErrorAction SilentlyContinue
                         if ($manifest)
-                        { Add-AppxPackage -Register -DisableDevelopmentMode -ErrorAction SilentlyContinue "$($pkg.InstallLocation)\AppxManifest.xml" | Out-Null; $repaired++ }
+                        { Add-AppxPackage -Register -DisableDevelopmentMode -ErrorAction SilentlyContinue "$($pkg.InstallLocation)\AppxManifest.xml" *>$null; $repaired++ }
                     } catch { Write-Output "AppX re-registration failed for $($pkg.Name): $($_.Exception.Message)" }
                 }
                 Write-Output "AppX re-registration: $repaired package(s) re-registered."
