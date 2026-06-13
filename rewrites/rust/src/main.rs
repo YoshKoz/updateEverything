@@ -507,6 +507,18 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             &["source", "update"],
         )
         .with_resource("winget"),
+        // Kill portable-app processes that hold their own exe open — winget
+        // can't overwrite a locked file even with --force. cmd.exe is always
+        // present on Windows; the task is naturally skipped on Linux/macOS
+        // (cmd not in PATH). Single `&` runs exit regardless of taskkill result.
+        Task::new(
+            "winget-pre",
+            "package-manager",
+            &["windows", "winget"],
+            "cmd",
+            &["/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & exit 0"],
+        )
+        .with_resource("winget"),
         Task::new_vec(
             "winget",
             "package-manager",
@@ -514,11 +526,7 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "winget",
             winget_upgrade_args,
         )
-        .with_resource("winget")
-        // winget exits nonzero when any individual package fails (e.g. a
-        // broken portable installer) even if all others succeeded.
-        // -1978335188 (0x89010C4C) = partial-upgrade failure; treat as OK.
-        .with_acceptable_exit_codes(&[-1978335188]),
+        .with_resource("winget"),
         Task::new(
             "scoop",
             "package-manager",
@@ -630,18 +638,33 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             dotnet_tools_upgrade_args(),
             "dotnet",
         ),
-        // code --update-extensions can open a full GUI window when no VSCode
-        // instance is running; cap it at 30 s so a dangling GUI doesn't block
-        // the rest of the run. Timeout is OK — extensions update in background.
-        Task::new(
+        // Only update extensions when VSCode is already running. When it's
+        // running, `code --update-extensions` talks to the existing instance via
+        // IPC and exits in ~2 s. When it's not running, the command opens a
+        // full GUI window and never exits on its own — skip instead.
+        Task::new_with_requires(
             "vscode-extensions",
             "editor",
             &["vscode"],
+            "python",
+            vec![
+                "-c".to_string(),
+                [
+                    "import shutil, subprocess, sys",
+                    r#"if not shutil.which("code"):"#,
+                    r#"    print("code not in PATH"); sys.exit(0)"#,
+                    r#"r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Code.exe", "/NH"],"#,
+                    r#"                   capture_output=True, text=True)"#,
+                    r#"if "Code.exe" not in r.stdout:"#,
+                    r#"    print("VSCode not running; skipping extension update (run with VSCode open to update)")"#,
+                    "    sys.exit(0)",
+                    r#"r2 = subprocess.run(["code", "--update-extensions"])"#,
+                    "sys.exit(r2.returncode)",
+                ]
+                .join("\n"),
+            ],
             "code",
-            &["--update-extensions"],
-        )
-        .with_timeout(30)
-        .with_ok_on_timeout(),
+        ),
         // git lfs install refreshes global hooks; binary itself is managed by winget/scoop
         Task::new_with_requires(
             "git-lfs",
