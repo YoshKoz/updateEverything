@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -89,6 +89,12 @@ struct Task {
     /// Named lock acquired before running in parallel mode ("" = no lock)
     resource: &'static str,
     skip_reason: Option<String>,
+    /// Per-task timeout; overrides the global --task-timeout-sec when set
+    timeout_override: Option<Duration>,
+    /// Exit codes that should be treated as Succeeded (e.g. winget partial upgrades)
+    acceptable_exit_codes: Vec<i32>,
+    /// If true, TimedOut is treated as Succeeded (e.g. fire-and-forget GUI launchers)
+    ok_on_timeout: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -291,6 +297,7 @@ fn run_task_streaming(
         None
     };
 
+    let timeout = task.timeout_override.unwrap_or(timeout);
     let start = Instant::now();
     let mut command = Command::new(task.command);
     command
@@ -308,12 +315,17 @@ fn run_task_streaming(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
+            // Treat any spawn failure as Skipped rather than Failed — the command
+            // exists on PATH (passed command_exists) but can't be launched (e.g. a
+            // stale .cmd/.ps1 shim whose underlying tool was uninstalled, or a
+            // .ps1 script that Windows won't execute directly). This keeps the
+            // summary clean for tools the user hasn't fully set up.
             return make_summary(
                 task,
-                "Failed",
+                "Skipped",
                 start.elapsed().as_millis(),
-                Some(127),
-                vec![err.to_string()],
+                None,
+                vec![format!("spawn failed: {err}")],
             );
         }
     };
@@ -386,23 +398,49 @@ fn run_task_streaming(
     let exit_status = child.wait().ok();
     let duration_ms = start.elapsed().as_millis();
     if !timed_out {
-        let _ = stdout_handle.join();
-        let _ = stderr_handle.join();
+        // On Windows a child that spawns a GUI sub-process (e.g.
+        // `code --update-extensions` → vscode.exe) passes its inherited pipe
+        // handles to the grandchild. The CLI parent exits (child.wait()
+        // returns) but the GUI keeps the write-ends open, blocking join()
+        // indefinitely. Use a bounded 3-second drain window; if the threads
+        // haven't finished by then, detach them and move on.
+        let (tx, rx) = mpsc::sync_channel::<()>(2);
+        let tx2 = tx.clone();
+        thread::spawn(move || {
+            let _ = stdout_handle.join();
+            let _ = tx.send(());
+        });
+        thread::spawn(move || {
+            let _ = stderr_handle.join();
+            let _ = tx2.send(());
+        });
+        let drain_deadline = Instant::now() + Duration::from_secs(3);
+        for _ in 0..2 {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = rx.recv_timeout(remaining);
+        }
     }
-    // On timeout the reader threads may still be blocked on pipes held open by
-    // surviving grandchildren (Windows kill() is not a tree kill); take what
-    // was captured so far instead of joining.
+    // On timeout (or drain timeout above) the reader threads may still be
+    // blocked on pipes held open by surviving grandchildren; take what was
+    // captured so far instead of joining.
     let mut all_lines = lines_out.lock().unwrap().clone();
     all_lines.extend(lines_err.lock().unwrap().iter().cloned());
 
-    let status = if timed_out {
+    let code = exit_status.and_then(|s| s.code());
+    let status = if timed_out && task.ok_on_timeout {
+        "Succeeded".to_string()
+    } else if timed_out {
         "TimedOut".to_string()
+    } else if code.map_or(false, |c| task.acceptable_exit_codes.contains(&c)) {
+        "Succeeded".to_string()
     } else {
         exit_status
             .map(status_name)
             .unwrap_or_else(|| "Failed".to_string())
     };
-    let code = exit_status.and_then(|s| s.code());
 
     if !quiet {
         println!(
@@ -476,7 +514,11 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "winget",
             winget_upgrade_args,
         )
-        .with_resource("winget"),
+        .with_resource("winget")
+        // winget exits nonzero when any individual package fails (e.g. a
+        // broken portable installer) even if all others succeeded.
+        // -1978335188 (0x89010C4C) = partial-upgrade failure; treat as OK.
+        .with_acceptable_exit_codes(&[-1978335188]),
         Task::new(
             "scoop",
             "package-manager",
@@ -533,7 +575,28 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             "python",
             pip_upgrade_args(&pip_skip),
         ),
-        Task::new("uv", "python", &["python"], "uv", &["self", "update"]),
+        Task::new_vec(
+            "uv",
+            "python",
+            &["python"],
+            "python",
+            vec![
+                "-c".to_string(),
+                // Skip self-update when uv is pip-managed (the pip task already
+                // upgrades it). Only run self-update for standalone installs
+                // (typically ~/.local/bin/uv or %LOCALAPPDATA%\uv\bin\uv.exe).
+                [
+                    "import shutil, subprocess, sys",
+                    r#"p = (shutil.which("uv") or "").replace("\\", "/").lower()"#,
+                    r#"if "/python" in p or "/scripts/" in p:"#,
+                    r#"    print("uv is pip-managed; update handled by pip task")"#,
+                    "    sys.exit(0)",
+                    r#"r = subprocess.run(["uv", "self", "update"])"#,
+                    "sys.exit(r.returncode)",
+                ]
+                .join("\n"),
+            ],
+        ),
         Task::new(
             "uv-tools",
             "python",
@@ -567,13 +630,18 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             dotnet_tools_upgrade_args(),
             "dotnet",
         ),
+        // code --update-extensions can open a full GUI window when no VSCode
+        // instance is running; cap it at 30 s so a dangling GUI doesn't block
+        // the rest of the run. Timeout is OK — extensions update in background.
         Task::new(
             "vscode-extensions",
             "editor",
             &["vscode"],
             "code",
             &["--update-extensions"],
-        ),
+        )
+        .with_timeout(30)
+        .with_ok_on_timeout(),
         // git lfs install refreshes global hooks; binary itself is managed by winget/scoop
         Task::new_with_requires(
             "git-lfs",
@@ -591,12 +659,27 @@ fn build_tasks(config: &Config) -> Vec<Task> {
             &["extension", "upgrade", "--all"],
         ),
         Task::new("yt-dlp", "media", &["media"], "yt-dlp", &["-U"]),
-        Task::new(
+        Task::new_vec(
             "mise",
             "version-manager",
             &["mise"],
-            "mise",
-            &["self-upgrade"],
+            "python",
+            // Skip self-update when mise is managed by winget/scoop/brew — those
+            // package managers own the binary path and self-update will hang or
+            // fail trying to overwrite a managed executable.
+            vec![
+                "-c".to_string(),
+                [
+                    "import shutil, subprocess, sys",
+                    r#"p = (shutil.which("mise") or "").replace("\\", "/").lower()"#,
+                    r#"if "winget" in p or "/microsoft/" in p or "/scoop/" in p or "/homebrew/" in p:"#,
+                    r#"    print("mise is package-manager-managed; update handled by winget/scoop task")"#,
+                    "    sys.exit(0)",
+                    r#"r = subprocess.run(["mise", "self-update"])"#,
+                    "sys.exit(r.returncode)",
+                ]
+                .join("\n"),
+            ],
         ),
         Task::new(
             "mise-upgrade",
@@ -647,7 +730,25 @@ impl Task {
             requires: command,
             resource: "",
             skip_reason: None,
+            timeout_override: None,
+            acceptable_exit_codes: vec![],
+            ok_on_timeout: false,
         }
+    }
+
+    fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_override = Some(Duration::from_secs(secs));
+        self
+    }
+
+    fn with_acceptable_exit_codes(mut self, codes: &[i32]) -> Self {
+        self.acceptable_exit_codes = codes.to_vec();
+        self
+    }
+
+    fn with_ok_on_timeout(mut self) -> Self {
+        self.ok_on_timeout = true;
+        self
     }
 
     fn new_with_requires(
@@ -667,6 +768,9 @@ impl Task {
             requires,
             resource: "",
             skip_reason: None,
+            timeout_override: None,
+            acceptable_exit_codes: vec![],
+            ok_on_timeout: false,
         }
     }
 
@@ -688,6 +792,7 @@ fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
         "--accept-source-agreements",
         "--disable-interactivity",
         "--silent",
+        "--force",
     ]
     .into_iter()
     .map(str::to_string)
