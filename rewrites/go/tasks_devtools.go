@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -61,37 +62,80 @@ func taskOllamaModels(timeoutSec int) *Task {
 		RequiresCommand: []string{"ollama"},
 		TimeoutSec:      timeoutSec,
 		Run: func(tc *TaskContext) error {
+			// Advisory + bounded: skip oversized re-pulls, cap per-model time,
+			// and never fail the run. Local Modelfile models have no registry
+			// source and fail fast; that is expected, not a failure.
+			const maxGB = 20.0
+			perModel := timeoutSec
+			if perModel > 300 {
+				perModel = 300
+			}
 			listRes, err := Run("ollama", RunOpts{Args: []string{"list"}, TimeoutSec: 60})
 			tc.Log(listRes.Lines...)
 			if err != nil {
-				return err
+				tc.Log("ollama list failed: " + err.Error())
+				return nil
 			}
-			var models []string
+			type ollamaModel struct {
+				name  string
+				gb    float64
+				hasGB bool
+			}
+			var models []ollamaModel
 			for _, l := range listRes.Lines[1:] {
 				parts := strings.Fields(l)
-				if len(parts) > 0 && parts[0] != "" {
-					models = append(models, parts[0])
+				if len(parts) == 0 || parts[0] == "" {
+					continue
 				}
+				m := ollamaModel{name: parts[0]}
+				for i := 0; i+1 < len(parts); i++ {
+					v, e := strconv.ParseFloat(parts[i], 64)
+					if e != nil {
+						continue
+					}
+					switch strings.ToUpper(parts[i+1]) {
+					case "GB":
+						m.gb, m.hasGB = v, true
+					case "MB":
+						m.gb, m.hasGB = v/1024, true
+					case "KB":
+						m.gb, m.hasGB = v/1048576, true
+					case "B":
+						m.gb, m.hasGB = v/1073741824, true
+					}
+					if m.hasGB {
+						break
+					}
+				}
+				models = append(models, m)
 			}
 			if len(models) == 0 {
 				tc.Log("No Ollama models found.")
 				return nil
 			}
-			var failed []string
-			for _, model := range models {
-				tc.Log("Updating Ollama model: " + model)
+			var updated, unchanged, skipped []string
+			for _, m := range models {
+				if m.hasGB && m.gb > maxGB {
+					tc.Log(fmt.Sprintf("Skipping large model (%.0f GB > %.0f GB): %s", m.gb, maxGB, m.name))
+					skipped = append(skipped, m.name)
+					continue
+				}
+				tc.Log("Pulling Ollama model: " + m.name)
 				res, err := tc.RunCmd("ollama", RunOpts{
-					Args:       []string{"pull", model},
-					TimeoutSec: timeoutSec,
-					Retries:    1,
+					Args:       []string{"pull", m.name},
+					TimeoutSec: perModel,
+					Retries:    0,
 				})
 				tc.Log(res.Lines...)
 				if err != nil {
-					failed = append(failed, model)
+					unchanged = append(unchanged, m.name)
+				} else {
+					updated = append(updated, m.name)
 				}
 			}
-			if len(failed) > 0 {
-				return fmt.Errorf("ollama model updates failed: %s", strings.Join(failed, ", "))
+			tc.Log(fmt.Sprintf("Ollama: %d refreshed, %d unchanged, %d skipped (too large).", len(updated), len(unchanged), len(skipped)))
+			if len(unchanged) > 0 {
+				tc.Log("  unchanged (local/unavailable): " + strings.Join(unchanged, ", "))
 			}
 			return nil
 		},
