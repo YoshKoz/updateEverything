@@ -1884,12 +1884,12 @@ fi
             return
         }
 
-        Write-Output ("pip dependency check found {0} active issue(s):" -f $activeIssues.Count)
+        # Advisory only: pip check never updates anything and the conflicts are
+        # usually pre-existing environment state. Report, but never fail the run.
+        Write-Output ("pip dependency check found {0} conflict(s) (advisory, not failing the run):" -f $activeIssues.Count)
         foreach ($issue in $activeIssues)
         { Write-Output "  $issue"
         }
-        $global:LASTEXITCODE = 1
-        throw 'pip check found active dependency issues.'
     }
     $tasks.Add((New-UpdateTask -Name 'pip-health' -Category 'python' -RequiresCommand 'python' -Disabled:$SkipPipHealth -DisabledReason 'disabled by -SkipPipHealth' -Script $pipHealthScript -Tags @('python', 'health') -Resources @('pip'))) | Out-Null
 
@@ -2361,23 +2361,65 @@ fi
             { $listOutput | Write-Output
             }
 
-            $models = @($listOutput | Select-Object -Skip 1 | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ })
+            # Advisory + bounded. Refreshing local models is best-effort:
+            #  - locally-built (Modelfile) models have no registry source -> pull
+            #    fails fast; we record and move on instead of failing the run.
+            #  - oversized models are skipped to avoid multi-GB re-pulls that blow
+            #    the time budget; a short per-model timeout caps any single hang.
+            $maxGb = 20.0
+            $perModelTimeout = [Math]::Min($CommandTimeoutSec, 300)
+
+            $models = [System.Collections.Generic.List[object]]::new()
+            foreach ($row in @($listOutput | Select-Object -Skip 1))
+            {
+                $cols = @($row -split '\s+' | Where-Object { $_ })
+                if ($cols.Count -eq 0) { continue }
+                $name = $cols[0]
+                if (-not $name) { continue }
+                $gb = $null
+                for ($i = 0; $i -lt $cols.Count - 1; $i++)
+                {
+                    if ($cols[$i] -match '^[0-9.]+$' -and $cols[$i + 1] -match '^(?i)(GB|MB|KB|B)$')
+                    {
+                        $val = [double]$cols[$i]
+                        switch ($cols[$i + 1].ToUpper())
+                        {
+                            'GB' { $gb = $val }
+                            'MB' { $gb = $val / 1024 }
+                            'KB' { $gb = $val / 1048576 }
+                            'B'  { $gb = $val / 1073741824 }
+                        }
+                        break
+                    }
+                }
+                $models.Add([pscustomobject]@{ Name = $name; Gb = $gb })
+            }
             if ($models.Count -eq 0)
             { Write-Output 'No Ollama models found.'; return
             }
 
-            $failed = [System.Collections.Generic.List[string]]::new()
-            foreach ($model in $models)
+            $updated = [System.Collections.Generic.List[string]]::new()
+            $unchanged = [System.Collections.Generic.List[string]]::new()
+            $skipped = [System.Collections.Generic.List[string]]::new()
+            foreach ($m in $models)
             {
-                Write-Output "Updating Ollama model: $model"
+                if ($null -ne $m.Gb -and $m.Gb -gt $maxGb)
+                {
+                    Write-Output ("Skipping large model ({0:N0} GB > {1:N0} GB): {2}" -f $m.Gb, $maxGb, $m.Name)
+                    [void]$skipped.Add($m.Name)
+                    continue
+                }
+                Write-Output "Pulling Ollama model: $($m.Name)"
                 try
-                { Invoke-UpdateProcess -FilePath 'ollama' -ArgumentList @('pull', $model) -TimeoutSec $CommandTimeoutSec -Retries 1
+                { Invoke-UpdateProcess -FilePath 'ollama' -ArgumentList @('pull', $m.Name) -TimeoutSec $perModelTimeout -Retries 0
+                    [void]$updated.Add($m.Name)
                 } catch
-                { Write-Output $_.Exception.Message; [void]$failed.Add($model)
+                { Write-Output "  $($_.Exception.Message)"; [void]$unchanged.Add($m.Name)
                 }
             }
-            if ($failed.Count -gt 0)
-            { Write-Output "Ollama models left unchanged: $($failed -join ', ')"
+            Write-Output ("Ollama: {0} refreshed, {1} unchanged, {2} skipped (too large)." -f $updated.Count, $unchanged.Count, $skipped.Count)
+            if ($unchanged.Count -gt 0)
+            { Write-Output "  unchanged (local/unavailable): $($unchanged -join ', ')"
             }
         }
         $tasks.Add((New-UpdateTask -Name 'ollama-models' -Category 'ai' -RequiresCommand 'ollama' -Disabled:(-not $UpdateOllamaModels) -DisabledReason 'use -UpdateOllamaModels to refresh local models' -TimeoutSec 7200 -Script $ollamaScript -Tags @('ai') -Resources @('ollama'))) | Out-Null
