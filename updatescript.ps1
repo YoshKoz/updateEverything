@@ -1222,6 +1222,24 @@ function Get-UpdateTasks
                 }
             } -Tags @('windows'))) | Out-Null
 
+    # MSYS2 (native Windows): winget refuses to upgrade it ("cannot be upgraded
+    # using winget"); its own pacman is the supported path.
+    $tasks.Add((New-UpdateTask -Name 'msys2' -Category 'package-manager' -Script {
+                $bash = @(
+                    'C:\msys64\usr\bin\bash.exe',
+                    'C:\tools\msys64\usr\bin\bash.exe',
+                    "$env:SystemDrive\msys64\usr\bin\bash.exe"
+                ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+                if (-not $bash)
+                {
+                    Set-TaskStatus -Status 'Skipped' -Reason 'MSYS2 not installed'
+                    Write-Output 'MSYS2 not installed; skipping.'
+                    return
+                }
+                Write-Output "Updating MSYS2 via $bash"
+                Invoke-UpdateProcess -FilePath $bash -ArgumentList @('-lc', 'pacman -Syu --noconfirm') -Retries 0 -TimeoutSec 1800
+            } -Tags @('windows', 'msys2') -Resources @('msys2'))) | Out-Null
+
     $tasks.Add((New-UpdateTask -Name 'chocolatey' -Category 'package-manager' -RequiresCommand 'choco' -RequiresAdmin -Script {
                 param(
                     [string[]]$SkipPackages,
@@ -1893,8 +1911,9 @@ fi
     }
     $tasks.Add((New-UpdateTask -Name 'pip-health' -Category 'python' -RequiresCommand 'python' -Disabled:$SkipPipHealth -DisabledReason 'disabled by -SkipPipHealth' -Script $pipHealthScript -Tags @('python', 'health') -Resources @('pip'))) | Out-Null
 
+    # pipx defaults to the uv backend; force pip so it works when uv is not installed.
     $tasks.Add((New-UpdateTask -Name 'pipx' -Category 'python' -RequiresCommand 'pipx' -Script {
-                Invoke-UpdateProcess -FilePath 'pipx' -ArgumentList @('upgrade-all') -Retries 1 -TimeoutSec 600
+                Invoke-UpdateProcess -FilePath 'pipx' -ArgumentList @('upgrade-all', '--backend', 'pip') -Retries 1 -TimeoutSec 600
             } -Tags @('python') -Resources @('pip'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'uv' -Category 'python' -RequiresCommand 'uv' -Script {

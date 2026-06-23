@@ -149,6 +149,10 @@ struct Cli {
     #[arg(long)]
     update_powershell_help: bool,
 
+    /// Download latest GitHub-release binaries for tools in config.GithubTools (opt-in)
+    #[arg(long)]
+    update_github_tools: bool,
+
     /// Include apps protected by package managers in upgrades
     #[arg(long)]
     bypass_protection: bool,
@@ -206,6 +210,49 @@ struct Config {
     temp_cleanup_days: u32,
     #[serde(default = "default_log_retention")]
     log_retention_days: u32,
+    #[serde(default)]
+    github_tools: Vec<GithubTool>,
+}
+
+/// A manually-installed tool whose binaries come from a release/CI asset (no
+/// package manager, no local git build). The task queries the latest version,
+/// compares against the locally-installed version, and downloads + extracts the
+/// matching asset when behind. Supports three providers:
+///   - "github"          (default): GitHub releases/latest, asset by AssetRegex
+///   - "gitlab"          : GitLab releases permalink/latest, asset link by AssetRegex
+///   - "gitlab-artifact" : latest successful CI pipeline artifact for a Job
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GithubTool {
+    /// "owner/name", e.g. "ggml-org/llama.cpp" (also used for task id + marker)
+    repo: String,
+    /// Install directory to extract/copy into
+    install_dir: String,
+    /// Regex matched against release asset names to pick the download
+    /// (unused for gitlab-artifact)
+    #[serde(default)]
+    asset_regex: String,
+    /// "github" (default), "gitlab", or "gitlab-artifact"
+    #[serde(default)]
+    provider: Option<String>,
+    /// Numeric GitLab project id (required for gitlab / gitlab-artifact)
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Git ref for gitlab-artifact pipelines (default "master")
+    #[serde(default, rename = "Ref")]
+    git_ref: Option<String>,
+    /// CI job name for gitlab-artifact (e.g. "Windows 64")
+    #[serde(default)]
+    job: Option<String>,
+    /// Optional command run inside install_dir to print the local version
+    #[serde(default)]
+    version_cmd: Option<String>,
+    /// Regex with one capture group extracting a numeric local version
+    #[serde(default)]
+    version_regex: Option<String>,
+    /// Optional task id override (defaults to "gh-<repo name>")
+    #[serde(default)]
+    id: Option<String>,
 }
 
 fn default_cleanup_days() -> u32 { 7 }
@@ -612,7 +659,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
 
     let winget_upgrade_args = winget_upgrade_args(&config.winget_skip_packages);
 
-    let tasks = vec![
+    let mut tasks = vec![
         // ── winget ──────────────────────────────────────────────────────────
         Task::new(
             "winget-source",
@@ -788,6 +835,19 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             vec!["pacman".into(), "-Syu".into(), "--noconfirm".into()],
             "pacman",
         ),
+        // ── MSYS2 (native Windows) ───────────────────────────────────────────
+        // winget refuses to upgrade MSYS2 ("cannot be upgraded using winget");
+        // its own pacman is the supported path.
+        Task::new_vec(
+            "msys2",
+            "package-manager",
+            &["windows", "msys2"],
+            "pwsh",
+            pwsh_cmd(msys2_script()),
+        )
+        .with_resource("msys2")
+        .with_timeout(1800)
+        .with_requires("pwsh"),
         // ── JavaScript ───────────────────────────────────────────────────────
         Task::new_vec(
             "npm",
@@ -860,7 +920,8 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             pip_health_args(&config.pip_ignore_health_packages),
         )
         .with_skip_if(cli.skip_pip_health, "disabled by --skip-pip-health"),
-        Task::new("pipx", "python", &["python"], "pipx", &["upgrade-all"]),
+        // pipx defaults to the uv backend; force pip so it works when uv is not installed.
+        Task::new("pipx", "python", &["python"], "pipx", &["upgrade-all", "--backend", "pip"]),
         Task::new_vec("uv", "python", &["python"], "python", uv_self_update_args()),
         Task::new(
             "uv-tools",
@@ -1188,6 +1249,29 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         ),
     ];
 
+    // ── GitHub-release tools (manually-installed, config-driven, opt-in) ──────
+    for tool in &config.github_tools {
+        let name = tool.id.clone().unwrap_or_else(|| {
+            tool.repo.rsplit('/').next().unwrap_or(&tool.repo).to_string()
+        });
+        let id: &'static str = Box::leak(format!("gh-{name}").into_boxed_str());
+        tasks.push(
+            Task::new_vec(
+                id,
+                "github-tools",
+                &["github", "tools"],
+                "pwsh",
+                github_release_args(tool),
+            )
+            .with_resource("github-tools")
+            .with_timeout(900)
+            .with_skip_if(
+                !cli.update_github_tools,
+                "opt-in: use --update-github-tools",
+            ),
+        );
+    }
+
     tasks.into_iter().map(mark_missing).collect()
 }
 
@@ -1295,6 +1379,196 @@ fn pwsh_cmd(script: &str) -> Vec<String> {
         "-Command".into(),
         script.to_string(),
     ]
+}
+
+/// Dispatch to the right provider builder for a managed tool.
+fn github_release_args(tool: &GithubTool) -> Vec<String> {
+    match tool.provider.as_deref().unwrap_or("github") {
+        "gitlab" => gitlab_release_args(tool),
+        "gitlab-artifact" => gitlab_artifact_args(tool),
+        _ => github_release_inner_args(tool),
+    }
+}
+
+/// Shared PowerShell helpers (version compare + marker) prepended to each script.
+fn tool_script_prelude() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+function Test-UpToDate($l, $r) {
+  if ($null -eq $l -or $null -eq $r) { return $false }
+  $lv = $null; $rv = $null
+  if ([version]::TryParse($l, [ref]$lv) -and [version]::TryParse($r, [ref]$rv)) {
+    return $lv -ge $rv
+  }
+  $ln = ($l -replace '\D', ''); $rn = ($r -replace '\D', '')
+  if ($ln -and $rn) { return [int64]$ln -ge [int64]$rn }
+  return $false
+}
+"#
+}
+
+/// GitLab release-asset provider: releases/permalink/latest, asset link by AssetRegex.
+fn gitlab_release_args(tool: &GithubTool) -> Vec<String> {
+    let project = tool.project_id.clone().unwrap_or_default();
+    let script = format!(
+        "{prelude}\
+$repo    = '{repo}'
+$dir     = '{dir}'
+$assetRe = '{asset}'
+$proj    = '{proj}'
+$marker  = Join-Path $dir (\".ue-\" + ($repo -replace '[\\\\/:]', '_') + \".version\")
+
+$local = if (Test-Path $marker) {{ (Get-Content $marker -Raw).Trim() }} else {{ $null }}
+$rel = Invoke-RestMethod -Uri \"https://gitlab.com/api/v4/projects/$proj/releases/permalink/latest\"
+$tag = $rel.tag_name
+Write-Host \"$repo  local=$local  latest=$tag\"
+if (Test-UpToDate $local $tag) {{ Write-Host 'up to date'; exit 0 }}
+
+$dl = $rel.assets.links | Where-Object {{ $_.name -match $assetRe }} | Select-Object -First 1
+if (-not $dl) {{ Write-Host \"no asset matched /$assetRe/\"; exit 1 }}
+$url = if ($dl.direct_asset_url) {{ $dl.direct_asset_url }} else {{ $dl.url }}
+$tmp = Join-Path $env:TEMP $dl.name
+Write-Host \"downloading $($dl.name)\"
+Invoke-WebRequest -Uri $url -OutFile $tmp
+if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+if ($dl.name -match '\\.zip$') {{ Expand-Archive -Path $tmp -DestinationPath $dir -Force }}
+else {{ Copy-Item $tmp (Join-Path $dir $dl.name) -Force }}
+Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+Set-Content -Path $marker -Value $tag -NoNewline
+Write-Host \"updated $repo -> $tag\"
+",
+        prelude = tool_script_prelude(),
+        repo = tool.repo,
+        dir = tool.install_dir,
+        asset = tool.asset_regex,
+        proj = project,
+    );
+    pwsh_cmd(&script)
+}
+
+/// GitLab CI-artifact provider: latest successful pipeline artifact for a Job.
+/// Used by tools (e.g. OpenRGB) that publish builds as pipeline artifacts, not
+/// release assets. Version is the pipeline commit sha, stored in the marker.
+fn gitlab_artifact_args(tool: &GithubTool) -> Vec<String> {
+    let project = tool.project_id.clone().unwrap_or_default();
+    let git_ref = tool.git_ref.clone().unwrap_or_else(|| "master".to_string());
+    let job = tool.job.clone().unwrap_or_default();
+    let script = format!(
+        "{prelude}\
+$repo = '{repo}'
+$dir  = '{dir}'
+$proj = '{proj}'
+$ref  = '{git_ref}'
+$job  = '{job}'
+$marker = Join-Path $dir (\".ue-\" + ($repo -replace '[\\\\/:]', '_') + \".version\")
+
+$pl = Invoke-RestMethod -Uri \"https://gitlab.com/api/v4/projects/$proj/pipelines?ref=$ref&status=success&per_page=1\"
+if (-not $pl) {{ Write-Host 'no successful pipeline found'; exit 1 }}
+$latest = $pl[0].sha
+$local = if (Test-Path $marker) {{ (Get-Content $marker -Raw).Trim() }} else {{ $null }}
+Write-Host \"$repo  local=$local  latest=$latest\"
+if ($local -eq $latest) {{ Write-Host 'up to date'; exit 0 }}
+
+$enc = [uri]::EscapeDataString($job)
+$url = \"https://gitlab.com/api/v4/projects/$proj/jobs/artifacts/$ref/download?job=$enc\"
+$tmp = Join-Path $env:TEMP ((($repo -replace '[\\\\/:]', '_')) + '-artifact.zip')
+Write-Host \"downloading artifact (job=$job)\"
+Invoke-WebRequest -Uri $url -OutFile $tmp
+if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+Expand-Archive -Path $tmp -DestinationPath $dir -Force
+Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+Set-Content -Path $marker -Value $latest -NoNewline
+Write-Host \"updated $repo -> $latest\"
+",
+        prelude = tool_script_prelude(),
+        repo = tool.repo,
+        dir = tool.install_dir,
+        proj = project,
+        git_ref = git_ref,
+        job = job,
+    );
+    pwsh_cmd(&script)
+}
+
+/// Build the pwsh args for a GitHub-release tool update: compare local version
+/// to the latest release, download + extract the matching asset when behind.
+fn github_release_inner_args(tool: &GithubTool) -> Vec<String> {
+    let version_cmd = tool.version_cmd.clone().unwrap_or_default();
+    let version_regex = tool
+        .version_regex
+        .clone()
+        .unwrap_or_else(|| r"(\d+)".to_string());
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$repo    = '{repo}'
+$dir     = '{dir}'
+$assetRe = '{asset}'
+$verRe   = '{vre}'
+$verCmd  = @'
+{vcmd}
+'@
+
+$marker = Join-Path $dir (".ue-" + ($repo -replace '[\\/:]', '_') + ".version")
+
+$local = $null
+if ($verCmd.Trim()) {{
+  try {{
+    Push-Location $dir
+    $out = & ([scriptblock]::Create($verCmd)) 2>&1 | Out-String
+    Pop-Location
+    if ($out -match $verRe) {{ $local = $matches[1] }}
+  }} catch {{ Write-Host "version probe failed: $_" }}
+}}
+# Fall back to the marker written by a previous run (tools with no queryable version).
+if ($null -eq $local -and (Test-Path $marker)) {{
+  $local = (Get-Content $marker -Raw).Trim()
+}}
+
+$hdr = @{{ 'User-Agent' = 'updateEverything' }}
+$rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $hdr
+$tag = $rel.tag_name
+$latest = if ($tag -match '([\d.]+)') {{ $matches[1] }} else {{ $null }}
+
+# Compare local vs latest: semver via [version] when both parse, else numeric.
+function Test-UpToDate($l, $r) {{
+  if ($null -eq $l -or $null -eq $r) {{ return $false }}
+  $lv = $null; $rv = $null
+  if ([version]::TryParse($l, [ref]$lv) -and [version]::TryParse($r, [ref]$rv)) {{
+    return $lv -ge $rv
+  }}
+  $ln = ($l -replace '\D', ''); $rn = ($r -replace '\D', '')
+  if ($ln -and $rn) {{ return [int64]$ln -ge [int64]$rn }}
+  return $false
+}}
+
+Write-Host "$repo  local=$local  latest=$tag"
+if (Test-UpToDate $local $latest) {{
+  Write-Host "up to date"; exit 0
+}}
+
+$dl = $rel.assets | Where-Object {{ $_.name -match $assetRe }} | Select-Object -First 1
+if (-not $dl) {{ Write-Host "no asset matched /$assetRe/"; exit 1 }}
+
+$tmp = Join-Path $env:TEMP $dl.name
+Write-Host "downloading $($dl.name)"
+Invoke-WebRequest -Uri $dl.browser_download_url -OutFile $tmp -Headers $hdr
+if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+if ($dl.name -match '\.zip$') {{
+  Write-Host "extracting to $dir"
+  Expand-Archive -Path $tmp -DestinationPath $dir -Force
+}} else {{
+  Copy-Item $tmp (Join-Path $dir $dl.name) -Force
+}}
+Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+Set-Content -Path $marker -Value $tag -NoNewline
+Write-Host "updated $repo -> $tag"
+"#,
+        repo = tool.repo,
+        dir = tool.install_dir,
+        asset = tool.asset_regex,
+        vre = version_regex,
+        vcmd = version_cmd,
+    );
+    pwsh_cmd(&script)
 }
 
 fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
@@ -1949,6 +2223,15 @@ fn windows_update_script() -> &'static str {
      $i=New-Object -ComObject Microsoft.Update.Installer;\
      $i.Updates=$r.Updates;$ir=$i.Install();\
      Write-Output \"Windows Update: $($r.Updates.Count) update(s) installed. Reboot required: $($ir.RebootRequired)\""
+}
+
+fn msys2_script() -> &'static str {
+    "$bash=@('C:\\msys64\\usr\\bin\\bash.exe','C:\\tools\\msys64\\usr\\bin\\bash.exe',\
+     \"$env:SystemDrive\\msys64\\usr\\bin\\bash.exe\")|Where-Object{Test-Path $_}|Select-Object -First 1;\
+     if(-not $bash){Write-Output 'MSYS2 not installed; skipping.';return};\
+     Write-Output \"Updating MSYS2 via $bash\";\
+     & $bash -lc 'pacman -Syu --noconfirm';\
+     if($LASTEXITCODE-ne 0){Write-Output \"MSYS2 pacman exit $LASTEXITCODE\"}"
 }
 
 fn wsl_distros_script() -> &'static str {
