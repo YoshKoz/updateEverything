@@ -6,5 +6,34 @@
     "pylint",
     "huggingface-hub",
     "mega-py"
+  ],
+  "GithubTools": [
+    {
+      "Repo": "ggml-org/llama.cpp",
+      "InstallDir": "C:\\Tools\\llama.cpp",
+      "AssetRegex": "^llama-.*-bin-win-cuda.*x64\\.zip$",
+      "VersionCmd": "& .\\llama-cli.exe --version",
+      "VersionRegex": "version:\\s*(\\d+)"
+    },
+    {
+      "Repo": "neovim/neovim",
+      "InstallDir": "C:\\Tools\\neovim",
+      "AssetRegex": "^nvim-win64\\.zip$",
+      "VersionCmd": "& .\\nvim-win64\\bin\\nvim.exe --version",
+      "VersionRegex": "v([\\d.]+)"
+    },
+    {
+      "Repo": "schmaldeo/DS4Windows",
+      "InstallDir": "C:\\Tools",
+      "AssetRegex": "_x64\\.zip$"
+    },
+    {
+      "Repo": "CalcProgrammer1/OpenRGB",
+      "Provider": "gitlab-artifact",
+      "ProjectId": "10582521",
+      "Ref": "master",
+      "Job": "Windows 64",
+      "InstallDir": "C:\\Tools\\OpenRGB"
+    }
   ]
 }
