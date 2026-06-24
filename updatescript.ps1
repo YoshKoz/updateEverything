@@ -1,10 +1,10 @@
-﻿#requires -version 7.0
+#requires -version 7.0
 <#
 .SYNOPSIS
     Updates common Windows 11 package managers, developer tools, runtimes, WSL distros, Defender, and maintenance tasks.
 
 .VERSION
-    Update-Everything v6.5.3-codex-task
+    Update-Everything v7.0.0-mega
 
 .NOTES
     v7.0.0-mega: major expansion — 20 new tool sections, 20 new features.
