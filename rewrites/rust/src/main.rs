@@ -160,7 +160,6 @@ struct Cli {
     /// Run extra cleanup steps (DISM, delivery-opt cache, orphan scan)
     #[arg(long = "deep-clean")]
     // already set above — alias for clarity in help
-
     #[arg(long, default_value_t = 600)]
     winget_timeout_sec: u64,
 
@@ -206,6 +205,8 @@ struct Config {
     vcpkg_skip_packages: Vec<String>,
     #[serde(default)]
     windows_optional_features: Vec<String>,
+    #[serde(default)]
+    cross_manager_fallback: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default = "default_cleanup_days")]
     temp_cleanup_days: u32,
     #[serde(default = "default_log_retention")]
@@ -255,8 +256,12 @@ struct GithubTool {
     id: Option<String>,
 }
 
-fn default_cleanup_days() -> u32 { 7 }
-fn default_log_retention() -> u32 { 14 }
+fn default_cleanup_days() -> u32 {
+    7
+}
+fn default_log_retention() -> u32 {
+    14
+}
 
 #[derive(Clone, Debug)]
 struct Task {
@@ -711,6 +716,14 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             vec!["pin".into(), "list".into()],
         )
         .with_acceptable_exit_codes(&[-1978335212]),
+        Task::new_vec(
+            "cross-manager",
+            "package-manager",
+            &["windows", "winget", "scoop", "choco"],
+            "python",
+            cross_manager_args(&config.cross_manager_fallback),
+        )
+        .with_resource("package-manager"),
         // ── store apps ───────────────────────────────────────────────────────
         Task::new_vec(
             "store-apps",
@@ -998,6 +1011,15 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         .with_skip_if(cli.skip_flutter, "disabled by --skip-flutter"),
         // ── Julia ────────────────────────────────────────────────────────────
         Task::new("juliaup", "systems-language", &["julia"], "juliaup", &["update"]),
+        Task::new_vec(
+            "gh",
+            "dev-tools",
+            &["github", "dev-tools"],
+            "python",
+            gh_upgrade_args(),
+        )
+        .with_requires("gh")
+        .with_resource("winget"),
         // ── .NET ─────────────────────────────────────────────────────────────
         Task::new(
             "dotnet-workloads",
@@ -1252,7 +1274,11 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
     // ── GitHub-release tools (manually-installed, config-driven, opt-in) ──────
     for tool in &config.github_tools {
         let name = tool.id.clone().unwrap_or_else(|| {
-            tool.repo.rsplit('/').next().unwrap_or(&tool.repo).to_string()
+            tool.repo
+                .rsplit('/')
+                .next()
+                .unwrap_or(&tool.repo)
+                .to_string()
         });
         let id: &'static str = Box::leak(format!("gh-{name}").into_boxed_str());
         tasks.push(
@@ -1359,7 +1385,6 @@ impl Task {
         self
     }
 
-
     /// Set skip_reason when condition is true and no reason is already set.
     fn with_skip_if(mut self, condition: bool, reason: &str) -> Self {
         if condition && self.skip_reason.is_none() {
@@ -1382,6 +1407,54 @@ fn pwsh_cmd(script: &str) -> Vec<String> {
 }
 
 /// Dispatch to the right provider builder for a managed tool.
+fn cross_manager_args(fallback: &BTreeMap<String, BTreeMap<String, String>>) -> Vec<String> {
+    let json = serde_json::to_string(fallback).unwrap_or_else(|_| "{}".to_string());
+    vec![
+        "-c".to_string(),
+        format!(
+            r#"import json, shutil, subprocess, sys
+fallback = json.loads({json:?})
+if not fallback:
+    print('No cross-manager fallback apps configured.')
+    sys.exit(0)
+choco = shutil.which('choco')
+scoop = shutil.which('scoop')
+if not choco and not scoop:
+    print('No alternate package managers (choco/scoop) available for fallback.')
+    sys.exit(0)
+failed = False
+for winget_id, alt in fallback.items():
+    print(f'Fallback check: {{winget_id}}')
+    if choco and alt.get('choco'):
+        result = subprocess.run(['choco', 'upgrade', alt['choco'], '-y', '--no-progress'], text=True)
+        failed = failed or result.returncode not in (0, 1)
+    if scoop and alt.get('scoop'):
+        result = subprocess.run(['scoop', 'update', alt['scoop']], text=True)
+        failed = failed or result.returncode != 0
+sys.exit(1 if failed else 0)
+"#
+        ),
+    ]
+}
+
+fn gh_upgrade_args() -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        r#"import shutil, subprocess, sys
+path = (shutil.which('gh') or '').replace('\\', '/').lower()
+managed_markers = ['/scoop/apps/', '/scoop/shims/', '/chocolatey/lib/', '/microsoft/winget/packages/', '/windowsapps/']
+if any(marker in path for marker in managed_markers):
+    print(f'gh is managed by another package manager; handled elsewhere: {path}')
+    sys.exit(0)
+if not shutil.which('winget'):
+    print('winget missing; gh standalone update skipped.')
+    sys.exit(0)
+cmd = ['winget', 'upgrade', '--id', 'GitHub.cli', '--exact', '--include-unknown', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements', '--silent']
+result = subprocess.run(cmd, text=True)
+sys.exit(result.returncode)
+"#.to_string(),
+    ]
+}
 fn github_release_args(tool: &GithubTool) -> Vec<String> {
     match tool.provider.as_deref().unwrap_or("github") {
         "gitlab" => gitlab_release_args(tool),
@@ -1573,9 +1646,17 @@ Write-Host "updated $repo -> $tag"
 
 fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
     let mut args: Vec<String> = vec![
-        "upgrade", "--all", "--source", "winget", "--include-unknown", "--include-pinned",
-        "--accept-package-agreements", "--accept-source-agreements",
-        "--disable-interactivity", "--silent", "--force",
+        "upgrade",
+        "--all",
+        "--source",
+        "winget",
+        "--include-unknown",
+        "--include-pinned",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+        "--silent",
+        "--force",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2274,7 +2355,8 @@ fn powershell_modules_script() -> &'static str {
 
 fn windows_features_script(features: &[String]) -> String {
     if features.is_empty() {
-        return "Write-Output 'No WindowsOptionalFeatures configured in update-config.json.'".into();
+        return "Write-Output 'No WindowsOptionalFeatures configured in update-config.json.'"
+            .into();
     }
     let list = features
         .iter()
@@ -2310,7 +2392,6 @@ fn appx_repair_script() -> &'static str {
      Write-Output \"AppX re-registration: $repaired package(s) re-registered.\""
 }
 
-
 // ─── Task filtering ───────────────────────────────────────────────────────────
 
 fn mark_missing(mut task: Task) -> Task {
@@ -2333,37 +2414,114 @@ fn filter_tasks(
 
     // Matches PS1 FastModeSkip
     let fast_skip = normalize_slice(&[
-        "chocolatey", "wsl-distros", "npm", "pnpm", "yarn", "bun", "deno",
-        "rustup", "cargo", "go", "pip", "pip-health", "pipx", "uv", "uv-tools",
-        "poetry", "composer", "ruby-gems", "flutter", "juliaup",
-        "oh-my-posh", "yt-dlp", "volta", "fnm", "dotnet-tools",
-        "dotnet-workloads", "vscode-extensions", "powershell-modules",
-        "powershell-help", "uv-python", "ollama-models",
-        "vcpkg", "conda", "gcloud", "az", "aws", "terraform", "pulumi",
-        "kubectl", "helm", "hugo", "opentofu", "starship", "zoxide",
-        "gitleaks", "trivy", "packer", "nvm", "devcontainer", "cross-manager",
-        "mise-upgrade", "tldr",
+        "chocolatey",
+        "wsl-distros",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "deno",
+        "rustup",
+        "cargo",
+        "go",
+        "pip",
+        "pip-health",
+        "pipx",
+        "uv",
+        "uv-tools",
+        "poetry",
+        "composer",
+        "ruby-gems",
+        "flutter",
+        "juliaup",
+        "oh-my-posh",
+        "yt-dlp",
+        "volta",
+        "fnm",
+        "dotnet-tools",
+        "dotnet-workloads",
+        "vscode-extensions",
+        "powershell-modules",
+        "powershell-help",
+        "uv-python",
+        "ollama-models",
+        "vcpkg",
+        "conda",
+        "gcloud",
+        "az",
+        "aws",
+        "terraform",
+        "pulumi",
+        "kubectl",
+        "helm",
+        "hugo",
+        "opentofu",
+        "starship",
+        "zoxide",
+        "gitleaks",
+        "trivy",
+        "packer",
+        "nvm",
+        "devcontainer",
+        "cross-manager",
+        "mise-upgrade",
+        "tldr",
     ]);
 
     // Matches PS1 UltraFastSkip
     let ultra_skip = normalize_slice(&[
-        "windows-update", "store-apps", "wsl", "wsl-distros", "defender", "cleanup",
-        "winget", "winget-source", "scoop",
+        "windows-update",
+        "store-apps",
+        "wsl",
+        "wsl-distros",
+        "defender",
+        "cleanup",
+        "winget",
+        "winget-source",
+        "scoop",
     ]);
 
     // Profile-based skip presets
     let profile_skip: BTreeSet<String> = match cli.profile.as_deref() {
         Some("minimal") => normalize_slice(&[
-            "vcpkg", "conda", "gcloud", "az", "aws", "terraform", "pulumi",
-            "kubectl", "helm", "hugo", "opentofu", "starship", "gitleaks",
-            "trivy", "packer", "nvm", "devcontainer",
+            "vcpkg",
+            "conda",
+            "gcloud",
+            "az",
+            "aws",
+            "terraform",
+            "pulumi",
+            "kubectl",
+            "helm",
+            "hugo",
+            "opentofu",
+            "starship",
+            "gitleaks",
+            "trivy",
+            "packer",
+            "nvm",
+            "devcontainer",
         ]),
         Some("work") => BTreeSet::new(),
         Some("personal") => BTreeSet::new(),
         Some("gaming") => normalize_slice(&[
-            "vcpkg", "conda", "gcloud", "az", "aws", "terraform", "pulumi",
-            "kubectl", "helm", "hugo", "opentofu", "gitleaks", "trivy",
-            "packer", "nvm", "devcontainer", "powershell-modules",
+            "vcpkg",
+            "conda",
+            "gcloud",
+            "az",
+            "aws",
+            "terraform",
+            "pulumi",
+            "kubectl",
+            "helm",
+            "hugo",
+            "opentofu",
+            "gitleaks",
+            "trivy",
+            "packer",
+            "nvm",
+            "devcontainer",
+            "powershell-modules",
         ]),
         _ => BTreeSet::new(),
     };
@@ -2721,7 +2879,13 @@ mod tests {
 
     #[test]
     fn matches_any_by_id_category_and_tag() {
-        let task = Task::new("rustup", "systems-language", &["toolchain"], "rustup", &["update"]);
+        let task = Task::new(
+            "rustup",
+            "systems-language",
+            &["toolchain"],
+            "rustup",
+            &["update"],
+        );
         let by_id = normalize_slice(&["RUSTUP"]);
         let by_cat = normalize_slice(&["systems-language"]);
         let by_tag = normalize_slice(&["toolchain"]);
