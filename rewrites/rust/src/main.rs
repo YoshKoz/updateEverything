@@ -175,6 +175,14 @@ struct Cli {
 
     #[arg(long)]
     show_skipped: bool,
+
+    /// Register a Windows scheduled task to run at logon (use --schedule-time HH:MM for daily instead)
+    #[arg(long)]
+    schedule: bool,
+
+    /// When scheduling: trigger daily at HH:MM instead of at logon
+    #[arg(long)]
+    schedule_time: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -315,14 +323,27 @@ struct PrevSummary {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle --schedule before anything else
+    if cli.schedule {
+        let exe = std::env::current_exe().context("could not resolve current executable")?;
+        schedule_task(&exe, cli.schedule_time.as_deref())?;
+        return Ok(());
+    }
+
     let start = Instant::now();
     let started_at = now_string();
     let repo_root = find_repo_root()?;
+    let state_dir = get_state_dir(&cli);
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(|| repo_root.join("update-config.json"));
     let config = load_config(&config_path)?;
+
+    // Prevent concurrent runs (non-fatal: if lock fails we still continue)
+    let _lock = ProcessLock::acquire(&state_dir);
+
     let tasks = build_tasks(&config, &cli);
     let prev_summary = if cli.since_hours > 0.0 {
         load_prev_summary(&cli, &repo_root)
@@ -348,6 +369,15 @@ fn main() -> Result<()> {
         results,
     };
 
+    // Auto-save last-run.json to state dir (enables --since-hours on next run)
+    if !cli.dry_run {
+        let auto_path = state_dir.join("last-run.json");
+        if let Err(e) = write_summary(&auto_path, &summary) {
+            eprintln!("warn: could not save {}: {e}", auto_path.display());
+        }
+    }
+
+    // Also save to explicit --json-summary path if given
     if let Some(path) = &cli.json_summary {
         write_summary(path, &summary)?;
         if !cli.quiet {
@@ -356,6 +386,10 @@ fn main() -> Result<()> {
     }
 
     print_summary(&summary);
+
+    if !cli.dry_run {
+        print_update_summary(&summary.results);
+    }
 
     if cli.ci {
         let any_failure = summary
@@ -404,9 +438,20 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
         results.push(make_summary(task, "Skipped", 0, None, vec![]));
     }
 
+    let retry_count = cli.retry_count;
+
     if jobs <= 1 {
         for task in to_run {
-            let r = run_task_streaming(&task, cli.quiet, timeout, false, &HashMap::new());
+            let mut r = run_task_streaming(&task, cli.quiet, timeout, false, &HashMap::new());
+            for attempt in 1..=retry_count {
+                if !matches!(r.status.as_str(), "Failed" | "TimedOut") {
+                    break;
+                }
+                let delay = Duration::from_secs(3 * (1u64 << attempt.min(4)));
+                eprintln!("retry {attempt}/{retry_count} {} (waiting {}s)", task.id, delay.as_secs());
+                thread::sleep(delay);
+                r = run_task_streaming(&task, cli.quiet, timeout, false, &HashMap::new());
+            }
             results.push(r);
         }
     } else {
@@ -438,7 +483,16 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                             None => break,
                         }
                     };
-                    let r = run_task_streaming(&task, quiet, timeout, true, &locks);
+                    let mut r = run_task_streaming(&task, quiet, timeout, true, &locks);
+                    for attempt in 1..=retry_count {
+                        if !matches!(r.status.as_str(), "Failed" | "TimedOut") {
+                            break;
+                        }
+                        let delay = Duration::from_secs(3 * (1u64 << attempt.min(4)));
+                        eprintln!("retry {attempt}/{retry_count} {} (waiting {}s)", task.id, delay.as_secs());
+                        thread::sleep(delay);
+                        r = run_task_streaming(&task, quiet, timeout, true, &locks);
+                    }
                     out.lock().unwrap().push(r);
                 }
             });
@@ -613,7 +667,7 @@ fn run_task_streaming(
         );
     }
 
-    make_summary(task, &status, duration_ms, code, tail(all_lines, 30))
+    make_summary(task, &status, duration_ms, code, cap_output(all_lines, 300))
 }
 
 #[cfg(unix)]
@@ -749,13 +803,20 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         .with_requires("winget")
         .with_skip_if(cli.skip_store_apps, "disabled by --skip-store-apps"),
         // ── scoop ────────────────────────────────────────────────────────────
+        // scoop is a .ps1 shim — must be invoked via pwsh
         Task::new(
             "scoop",
             "package-manager",
             &["windows", "scoop"],
-            "scoop",
-            &["update", "*"],
-        ),
+            "pwsh",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "scoop update; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; scoop update *",
+            ],
+        )
+        .with_requires("scoop"),
         // ── chocolatey ───────────────────────────────────────────────────────
         Task::new_vec(
             "chocolatey",
@@ -1019,7 +1080,8 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             gh_upgrade_args(),
         )
         .with_requires("gh")
-        .with_resource("winget"),
+        .with_resource("winget")
+        .with_acceptable_exit_codes(&[-1978335189, -1978335212]),
         // ── .NET ─────────────────────────────────────────────────────────────
         Task::new(
             "dotnet-workloads",
@@ -2706,7 +2768,7 @@ fn command_exists(name: &str) -> bool {
                     .collect::<Vec<_>>()
             })
             .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string()])
+            .unwrap_or_else(|| vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string(), ".ps1".to_string()])
     } else {
         vec!["".to_string()]
     };
@@ -2795,9 +2857,23 @@ fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 
+#[allow(dead_code)]
 fn tail<T>(items: Vec<T>, count: usize) -> Vec<T> {
     let len = items.len();
     items.into_iter().skip(len.saturating_sub(count)).collect()
+}
+
+/// Keep up to `max` lines: first half + last half when output is long.
+/// Ensures both the initial version-table (head) and completion messages (tail) survive.
+fn cap_output(lines: Vec<String>, max: usize) -> Vec<String> {
+    if lines.len() <= max {
+        return lines;
+    }
+    let head = max / 2;
+    let tail_count = max - head;
+    let mut result = lines[..head].to_vec();
+    result.extend_from_slice(&lines[lines.len() - tail_count..]);
+    result
 }
 
 fn now_string() -> String {
@@ -2819,6 +2895,438 @@ fn find_repo_root() -> Result<PathBuf> {
         }
     }
     env::current_dir().context("failed to resolve current directory")
+}
+
+// ─── State dir / process lock / scheduling ───────────────────────────────────
+
+fn get_state_dir(cli: &Cli) -> PathBuf {
+    if let Some(ref dir) = cli.state_dir {
+        return dir.clone();
+    }
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("Update-Everything");
+    }
+    env::temp_dir().join("Update-Everything")
+}
+
+struct ProcessLock {
+    path: PathBuf,
+}
+
+impl ProcessLock {
+    fn acquire(state_dir: &Path) -> Option<Self> {
+        let path = state_dir.join("update-everything.lock");
+        if path.exists() {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if is_pid_running(pid) {
+                        eprintln!(
+                            "warn: another instance is already running (PID {pid}); exiting"
+                        );
+                        std::process::exit(5);
+                    }
+                }
+            }
+        }
+        let _ = fs::create_dir_all(state_dir);
+        let _ = fs::write(&path, std::process::id().to_string());
+        Some(Self { path })
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(windows)]
+fn is_pid_running(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // tasklist CSV: header + one row per match; if only header, no match
+            s.lines().skip(1).any(|l| !l.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn is_pid_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(windows)]
+fn schedule_task(exe: &Path, schedule_time: Option<&str>) -> Result<()> {
+    let task_name = "Update-Everything";
+    let exe_str = exe.to_string_lossy().into_owned();
+
+    let args: Vec<&str> = if let Some(time) = schedule_time {
+        vec![
+            "/Create", "/F", "/TN", task_name, "/TR", &exe_str, "/SC", "DAILY", "/ST", time,
+        ]
+    } else {
+        vec![
+            "/Create", "/F", "/TN", task_name, "/TR", &exe_str, "/SC", "ONLOGON",
+        ]
+    };
+
+    let status = Command::new("schtasks")
+        .args(&args)
+        .status()
+        .context("failed to run schtasks.exe")?;
+
+    if !status.success() {
+        anyhow::bail!("schtasks /Create failed (exit {:?})", status.code());
+    }
+
+    let trigger = schedule_time
+        .map(|t| format!("daily at {t}"))
+        .unwrap_or_else(|| "at logon".to_string());
+    println!("Registered scheduled task '{task_name}' ({trigger})");
+    println!("  exe: {exe_str}");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn schedule_task(_exe: &Path, _schedule_time: Option<&str>) -> Result<()> {
+    anyhow::bail!("--schedule is only supported on Windows; use cron on Unix");
+}
+
+// ─── What's Changed summary ───────────────────────────────────────────────────
+
+/// True if a string looks like a version: contains a digit and at least one dot.
+fn looks_like_version(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit()) && s.contains('.')
+}
+
+/// Strip spinner/progress junk chars that winget inserts into lines.
+fn strip_progress(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|t| !matches!(*t, "-" | "\\" | "|" | "/"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn print_update_summary(results: &[TaskSummary]) {
+    struct Entry {
+        task: String,
+        changes: Vec<String>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+
+    for r in results {
+        if r.output_tail.is_empty() {
+            continue;
+        }
+        let lines = &r.output_tail;
+        let mut changes: Vec<String> = Vec::new();
+
+        match r.id.as_str() {
+            "npm" => {
+                let mut i = 0;
+                while i < lines.len() {
+                    if lines[i].contains("Updating npm package:") {
+                        let pkg = lines[i]
+                            .split("Updating npm package:")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_end_matches("@latest")
+                            .to_string();
+                        let count = lines
+                            .get(i + 1)
+                            .filter(|l| l.contains("changed") && l.contains("package"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("?")
+                            .to_string();
+                        changes.push(format!("{pkg}  (+{count} pkg)"));
+                    }
+                    i += 1;
+                }
+            }
+            "pnpm" => {
+                for line in lines {
+                    if line.contains("Switching") && line.contains("from v") && line.contains("to v") {
+                        if let Some(after_from) = line.split("from v").nth(1) {
+                            let tool = line
+                                .split("Switching")
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("pnpm");
+                            if let Some((old, rest)) = after_from.split_once(" to v") {
+                                let new_ver =
+                                    rest.trim_end_matches('.').trim_end_matches("..").trim();
+                                changes.push(format!("{tool}: {old} → {new_ver}"));
+                            }
+                        }
+                    }
+                }
+            }
+            "winget" | "winget-batch" | "store-apps" => {
+                // winget-batch: parse the version table (Name / Id / Version / Available)
+                // winget: parse "[N/M] Upgrading: X" lines filtered for failures
+                let mut in_table = false;
+                let mut i = 0;
+                while i < lines.len() {
+                    let clean = strip_progress(&lines[i]);
+                    // Detect table header
+                    if !in_table
+                        && clean.contains("Name")
+                        && clean.contains("Id")
+                        && clean.contains("Available")
+                    {
+                        in_table = true;
+                        i += 1;
+                        continue;
+                    }
+                    if in_table {
+                        // Skip separator
+                        if clean.trim().chars().all(|c| c == '-' || c == ' ') {
+                            i += 1;
+                            continue;
+                        }
+                        // Stop at end-of-table markers
+                        if clean.trim().is_empty()
+                            || clean.contains("package(s) are pinned")
+                            || clean.contains("The following")
+                            || clean.contains("upgrades available")
+                            || clean.contains("upgrade available")
+                        {
+                            in_table = false;
+                        } else {
+                            // Split into tokens on 2+ spaces
+                            let tokens: Vec<&str> = clean
+                                .split("  ")
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if tokens.len() >= 3 {
+                                let name = tokens[0];
+                                let available = tokens[tokens.len() - 1];
+                                let version = tokens[tokens.len() - 2];
+                                if looks_like_version(available) || available.starts_with('<') {
+                                    changes.push(format!("{name}: {version} → {available}"));
+                                }
+                            }
+                        }
+                    }
+                    // Also capture "[N/M] Upgrading: X" lines from winget task (not already covered by table)
+                    if lines[i].contains("] Upgrading:") && r.id == "winget" {
+                        let pkg = lines[i]
+                            .split("] Upgrading:")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .split(" (installed")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let next = lines.get(i + 1).map_or("", |s| s.as_str());
+                        if !next.contains("Not applicable:") && !next.contains("FAILED:") && !pkg.is_empty() {
+                            // Only add if not already captured from table
+                            if changes.iter().all(|c| !c.starts_with(pkg.as_str())) {
+                                changes.push(pkg);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            "scoop" => {
+                for line in lines {
+                    // "Updating 'name' (old -> new)"
+                    if (line.contains("Updating '") || line.contains("Updating "))
+                        && line.contains("->")
+                    {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "chocolatey" => {
+                for line in lines {
+                    // "Chocolatey upgraded N/M packages" — only if N > 0
+                    if line.contains("upgraded") && line.contains("package") {
+                        if !line.contains("upgraded 0/") {
+                            changes.push(line.trim().to_string());
+                        }
+                    } else if line.contains(" to ") && looks_like_version(line.split(" to ").next().unwrap_or("").split_whitespace().last().unwrap_or("")) {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "cargo" => {
+                for line in lines {
+                    // "Updating crate-name v0.1 -> v0.2" or table "name  v0.1  v0.2  Yes"
+                    if line.contains("->") && line.chars().any(|c| c.is_ascii_digit()) {
+                        let t = line.trim();
+                        if t.len() < 120 && !t.starts_with("Package") {
+                            changes.push(t.to_string());
+                            if changes.len() >= 10 { break; }
+                        }
+                    }
+                }
+            }
+            "pip" | "uv-tools" | "uv-python" | "pipx" => {
+                if r.id == "pipx" {
+                    // "upgrading X..."
+                    let upgraded: Vec<&str> = lines
+                        .iter()
+                        .filter(|l| l.starts_with("upgrading ") && l.ends_with("..."))
+                        .map(|l| l.trim_start_matches("upgrading ").trim_end_matches("..."))
+                        .collect();
+                    if !upgraded.is_empty() {
+                        changes.push(upgraded.join(", "));
+                    }
+                } else {
+                    // "Successfully installed X-1.2.3 Y-4.5.6"
+                    for line in lines {
+                        if line.contains("Successfully installed") {
+                            let pkgs = line
+                                .trim()
+                                .trim_start_matches("Successfully installed")
+                                .trim();
+                            if !pkgs.is_empty() {
+                                changes.push(pkgs.to_string());
+                                if changes.len() >= 5 { break; }
+                            }
+                        }
+                    }
+                    // uv-tools: "Updated X 1.0 -> 1.1"
+                    for line in lines {
+                        if line.contains("Updated") && line.contains("->") {
+                            changes.push(line.trim().to_string());
+                            if changes.len() >= 10 { break; }
+                        }
+                    }
+                }
+            }
+            "poetry" => {
+                let mut pkg_count = 0;
+                for line in lines {
+                    if line.contains("Package operations:") {
+                        let summary = line.trim().trim_start_matches("Package operations: ");
+                        if !summary.contains("0 installs, 0 updates, 0 removals") {
+                            changes.push(summary.to_string());
+                        }
+                    } else if pkg_count < 6
+                        && (line.contains("- Installing")
+                            || line.contains("- Updating")
+                            || line.contains("- Downgrading"))
+                        && line.contains('(')
+                    {
+                        changes.push(format!("  {}", line.trim().trim_start_matches("- ")));
+                        pkg_count += 1;
+                    }
+                }
+            }
+            "mise" | "mise-upgrade" => {
+                for line in lines {
+                    // "mise python@3.11 -> python@3.12" or "Updated X from v1 to v2"
+                    if (line.contains("→") || line.contains("->"))
+                        && line.chars().any(|c| c.is_ascii_digit())
+                    {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "gh-extensions" => {
+                for line in lines {
+                    if line.contains("upgraded") || (line.contains("Updated") && line.contains("→")) {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "ruby-gems" => {
+                for line in lines {
+                    // "Updated X from 1.0 to 2.0" or "Updating X (1.0 -> 2.0)"
+                    if (line.contains("Updated") || line.contains("Updating"))
+                        && (line.contains("->") || line.contains(" to "))
+                        && line.chars().any(|c| c.is_ascii_digit())
+                    {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "powershell-modules" => {
+                for line in lines {
+                    if (line.contains("Install") || line.contains("Update"))
+                        && line.chars().any(|c| c.is_ascii_digit())
+                    {
+                        changes.push(line.trim().to_string());
+                        if changes.len() >= 10 { break; }
+                    }
+                }
+            }
+            "dotnet-workloads" => {
+                let cnt = lines
+                    .iter()
+                    .filter(|l| l.contains("Updated advertising manifest"))
+                    .count();
+                if cnt > 0 {
+                    changes.push(format!("{cnt} manifests updated"));
+                }
+            }
+            "appx-repair" => {
+                for line in lines {
+                    if line.contains("re-registered") {
+                        changes.push(line.trim().to_string());
+                    }
+                }
+            }
+            _ => {
+                // Generic: version arrows "X 1.2 -> 1.3" or "X v1 → v2"
+                let mut count = 0;
+                for line in lines {
+                    if (line.contains("->") || line.contains('→'))
+                        && line.chars().any(|c| c.is_ascii_digit())
+                    {
+                        let t = line.trim();
+                        if t.len() < 120 && !t.is_empty() {
+                            changes.push(t.to_string());
+                            count += 1;
+                            if count >= 5 { break; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changes.is_empty() {
+            entries.push(Entry {
+                task: r.id.clone(),
+                changes,
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("What's Changed:");
+    for entry in &entries {
+        println!("  {:<18}  {}", entry.task, entry.changes[0]);
+        for change in entry.changes.iter().skip(1) {
+            println!("  {:<18}  {}", "", change);
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

@@ -3744,6 +3744,173 @@ function Show-WhatChanged
     }
 }
 
+function Show-UpdateSummary
+{
+    param([object[]]$Results)
+
+    $entries = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($r in $Results)
+    {
+        if (-not $r.PSObject.Properties['OutputPreview']) { continue }
+        $lines = @($r.OutputPreview | ForEach-Object { [string]$_ })
+        if ($lines.Count -eq 0) { continue }
+        $text = $lines -join "`n"
+
+        $changes = [System.Collections.Generic.List[string]]::new()
+
+        switch ($r.Id)
+        {
+            'npm' {
+                for ($i = 0; $i -lt $lines.Count; $i++)
+                {
+                    if ($lines[$i] -match 'Updating npm package:\s+(.+?)(?:@\S+)?\s*$')
+                    {
+                        $pkg = $Matches[1] -replace '@latest$', ''
+                        $n = if (($i + 1) -lt $lines.Count -and $lines[$i + 1] -match 'changed (\d+) packages?') { $Matches[1] } else { '?' }
+                        [void]$changes.Add("$pkg  (+$n pkg)")
+                    }
+                }
+            }
+            'pnpm' {
+                if ($text -match 'Switching (\S+) from v?(\d+(?:\.\d+)+) to v?(\d+(?:\.\d+)+)')
+                { [void]$changes.Add("$($Matches[1]): $($Matches[2]) → $($Matches[3])") }
+            }
+            { $_ -in @('winget', 'winget-batch', 'store-apps') } {
+                # Parse the version table (Name / Id / Version / Available)
+                $inTable = $false
+                foreach ($l in $lines)
+                {
+                    # Strip spinner chars, then check for table header
+                    $clean = $l -replace '[-\\|/]\s+', '' -replace '\s{2,}', '  '
+                    if (-not $inTable -and $clean -match 'Name\s+Id\s+.*Version\s+Available')
+                    { $inTable = $true; continue }
+                    if (-not $inTable) { continue }
+                    if ($clean -match '^[\s\-]+$') { continue }
+                    if (-not $clean.Trim() -or $clean -match '\d+ upgrade|The following|package\(s\) are pinned|upgrade available')
+                    { $inTable = $false; continue }
+                    # Extract name and version columns (split on 2+ spaces, take first and last two non-empty tokens)
+                    $tokens = @($clean.Trim() -split '\s{2,}' | Where-Object { $_ })
+                    if ($tokens.Count -ge 3)
+                    {
+                        $name = $tokens[0]
+                        $avail = $tokens[-1]
+                        $ver = $tokens[-2]
+                        if ($avail -match '\d' -or $avail -match '^<')
+                        { [void]$changes.Add("$name`: $ver → $avail") }
+                    }
+                }
+                # Fallback for winget task: "[N/M] Upgrading: X" lines (only if table didn't fire)
+                if ($r.Id -eq 'winget' -and $changes.Count -eq 0)
+                {
+                    for ($i = 0; $i -lt $lines.Count; $i++)
+                    {
+                        if ($lines[$i] -match '\[\d+/\d+\] Upgrading:\s+(.+?)(?:\s+\(installed.*\))?$')
+                        {
+                            $pkg = $Matches[1].Trim()
+                            $nextLine = if ($i + 1 -lt $lines.Count) { $lines[$i + 1] } else { '' }
+                            if ($nextLine -notmatch '(?i)Not applicable:|FAILED:')
+                            { [void]$changes.Add($pkg) }
+                        }
+                    }
+                }
+            }
+            'scoop' {
+                $lines | Where-Object { $_ -match "(?i)Updating\s+'?(\S+)'?\s+\(" -or $_ -match 'Updated .+ \(\S+ -> \S+\)' } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'chocolatey' {
+                $lines | Where-Object { ($_ -match '(?i)upgraded \d+' -and $_ -notmatch '(?i)upgraded 0/') -or ($_ -match ' to ' -and $_ -match '\d+\.\d+') } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'cargo' {
+                $lines | Where-Object { $_ -match '(?i)(Updating|Updated)\s+\S+\s+v[\d.].*->|v[\d.]+\s+Yes' } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+                # Also catch table rows "name  vOLD  vNEW  Yes"
+                $lines | Where-Object { $_ -match '\S+\s+v[\d.]+\s+v[\d.]+\s+Yes' } |
+                    Select-Object -First 10 | ForEach-Object {
+                        if ($_ -match '(\S+)\s+(v[\d.]+)\s+(v[\d.]+)\s+Yes')
+                        { [void]$changes.Add("$($Matches[1]): $($Matches[2]) → $($Matches[3])") }
+                    }
+            }
+            'pip' {
+                $lines | Where-Object { $_ -match 'Successfully installed\s+\S' } |
+                    Select-Object -First 5 | ForEach-Object {
+                        $pkgs = $_ -replace '.*Successfully installed\s+', ''
+                        [void]$changes.Add($pkgs.Trim())
+                    }
+            }
+            'uv-tools' {
+                $lines | Where-Object { $_ -match '(?i)(Updated|Upgraded)\s+\S+\s+\S+\s*->' } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'mise' {
+                $lines | Where-Object { $_ -match '(?:->|→)' -and $_ -match '\d' } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'poetry' {
+                if ($text -match 'Package operations: (\d+) installs, (\d+) updates, (\d+) removals')
+                {
+                    $inst = [int]$Matches[1]; $upd = [int]$Matches[2]; $rem = [int]$Matches[3]
+                    if ($inst + $upd + $rem -gt 0)
+                    {
+                        [void]$changes.Add("$inst installs, $upd updates, $rem removals")
+                        $lines | Where-Object { $_ -match '^\s*-\s+(Installing|Updating|Downgrading|Removing)\s+(\S+)\s+\(' } |
+                            Select-Object -First 6 | ForEach-Object {
+                                if ($_ -match '(Installing|Updating|Downgrading|Removing)\s+(\S+)\s+\(([^)]+)\)')
+                                { [void]$changes.Add("  $($Matches[2]): $($Matches[3])") }
+                            }
+                    }
+                }
+            }
+            'pipx' {
+                $upgraded = @($lines | Where-Object { $_ -match '^upgrading\s+(.+)\.\.\.' } |
+                    ForEach-Object { ($_ -replace '^upgrading\s+', '' -replace '\.\.\.$', '').Trim() })
+                if ($upgraded.Count -gt 0) { [void]$changes.Add($upgraded -join ', ') }
+            }
+            'ruby-gems' {
+                $lines | Where-Object { $_ -match '(?i)(Updating|Updated)\s+\S+.*\d+\.\d+' -and ($_ -match '\(' -or $_ -match 'to') } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'gh-extensions' {
+                $lines | Where-Object { $_ -match '(?i)upgraded\s+\S+' -or ($_ -match '(?:->|→)' -and $_ -match '\d') } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'powershell-modules' {
+                $lines | Where-Object { $_ -match '(?i)(installing|updating)\s+\S+.*\d+\.\d+' } |
+                    Select-Object -First 10 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+            'dotnet-workloads' {
+                $cnt = @($lines | Where-Object { $_ -match 'Updated advertising manifest' }).Count
+                if ($cnt -gt 0) { [void]$changes.Add("$cnt manifests updated") }
+            }
+            'appx-repair' {
+                if ($text -match '(\d+) package\(s\) re-registered')
+                { [void]$changes.Add("$($Matches[1]) packages re-registered") }
+            }
+            default {
+                $lines | Where-Object { $_ -match '(?:->|→)' -and $_ -match '\d[\d.]+' -and $_.Length -lt 120 } |
+                    Select-Object -First 5 | ForEach-Object { [void]$changes.Add($_.Trim()) }
+            }
+        }
+
+        if ($changes.Count -gt 0)
+        {
+            $label = $r.Name.PadRight(16)
+            [void]$entries.Add("  $label  $($changes[0])")
+            foreach ($c in $changes | Select-Object -Skip 1)
+            { [void]$entries.Add("  $(' ' * 18)$c") }
+        }
+    }
+
+    if ($entries.Count -gt 0)
+    {
+        Write-Host ''
+        Write-Status "What's Changed:" -Level Info
+        foreach ($e in $entries) { Write-Status $e -Level Muted }
+    }
+}
+
 function Get-RunNotes
 {
     param([object[]]$Results, [object[]]$Skipped)
@@ -4241,6 +4408,8 @@ $elapsed = ((Get-Date) - $script:StartTime).ToString('hh\:mm\:ss')
 
 Show-ResultTable -Results $results -Skipped $skippedTasks
 
+Show-UpdateSummary -Results $results
+
 Show-RunNotes -Notes $runNotes
 
 if ($summary.SummaryWritten)
@@ -4262,21 +4431,6 @@ if ($RemoteStatePath -and $summary.SummaryWritten)
     } catch
     { Write-Status "Remote state sync failed: $($_.Exception.Message)" -Level Warning
     }
-}
-
-# Show version diff summary (installed → available)
-$updatedCount = 0
-foreach ($r in $results)
-{
-    if ($r.Status -eq 'Succeeded' -and $r.PSObject.Properties['OutputPreview'] -and @($r.OutputPreview).Count -gt 0)
-    {
-        $outText = ($r.OutputPreview -join "`n")
-        if ($outText -match '(?i)(\d+\.\d+\.\d+[^\s]*)\s*(?:->|→)\s*(\d+\.\d+\.\d+[^\s]*)')
-        { $updatedCount++ }
-    }
-}
-if ($updatedCount -gt 0)
-{ Write-Status "$updatedCount tool(s) reported version changes." -Level Muted
 }
 
 # Webhook notification
