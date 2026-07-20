@@ -31,11 +31,11 @@ A single PowerShell script that keeps your entire Windows machine up to date —
 | Package managers | Winget source refresh + upgrades, Scoop, Chocolatey |
 | System | Windows Update, Microsoft Store apps, WSL distros, Windows Defender signatures |
 | JavaScript | npm, pnpm, yarn, bun, deno, Volta, fnm |
-| Python | pip, pipx, uv, uv tools, uv-managed Python patch releases, Poetry |
+| Python | pip, pipx, uv, uv tools, uv-managed Python patch releases, Poetry, conda |
 | Systems languages | Rust + cargo binaries, Go, Julia via juliaup |
 | .NET | dotnet tools, dotnet workloads |
 | Other runtimes | Flutter, Ruby gems, Composer |
-| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs, Oh My Posh, yt-dlp |
+| Dev tools | VS Code extensions, GitHub CLI extensions, git-lfs, Oh My Posh, yt-dlp, vcpkg, Starship, Hugo |
 | AI | Ollama models when `-UpdateOllamaModels` is supplied |
 | Cleanup | Temp files, DNS cache, Recycle Bin, optional DISM component cleanup |
 
@@ -113,11 +113,23 @@ The scheduled task runs with `-SkipReboot -SkipWSL -SkipWindowsUpdate -Quiet` so
 | `-SkipComposer` | Skip Composer |
 | `-SkipRuby` | Skip Ruby gems |
 | `-SkipPowerShellModules` | Skip PowerShell module updates |
+| `-SkipPipHealth` | Skip the pip environment health check |
 | `-SkipCleanup` | Skip all cleanup steps |
 | `-DeepClean` | Run extra cleanup with DISM component cleanup and Delivery Optimization cache cleanup |
 | `-UpdateOllamaModels` | Pull updates for installed Ollama models; skipped by default |
+| `-UpdatePowerShellHelp` | Update PowerShell help files; opt-in |
+| `-HealthCheck` | Inventory current tool/version state without updating anything |
+| `-Snapshot` | Record current environment state to the JSON summary without updating |
+| `-Interactive` | Prompt for confirmation before each task group |
+| `-Profile` | Apply a named skip profile (`work`, `personal`, `gaming`, `minimal`) from `update-config.json` |
+| `-NoParallel` | Disable parallel task execution |
+| `-ShowSkipped` | List optional skips that are normally hidden from the summary |
+| `-BypassProtection` | Allow protected apps to be touched (normally excluded for safety) |
+| `-NoSilentInstallers` | Disable silent/unattended installer flags |
+| `-WebhookUrl` | POST a JSON alert here if any task fails or warns |
 | `-Schedule` | Register as a daily scheduled task |
 | `-ScheduleTime` | Time for scheduled task (default: `03:00`) |
+| `-ScheduleRepeat` | Repeat the scheduled task every N hours instead of once daily |
 | `-LogPath` | Custom log file path |
 | `-JsonSummaryPath` | Custom JSON summary path |
 | `-StateDir` | Custom state directory for logs and summaries |
