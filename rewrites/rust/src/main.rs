@@ -667,7 +667,14 @@ fn run_task_streaming(
         );
     }
 
-    make_summary(task, &status, duration_ms, code, cap_output(all_lines, 300))
+    // Normalize whitelisted exit codes to 0 in the summary so the report column
+    // doesn't show an alarming raw code (e.g. winget -1978335189 "no applicable
+    // upgrade") for a task that succeeded.
+    let reported_code = match code {
+        Some(c) if task.acceptable_exit_codes.contains(&c) => Some(0),
+        other => other,
+    };
+    make_summary(task, &status, duration_ms, reported_code, cap_output(all_lines, 300))
 }
 
 #[cfg(unix)]
@@ -738,6 +745,32 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             &["/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & exit 0"],
         )
         .with_resource("winget"),
+        // Git upgrades abort while any Git-shipped exe is running; Claude Code's
+        // statusline respawns bash.exe every few seconds, so kill-loops and
+        // /FORCECLOSEAPPLICATIONS both lose the race. Rename bash.exe away so
+        // respawns fail harmlessly, upgrade, then clean up.
+        Task::new_vec(
+            "winget-git",
+            "package-manager",
+            &["windows", "winget", "git"],
+            "pwsh",
+            pwsh_cmd(winget_git_script()),
+        )
+        .with_resource("winget")
+        .with_timeout(900)
+        .with_requires("winget"),
+        // Pin the skip-packages so the upgrade passes leave them alone. winget
+        // has no per-package exclude for `upgrade --all`, so pinning is the only
+        // reliable mechanism. `pin add` on an already-pinned id is a no-op.
+        Task::new_vec(
+            "winget-pin-skip",
+            "package-manager",
+            &["windows", "winget"],
+            "pwsh",
+            pwsh_cmd(&winget_pin_skip_script(&config.winget_skip_packages)),
+        )
+        .with_resource("winget")
+        .with_timeout(300),
         Task::new_vec(
             "winget",
             "package-manager",
@@ -747,21 +780,40 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
-        .with_acceptable_exit_codes(&[-1978335189, -1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
         Task::new_vec(
             "winget-batch",
             "package-manager",
             &["windows", "winget"],
             "winget",
-            vec![
-                "upgrade".into(), "--all".into(), "--source".into(), "winget".into(),
-                "--include-unknown".into(), "--accept-source-agreements".into(),
-                "--disable-interactivity".into(),
-            ],
+            {
+                // No `--exclude` (unsupported by winget). Skips handled via pins.
+                let a: Vec<String> = vec![
+                    "upgrade".into(), "--all".into(), "--source".into(), "winget".into(),
+                    "--include-unknown".into(), "--accept-source-agreements".into(),
+                    "--disable-interactivity".into(),
+                ];
+                a
+            },
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
-        .with_acceptable_exit_codes(&[-1978335189, -1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
+        // Elevated winget refuses to upgrade user-scope (zip/portable) packages
+        // ("cannot be uninstalled when running with administrator privileges",
+        // e.g. charmbracelet.crush). Re-run the upgrade de-elevated via
+        // `runas /trustlevel:0x20000` to catch those.
+        Task::new_vec(
+            "winget-userscope",
+            "package-manager",
+            &["windows", "winget"],
+            "pwsh",
+            pwsh_cmd(winget_userscope_script()),
+        )
+        .with_resource("winget")
+        .with_timeout(cli.winget_timeout_sec)
+        .with_requires("winget")
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
         Task::new_vec(
             "winget-pin-audit",
             "package-manager",
@@ -769,7 +821,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "winget",
             vec!["pin".into(), "list".into()],
         )
-        .with_acceptable_exit_codes(&[-1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
         Task::new_vec(
             "cross-manager",
             "package-manager",
@@ -799,7 +851,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
-        .with_acceptable_exit_codes(&[-1978335189, -1978335212])
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212])
         .with_requires("winget")
         .with_skip_if(cli.skip_store_apps, "disabled by --skip-store-apps"),
         // ── scoop ────────────────────────────────────────────────────────────
@@ -822,16 +874,24 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "chocolatey",
             "package-manager",
             &["windows", "choco"],
-            "choco",
+            "pwsh",
             {
-                let mut a = vec!["upgrade".into(), "all".into(), "-y".into(), "--no-progress".into()];
+                // Build the `--except pkg` suffix, then wrap the whole choco call
+                // in a pwsh admin-guard. choco requires elevation; when not
+                // elevated it prints a warning and blocks ~20s on a "continue?"
+                // prompt. Skip cleanly instead (the scheduled task runs elevated).
+                let mut except = String::new();
                 for pkg in &config.chocolatey_skip_packages {
-                    a.push("--except".into());
-                    a.push(pkg.clone());
+                    except.push_str(&format!(" --except '{}'", pkg.replace('\'', "''")));
                 }
-                a
+                let script = format!(
+                    "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){{Write-Output 'Chocolatey skipped: requires elevation (run elevated to upgrade choco packages).';exit 0}}; \
+                     & choco upgrade all -y --no-progress{except}; exit $LASTEXITCODE"
+                );
+                pwsh_cmd(&script)
             },
-        ),
+        )
+        .with_requires("choco"),
         // ── Windows Update ───────────────────────────────────────────────────
         Task::new_vec(
             "windows-update",
@@ -851,7 +911,9 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             &["windows", "security"],
             "pwsh",
             pwsh_cmd(
-                "try { Update-MpSignature -ErrorAction Stop; Write-Output 'Defender signatures updated.' } \
+                "$mode = try { (Get-MpComputerStatus -ErrorAction Stop).AMRunningMode } catch { $null }; \
+                 if ($mode -and $mode -ne 'Normal') { Write-Output \"Defender signature update skipped: AMRunningMode='$mode' (third-party AV active, Defender passive).\"; return }; \
+                 try { Update-MpSignature -ErrorAction Stop; Write-Output 'Defender signatures updated.' } \
                  catch { Write-Output \"Defender update skipped: $($_.Exception.Message)\" }",
             ),
         )
@@ -1081,7 +1143,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_requires("gh")
         .with_resource("winget")
-        .with_acceptable_exit_codes(&[-1978335189, -1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
         // ── .NET ─────────────────────────────────────────────────────────────
         Task::new(
             "dotnet-workloads",
@@ -1112,7 +1174,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             ],
         )
         .with_timeout(300)
-        .with_acceptable_exit_codes(&[-1978335189, -1978335212])
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212])
         .with_requires("winget"),
         Task::new_vec(
             "powershell-modules",
@@ -1512,7 +1574,14 @@ if not shutil.which('winget'):
     print('winget missing; gh standalone update skipped.')
     sys.exit(0)
 cmd = ['winget', 'upgrade', '--id', 'GitHub.cli', '--exact', '--include-unknown', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements', '--silent']
-result = subprocess.run(cmd, text=True)
+result = subprocess.run(cmd, capture_output=True, text=True)
+out = (result.stdout + result.stderr).strip()
+if out:
+    print(out)
+benign = ['No installed package found', 'No applicable update', 'No available upgrade', 'No newer package']
+if any(b in out for b in benign):
+    print('gh not tracked by winget (or already current); nothing to upgrade.')
+    sys.exit(0)
 sys.exit(result.returncode)
 "#.to_string(),
     ]
@@ -1706,14 +1775,35 @@ Write-Host "updated $repo -> $tag"
     pwsh_cmd(&script)
 }
 
-fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = vec![
+fn winget_pin_skip_script(skip_packages: &[String]) -> String {
+    // Pin each skip package so `winget upgrade --all` (without --include-pinned)
+    // leaves it untouched. Idempotent: pinning an already-pinned id just warns.
+    let list = skip_packages
+        .iter()
+        .map(|p| format!("'{}'", p.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "$pkgs = @({list})\n\
+         if (-not $pkgs) {{ Write-Output 'No winget skip-packages to pin.'; exit 0 }}\n\
+         foreach ($p in $pkgs) {{\n\
+         \x20   winget pin add --id $p --exact --source winget --accept-source-agreements --disable-interactivity 2>&1 | Out-Null\n\
+         \x20   Write-Output (\"pinned: {{0}}\" -f $p)\n\
+         }}\n\
+         exit 0"
+    )
+}
+
+fn winget_upgrade_args(_skip_packages: &[String]) -> Vec<String> {
+    // NOTE: `winget upgrade` has no `--exclude`. Packages in winget_skip_packages
+    // are excluded by pinning them (see winget-pin-skip task) and omitting
+    // `--include-pinned` here, so pinned packages are left untouched.
+    vec![
         "upgrade",
         "--all",
         "--source",
         "winget",
         "--include-unknown",
-        "--include-pinned",
         "--accept-package-agreements",
         "--accept-source-agreements",
         "--disable-interactivity",
@@ -1722,12 +1812,7 @@ fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
     ]
     .into_iter()
     .map(str::to_string)
-    .collect();
-    for package in skip_packages {
-        args.push("--exclude".into());
-        args.push(package.clone());
-    }
-    args
+    .collect()
 }
 
 fn pip_upgrade_args(skip_packages: &[String]) -> Vec<String> {
@@ -1802,7 +1887,16 @@ p = (shutil.which("uv") or "").replace("\\", "/").lower()
 if "/python" in p or "/scripts/" in p:
     print("uv is pip-managed; update handled by pip task")
     sys.exit(0)
-r = subprocess.run(["uv", "self", "update"])
+# `uv self update` replaces uvx.exe alongside uv.exe; if something (e.g. a
+# running uvx-hosted MCP server) has that file open, the installer fails
+# with a file-in-use error. Detect the lock and skip instead of failing --
+# the running process isn't ours to kill.
+r = subprocess.run(["uv", "self", "update"], capture_output=True, text=True)
+out = (r.stdout or "") + (r.stderr or "")
+print(out.strip())
+if r.returncode != 0 and "being used by another process" in out:
+    print("uv self-update skipped: uvx.exe locked by a running process.")
+    sys.exit(0)
 sys.exit(r.returncode)
 "#;
     vec!["-c".into(), script.into()]
@@ -1844,9 +1938,15 @@ fn npm_upgrade_args(skip_packages: &[String]) -> Vec<String> {
 
     let script = format!(
         r#"
-import json, subprocess, sys
+import json, shutil, subprocess, sys
 skip = [{skip_json}]
-r = subprocess.run(["npm", "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True)
+# Bare "npm" is npm.cmd on Windows; subprocess needs the resolved path (or
+# shell=True) or CreateProcess fails with WinError 2.
+npm = shutil.which("npm")
+if not npm:
+    print("npm not found in PATH; skipping.")
+    sys.exit(0)
+r = subprocess.run([npm, "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True)
 try:
     data = json.loads(r.stdout or "{{}}")
     pkgs = [k for k in data.get("dependencies", {{}}).keys() if k not in skip and not k.startswith("npm")]
@@ -1854,11 +1954,11 @@ except Exception:
     pkgs = []
 if not pkgs:
     print("npm: no global packages to upgrade (or npm ls failed)")
-    subprocess.run(["npm", "update", "-g"])
+    subprocess.run([npm, "update", "-g"])
     sys.exit(0)
 failed = []
 for p in pkgs:
-    rc = subprocess.run(["npm", "install", "-g", p]).returncode
+    rc = subprocess.run([npm, "install", "-g", p]).returncode
     print(("upgraded " if rc == 0 else "FAILED ") + p)
     if rc != 0:
         failed.append(p)
@@ -2223,7 +2323,7 @@ rc = r.returncode
 if rc and rc > 0x7FFFFFFF:
     rc -= 0x100000000
 low = out.lower()
-benign = rc in (0, -1978335189, -1978335212) or \
+benign = rc in (0, -1978335188, -1978335189, -1978335212) or \
     "no available upgrade" in low or "no newer package" in low or \
     "no installed package found" in low
 if benign:
@@ -2356,6 +2456,63 @@ sys.exit(0)
     vec!["-c".into(), script.into()]
 }
 
+fn winget_git_script() -> &'static str {
+    r#"
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Output 'Git upgrade skipped: requires elevation.'; exit 0 }
+$gitDir = 'C:\Program Files\Git'
+if (-not (Test-Path (Join-Path $gitDir 'bin\bash.exe'))) { Write-Output 'Git for Windows not found; skipping.'; exit 0 }
+$list = winget list --id Git.Git --exact --upgrade-available --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+if ($list -notmatch 'Git\.Git') { Write-Output 'Git: no upgrade available.'; exit 0 }
+Write-Output 'Git upgrade available. Stopping Git-dir processes and parking bash.exe (statusline respawns it)...'
+$bashPaths = @((Join-Path $gitDir 'usr\bin\bash.exe'), (Join-Path $gitDir 'bin\bash.exe'))
+Get-Process | Where-Object { $_.Path -like "$gitDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+$renamed = @()
+foreach ($p in $bashPaths) {
+    if (Test-Path $p) {
+        try { Rename-Item $p ($p + '.ue-hold') -Force; $renamed += $p }
+        catch { Write-Output "rename failed: $p -- $($_.Exception.Message)" }
+    }
+}
+Get-Process | Where-Object { $_.Path -like "$gitDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+winget upgrade --id Git.Git --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+$code = $LASTEXITCODE
+foreach ($p in $renamed) {
+    if (Test-Path $p) { Remove-Item ($p + '.ue-hold') -Force -ErrorAction SilentlyContinue }
+    else { Rename-Item ($p + '.ue-hold') $p -Force -ErrorAction SilentlyContinue }
+}
+if ($code -eq 0) { Write-Output 'Git upgraded.' } else { Write-Output "Git upgrade exit: $code" }
+exit $code
+"#
+}
+
+fn winget_userscope_script() -> &'static str {
+    r#"
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Output 'Not elevated: user-scope packages already covered by main winget pass.'; exit 0 }
+$dir = Join-Path $env:TEMP ('ue-userscope-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$ps1File = Join-Path $dir 'run.ps1'
+$log = Join-Path $dir 'run.log'
+@(
+    ('winget upgrade --all --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent *> "' + $log + '"'),
+    ('"exit: $LASTEXITCODE" | Add-Content -Path "' + $log + '"'),
+    ('"DONE" | Add-Content -Path "' + $log + '"')
+) | Set-Content -Path $ps1File -Encoding utf8
+runas /trustlevel:0x20000 "pwsh -NoProfile -ExecutionPolicy Bypass -File $ps1File" | Out-Null
+$deadline = (Get-Date).AddSeconds(900)
+while ((Get-Date) -lt $deadline) {
+    if ((Test-Path $log) -and (Select-String -Path $log -Pattern '^DONE' -Quiet -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep 5
+}
+if (-not (Test-Path $log)) { Write-Output 'De-elevated winget produced no log (runas launch failed?).'; exit 1 }
+Get-Content $log | Select-Object -Last 40
+$m = Select-String -Path $log -Pattern '^exit: (-?\d+)' | Select-Object -Last 1
+$code = if ($m) { [int]$m.Matches[0].Groups[1].Value } else { 1 }
+Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+if ($code -in 0, -1978335188, -1978335189, -1978335212) { exit 0 }
+exit $code
+"#
+}
+
 fn windows_update_script() -> &'static str {
     "$s=New-Object -ComObject Microsoft.Update.Session;\
      $r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Software'\");\
@@ -2373,26 +2530,78 @@ fn msys2_script() -> &'static str {
      \"$env:SystemDrive\\msys64\\usr\\bin\\bash.exe\")|Where-Object{Test-Path $_}|Select-Object -First 1;\
      if(-not $bash){Write-Output 'MSYS2 not installed; skipping.';return};\
      Write-Output \"Updating MSYS2 via $bash\";\
-     & $bash -lc 'pacman -Syu --noconfirm';\
+     & $bash -lc 'if [ -f /var/lib/pacman/db.lck ] && ! pgrep -x pacman >/dev/null 2>&1; then echo \"removing stale pacman lock\"; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm';\
      if($LASTEXITCODE-ne 0){Write-Output \"MSYS2 pacman exit $LASTEXITCODE\"}"
 }
 
 fn wsl_distros_script() -> &'static str {
-    "$prev=[Console]::OutputEncoding;\
-     [Console]::OutputEncoding=[System.Text.Encoding]::Unicode;\
-     $raw=wsl -l -q 2>$null;\
-     [Console]::OutputEncoding=$prev;\
-     $distros=@($raw|ForEach-Object{($_ -replace '\\0','').Trim()}|Where-Object{$_-and$_ -notmatch 'docker-desktop'});\
-     if($distros.Count-eq 0){Write-Output 'No WSL distros found.';return};\
-     $s='if command -v apt-get >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get upgrade -y; \
-     elif command -v pacman >/dev/null 2>&1; then sudo pacman -Syu --noconfirm; \
-     elif command -v dnf >/dev/null 2>&1; then sudo dnf upgrade -y; \
-     elif command -v yum >/dev/null 2>&1; then sudo yum update -y; \
-     elif command -v zypper >/dev/null 2>&1; then sudo zypper update -y; \
-     else echo no_known_package_manager; fi';\
-     foreach($d in $distros){\
-     Write-Output \"Updating WSL distro: $d\";\
-     wsl -d $d -- sh -lc $s}"
+    // NOTE: kept in parity with updatescript.ps1 'wsl-distros' task.
+    // Every package manager is gated behind `sudo -n true` so a distro whose
+    // user lacks passwordless sudo (e.g. Arch) is skipped instead of hanging
+    // forever on a password prompt under -NonInteractive.
+    r#"$prev=[Console]::OutputEncoding
+[Console]::OutputEncoding=[System.Text.Encoding]::Unicode
+$raw=wsl -l -q 2>$null
+[Console]::OutputEncoding=$prev
+$benign='(wsl2\.localhostForwarding setting has no effect|wsl: An internal error occurred\.|CreateInstance/CreateVm/ConfigureNetworking/0x8007054f|wsl: Failed to configure network|wsl: Failed to start the systemd user session)'
+$distros=@($raw|ForEach-Object{($_ -replace "`0",'').Trim()}|Where-Object{$_ -and $_ -notmatch 'docker-desktop' -and $_ -notmatch $benign}|Sort-Object -Unique)
+if($distros.Count -eq 0){Write-Output 'No WSL distros found.';return}
+$linuxScript=@'
+set -u
+
+resolve_any() {
+  for host in "$@"; do
+    if command -v getent >/dev/null 2>&1 && getent hosts "$host" >/dev/null 2>&1; then return 0; fi
+    if command -v nslookup >/dev/null 2>&1 && nslookup "$host" >/dev/null 2>&1; then return 0; fi
+    if command -v ping >/dev/null 2>&1 && ping -c 1 -W 2 "$host" >/dev/null 2>&1; then return 0; fi
+  done
+  return 1
+}
+
+if command -v apt-get >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping apt-get: sudo requires a password"
+    exit 0
+  fi
+  if ! resolve_any archive.ubuntu.com security.ubuntu.com; then
+    echo "Skipping apt-get: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
+elif command -v pacman >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping pacman: sudo requires a password"
+    exit 0
+  fi
+  if ! resolve_any archlinux.org geo.mirror.pkgbuild.com; then
+    echo "Skipping pacman: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n pacman -Syu --noconfirm --needed
+elif command -v dnf >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping dnf: sudo requires a password"
+    exit 0
+  fi
+  sudo -n dnf -y upgrade
+elif command -v zypper >/dev/null 2>&1; then
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Skipping zypper: sudo requires a password"
+    exit 0
+  fi
+  if ! resolve_any download.opensuse.org mirrors.opensuse.org; then
+    echo "Skipping zypper: WSL DNS/network is unavailable"
+    exit 0
+  fi
+  sudo -n zypper --non-interactive refresh && sudo -n zypper --non-interactive update
+else
+  echo "No supported Linux package manager found"
+fi
+'@
+foreach($d in $distros){
+  Write-Output "Updating WSL distro: $d"
+  wsl --distribution $d --exec sh -lc $linuxScript
+}"#
 }
 
 fn powershell_modules_script() -> &'static str {
@@ -2440,7 +2649,9 @@ fn windows_features_script(features: &[String]) -> String {
 }
 
 fn appx_repair_script() -> &'static str {
-    "$pkgs=@(Get-AppxPackage -AllUsers -EA SilentlyContinue|\
+    "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){\
+     Write-Output 'AppX repair skipped: requires elevation (Get-AppxPackage -AllUsers needs admin).';return};\
+     $pkgs=@(Get-AppxPackage -AllUsers -EA SilentlyContinue|\
      Where-Object{$_.SignatureKind-eq 'Store'-and-not $_.IsFramework-and\
      $_.Name-match '(Microsoft\\.WindowsStore|Microsoft\\.Store|Microsoft\\.WindowsCalculator|\
      Microsoft\\.Windows\\.Photos|Microsoft\\.Windows\\.Camera|Microsoft\\.People|\
@@ -2540,6 +2751,7 @@ fn filter_tasks(
         "cleanup",
         "winget",
         "winget-source",
+        "winget-userscope",
         "scoop",
     ]);
 
@@ -2682,7 +2894,11 @@ fn status_name(status: ExitStatus) -> String {
 
 fn load_config(path: &Path) -> Result<Config> {
     if !path.exists() {
-        return Ok(Config::default());
+        // Deserialize an empty object instead of Config::default() so the
+        // serde field defaults apply (e.g. temp_cleanup_days = 7). A raw
+        // Default would give temp_cleanup_days = 0, which makes the cleanup
+        // task delete *all* temp files regardless of age.
+        return Ok(serde_json::from_str("{}").expect("empty config is valid"));
     }
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
@@ -2885,15 +3101,35 @@ fn now_string() -> String {
 }
 
 fn find_repo_root() -> Result<PathBuf> {
+    let marker = |dir: &Path| {
+        dir.join("update-config.json").exists() || dir.join("updatescript.ps1").exists()
+    };
+
+    // 1) Walk up from the current working directory.
     let mut dir = env::current_dir()?;
     loop {
-        if dir.join("update-config.json").exists() || dir.join("updatescript.ps1").exists() {
+        if marker(&dir) {
             return Ok(dir);
         }
         if !dir.pop() {
             break;
         }
     }
+
+    // 2) Walk up from the executable's own directory. This makes config
+    //    discovery work when the exe is invoked from an arbitrary CWD (e.g. the
+    //    scheduled task runs from System32), as long as update-config.json sits
+    //    next to the deployed binary.
+    if let Ok(exe) = env::current_exe() {
+        let mut dir = exe.parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if marker(&d) {
+                return Ok(d);
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+    }
+
     env::current_dir().context("failed to resolve current directory")
 }
 
