@@ -1598,7 +1598,7 @@ if command -v apt-get >/dev/null 2>&1; then
     echo "Skipping apt-get: WSL DNS/network is unavailable"
     exit 0
   fi
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 update &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 update &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade &&   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
 elif command -v pacman >/dev/null 2>&1; then
   if ! sudo -n true >/dev/null 2>&1; then
     echo "Skipping pacman: sudo requires a password"

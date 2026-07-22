@@ -1,7 +1,12 @@
 {
-  "WingetSkipPackages": [],
+  "WingetSkipPackages": [
+    "charmbracelet.crush"
+  ],
   "SkipManagers": [],
   "PipSkipPackages": [],
+  "NpmSkipPackages": [
+    "@anthropic-ai/claude-code"
+  ],
   "PipIgnoreHealthPackages": [
     "pylint",
     "huggingface-hub",
