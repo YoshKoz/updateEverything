@@ -532,7 +532,7 @@ fn run_task_streaming(
 
     let timeout = task.timeout_override.unwrap_or(timeout);
     let start = Instant::now();
-    let mut command = Command::new(task.command);
+    let mut command = new_task_command(task.command);
     command
         .args(&task.args)
         .stdout(Stdio::piped())
@@ -545,9 +545,10 @@ fn run_task_streaming(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
+            eprintln!("fail {:<22} spawn failed: {err}", task.id);
             return make_summary(
                 task,
-                "Skipped",
+                "Failed",
                 start.elapsed().as_millis(),
                 None,
                 vec![format!("spawn failed: {err}")],
@@ -2968,13 +2969,16 @@ fn print_summary(summary: &RunSummary) {
 // ─── Command probing ─────────────────────────────────────────────────────────
 
 fn command_exists(name: &str) -> bool {
+    resolve_command_path(name).is_some()
+}
+
+fn resolve_command_path(name: &str) -> Option<PathBuf> {
     if Path::new(name).components().count() > 1 {
-        return Path::new(name).exists();
+        let p = Path::new(name);
+        return if p.exists() { Some(p.to_path_buf()) } else { None };
     }
 
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
+    let path = env::var_os("PATH")?;
 
     let extensions = if cfg!(windows) {
         env::var_os("PATHEXT")
@@ -2997,15 +3001,47 @@ fn command_exists(name: &str) -> bool {
             for ext in &extensions {
                 let candidate = dir.join(format!("{name}{ext}"));
                 if candidate.is_file() {
-                    return true;
+                    return Some(candidate);
                 }
             }
         } else if dir.join(name).is_file() {
-            return true;
+            return Some(dir.join(name));
         }
     }
 
-    false
+    None
+}
+
+/// Build a Command that can actually spawn on Windows. Bare `Command::new("yarn")`
+/// fails when the target is yarn.cmd / composer.ps1 / gem.bat: CreateProcess does
+/// no PATHEXT search, so the spawn errors and the task was silently marked
+/// Skipped. Resolve the full path first; .bat/.cmd with a visible extension go
+/// through std's safe cmd.exe handling, .ps1 needs an explicit PowerShell host.
+fn new_task_command(program: &str) -> Command {
+    if !cfg!(windows) {
+        return Command::new(program);
+    }
+    let Some(path) = resolve_command_path(program) else {
+        return Command::new(program);
+    };
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("ps1") => {
+            let shell = if resolve_command_path("pwsh").is_some() {
+                "pwsh"
+            } else {
+                "powershell"
+            };
+            let mut c = Command::new(shell);
+            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(path);
+            c
+        }
+        _ => Command::new(path),
+    }
 }
 
 /// When running under WSL, skip automounted Windows drives (/mnt/<letter>/...)
