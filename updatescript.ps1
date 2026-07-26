@@ -506,7 +506,8 @@ function Show-ResultTable
     Write-Host ("{0,-24} {1,-12} {2,-8} {3}" -f 'Task', 'Status', 'Time(s)', 'Note') -ForegroundColor DarkGray
     Write-Host ("{0,-24} {1,-12} {2,-8} {3}" -f '----', '------', '-------', '----') -ForegroundColor DarkGray
 
-    foreach ($r in $Results)
+    # Skipped rows are counted but not listed; they drown out tasks that ran.
+    foreach ($r in @($Results | Where-Object { $_.Status -ne 'Skipped' }))
     {
         $color = if ($statusColor.ContainsKey($r.Status)) { $statusColor[$r.Status] } else { 'White' }
         $dur = if ($r.PSObject.Properties['DurationSeconds'] -and $r.DurationSeconds -gt 0) { '{0:N1}' -f $r.DurationSeconds } else { '-' }
@@ -1958,6 +1959,32 @@ fi
                     return
                 }
 
+                # uv self-update replaces uvx.exe alongside uv.exe; anything hosting a
+                # uvx tool (commonly an MCP server) holds it open. Close the holders by
+                # exact path and retry -- whatever spawned them restarts them.
+                if ($result.ExitCode -ne 0 -and $outText -match 'being used by another process')
+                {
+                    $binDir = Split-Path -Parent $uvExe
+                    $targets = @('uv.exe', 'uvx.exe') | ForEach-Object { Join-Path $binDir $_ }
+                    $holders = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $targets -contains $_.Path })
+                    if ($holders.Count -gt 0)
+                    {
+                        foreach ($h in $holders)
+                        {
+                            Write-Output "closed $($h.ProcessName) (pid $($h.Id))"
+                            Stop-Process -Id $h.Id -Force -ErrorAction SilentlyContinue
+                        }
+                        Start-Sleep -Seconds 2
+                        $result = Invoke-UpdateProcess -FilePath $uvExe -ArgumentList @('self', 'update') -SuccessExitCodes @(0, 1) -PassThru
+                        $outText = (@($result.Output) | Out-String).Trim()
+                    } else
+                    {
+                        Set-TaskStatus -Status 'Skipped' -Reason 'uv self-update blocked; no closable holder found'
+                        Write-Output 'uv self-update blocked and no closable holder was found.'
+                        return
+                    }
+                }
+
                 if ($result.ExitCode -ne 0)
                 {
                     if ($outText) { Write-Output $outText }
@@ -2001,6 +2028,25 @@ fi
             } -Tags @('python', 'uv') -Resources @('uv'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'poetry' -Category 'python' -RequiresCommand 'poetry' -Disabled:$SkipPoetry -DisabledReason 'disabled by -SkipPoetry' -Script {
+                # pipx owns poetry's venv when it installed it; 'poetry self update'
+                # then re-pins poetry's shared libraries down to its own declared
+                # bounds, undoing pipx's upgrades on every run.
+                $pipxManaged = $false
+                if (Get-Command pipx -ErrorAction SilentlyContinue)
+                {
+                    try
+                    {
+                        $pipxManaged = @(& pipx list --short 2>$null) -match '^poetry\s'
+                    } catch
+                    {
+                    }
+                }
+                if ($pipxManaged)
+                {
+                    Set-TaskStatus -Status 'Skipped' -Reason 'poetry is pipx-managed; upgrades handled by the pipx task'
+                    Write-Output 'poetry is pipx-managed; upgrades handled by the pipx task.'
+                    return
+                }
                 try
                 {
                     Invoke-UpdateProcess -FilePath 'poetry' -ArgumentList @('self', 'update', '--no-interaction') -Retries 0 -TimeoutSec 120
@@ -3854,7 +3900,11 @@ function Show-UpdateSummary
                     $inst = [int]$Matches[1]; $upd = [int]$Matches[2]; $rem = [int]$Matches[3]
                     if ($inst + $upd + $rem -gt 0)
                     {
-                        [void]$changes.Add("$inst installs, $upd updates, $rem removals")
+                        $down = @($lines | Where-Object { $_ -match '^\s*-\s+Downgrading\s' }).Count
+                        if ($down -gt 0)
+                        { [void]$changes.Add("$inst installs, $upd updates, $rem removals -- $down DOWNGRADED") }
+                        else
+                        { [void]$changes.Add("$inst installs, $upd updates, $rem removals") }
                         $lines | Where-Object { $_ -match '^\s*-\s+(Installing|Updating|Downgrading|Removing)\s+(\S+)\s+\(' } |
                             Select-Object -First 6 | ForEach-Object {
                                 if ($_ -match '(Installing|Updating|Downgrading|Removing)\s+(\S+)\s+\(([^)]+)\)')
