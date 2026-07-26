@@ -550,6 +550,38 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
     results
 }
 
+/// Task scripts print a line starting with this when they deliberately took no
+/// action. Without it an intentional no-op reports as Succeeded, which reads as
+/// "updated" in the summary.
+const SKIP_PREFIX: &str = "SKIPPED:";
+
+/// Prepended to python task scripts that need to free a locked executable.
+/// Matches on the exact resolved path so an unrelated same-named binary
+/// elsewhere on PATH is never touched.
+const CLOSE_BLOCKERS_PY: &str = r#"
+import os as _os, subprocess as _sp
+
+def close_locking_processes(bindir, names):
+    targets = [_os.path.join(bindir, n) for n in names]
+    quoted = ",".join("'" + t.replace("'", "''") + "'" for t in targets)
+    ps = (
+        "$t=@(" + quoted + ");"
+        "Get-Process -ErrorAction SilentlyContinue |"
+        " Where-Object { $t -contains $_.Path } |"
+        " ForEach-Object {"
+        "  Write-Output ('closed ' + $_.ProcessName + ' (pid ' + $_.Id + ')');"
+        "  Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }"
+    )
+    r = _sp.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True, text=True,
+    )
+    out = (r.stdout or "").strip()
+    if out:
+        print(out)
+    return bool(out)
+"#;
+
 fn run_task_streaming(
     task: &Task,
     quiet: bool,
@@ -699,6 +731,15 @@ fn run_task_streaming(
         exit_status
             .map(status_name)
             .unwrap_or_else(|| "Failed".to_string())
+    };
+    let status = if status == "Succeeded"
+        && all_lines
+            .iter()
+            .any(|l| l.trim_start().starts_with(SKIP_PREFIX))
+    {
+        "Skipped".to_string()
+    } else {
+        status
     };
 
     if !quiet {
@@ -1121,13 +1162,14 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_requires("uv")
         .with_skip_if(cli.skip_uv_tools, "disabled by --skip-uv-tools"),
-        Task::new(
+        Task::new_vec(
             "poetry",
             "python",
             &["python"],
-            "poetry",
-            &["self", "update"],
+            "python",
+            poetry_self_update_args(),
         )
+        .with_requires("poetry")
         .with_skip_if(cli.skip_poetry, "disabled by --skip-poetry"),
         Task::new_vec("conda", "python", &["python"], "python", conda_upgrade_args(&config.conda_skip_envs))
             .with_requires("conda")
@@ -1934,21 +1976,53 @@ sys.exit(0)
 
 fn uv_self_update_args() -> Vec<String> {
     let script = r#"
-import shutil, subprocess, sys
-p = (shutil.which("uv") or "").replace("\\", "/").lower()
+import os, shutil, subprocess, sys, time
+
+uv = shutil.which("uv") or ""
+p = uv.replace("\\", "/").lower()
 if "/python" in p or "/scripts/" in p:
-    print("uv is pip-managed; update handled by pip task")
+    print("SKIPPED: uv is pip-managed; update handled by pip task.")
     sys.exit(0)
-# `uv self update` replaces uvx.exe alongside uv.exe; if something (e.g. a
-# running uvx-hosted MCP server) has that file open, the installer fails
-# with a file-in-use error. Detect the lock and skip instead of failing --
-# the running process isn't ours to kill.
-r = subprocess.run(["uv", "self", "update"], capture_output=True, text=True)
-out = (r.stdout or "") + (r.stderr or "")
+
+def update():
+    r = subprocess.run(["uv", "self", "update"], capture_output=True, text=True)
+    return r, (r.stdout or "") + (r.stderr or "")
+
+r, out = update()
 print(out.strip())
+# `uv self update` replaces uvx.exe alongside uv.exe. Anything hosting a uvx
+# tool (commonly an MCP server) holds that file open and the installer fails.
+# Close the holders by exact path and retry; whatever spawned them restarts them.
 if r.returncode != 0 and "being used by another process" in out:
-    print("uv self-update skipped: uvx.exe locked by a running process.")
-    sys.exit(0)
+    closed = close_locking_processes(os.path.dirname(uv), ["uv.exe", "uvx.exe"])
+    if closed:
+        time.sleep(2)
+        r, out = update()
+        print(out.strip())
+    else:
+        print("SKIPPED: uv self-update blocked and no closable holder was found.")
+        sys.exit(0)
+sys.exit(r.returncode)
+"#;
+    vec!["-c".into(), format!("{}{}", CLOSE_BLOCKERS_PY, script)]
+}
+
+fn poetry_self_update_args() -> Vec<String> {
+    // pipx owns poetry's venv when it installed it; `poetry self update` then
+    // re-pins poetry's shared libraries down to its own declared bounds,
+    // undoing pipx's upgrades on every run. Let pipx keep them current.
+    let script = r#"
+import shutil, subprocess, sys
+if shutil.which("pipx"):
+    r = subprocess.run(["pipx", "list", "--short"], capture_output=True, text=True)
+    for line in (r.stdout or "").splitlines():
+        if line.split()[:1] == ["poetry"]:
+            print("SKIPPED: poetry is pipx-managed; upgrades handled by the pipx task.")
+            sys.exit(0)
+r = subprocess.run(
+    ["poetry", "self", "update", "--no-interaction"], capture_output=True, text=True
+)
+print(((r.stdout or "") + (r.stderr or "")).strip())
 sys.exit(r.returncode)
 "#;
     vec!["-c".into(), script.into()]
@@ -2989,7 +3063,9 @@ fn print_summary(summary: &RunSummary) {
     println!();
     println!("{:<26} {:<12} {:<8} Exit", "Task", "Status", "Time(s)");
     println!("{:<26} {:<12} {:<8} ----", "----", "------", "-------");
-    for r in &summary.results {
+    // Skipped rows are almost all "tool not installed"; they drown out the tasks
+    // that actually ran. Counted below, just not listed.
+    for r in summary.results.iter().filter(|r| r.status != "Skipped") {
         let exit = r
             .exit_code
             .map(|c| c.to_string())
@@ -3558,11 +3634,16 @@ fn print_update_summary(results: &[TaskSummary]) {
             }
             "poetry" => {
                 let mut pkg_count = 0;
+                let downgrades = lines.iter().filter(|l| l.contains("- Downgrading")).count();
                 for line in lines {
                     if line.contains("Package operations:") {
                         let summary = line.trim().trim_start_matches("Package operations: ");
                         if !summary.contains("0 installs, 0 updates, 0 removals") {
-                            changes.push(summary.to_string());
+                            if downgrades > 0 {
+                                changes.push(format!("{summary} -- {downgrades} DOWNGRADED"));
+                            } else {
+                                changes.push(summary.to_string());
+                            }
                         }
                     } else if pkg_count < 6
                         && (line.contains("- Installing")
