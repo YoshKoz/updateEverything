@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -280,6 +280,10 @@ struct Task {
     args: Vec<String>,
     requires: &'static str,
     resource: &'static str,
+    /// Task ids that must finish (any status) before this one starts. Resources only
+    /// guarantee mutual exclusion, not ordering, so tasks sharing a resource that must
+    /// run in a specific sequence (e.g. pinning before `winget upgrade`) need this too.
+    depends_on: &'static [&'static str],
     skip_reason: Option<String>,
     timeout_override: Option<Duration>,
     acceptable_exit_codes: Vec<i32>,
@@ -465,6 +469,15 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
         }
         let resource_locks = Arc::new(resource_locks);
 
+        // Tasks may declare `depends_on` on other task ids that share a resource but
+        // need a strict run-before/run-after order (a resource mutex only guarantees
+        // exclusion, not sequencing). Only wait on dependencies that actually appear
+        // in this run's task set, so filtering (--only/--skip) can't deadlock a task
+        // waiting on a dependency that was never scheduled.
+        let runnable_ids: HashSet<String> = to_run.iter().map(|t| t.id.to_string()).collect();
+        let finished: Arc<(Mutex<HashSet<String>>, Condvar)> =
+            Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+
         let queue: Arc<Mutex<VecDeque<Task>>> = Arc::new(Mutex::new(to_run.into_iter().collect()));
         let out: Arc<Mutex<Vec<TaskSummary>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -473,14 +486,40 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
             let queue = Arc::clone(&queue);
             let out = Arc::clone(&out);
             let locks = Arc::clone(&resource_locks);
+            let finished = Arc::clone(&finished);
+            let runnable_ids = runnable_ids.clone();
             let quiet = cli.quiet;
             let h = thread::spawn(move || {
                 loop {
                     let task = {
                         let mut q = queue.lock().unwrap();
-                        match q.pop_front() {
-                            Some(t) => t,
-                            None => break,
+                        // Find the first queued task whose dependencies (that were
+                        // actually scheduled this run) have all finished; requeue
+                        // anything skipped over so other workers can still find it.
+                        let (done_lock, _) = &*finished;
+                        let pos = {
+                            let done = done_lock.lock().unwrap();
+                            q.iter().position(|t| {
+                                t.depends_on
+                                    .iter()
+                                    .all(|dep| !runnable_ids.contains(*dep) || done.contains(*dep))
+                            })
+                        };
+                        match pos {
+                            Some(i) => q.remove(i).unwrap(),
+                            None if q.is_empty() => break,
+                            None => {
+                                // Everything left is blocked on an in-flight dependency;
+                                // wait to be woken when a task finishes, then re-check.
+                                let guard = q;
+                                drop(
+                                    finished
+                                        .1
+                                        .wait_timeout(guard, Duration::from_millis(200))
+                                        .unwrap(),
+                                );
+                                continue;
+                            }
                         }
                     };
                     let mut r = run_task_streaming(&task, quiet, timeout, true, &locks);
@@ -493,7 +532,10 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                         thread::sleep(delay);
                         r = run_task_streaming(&task, quiet, timeout, true, &locks);
                     }
+                    let task_id = task.id.to_string();
                     out.lock().unwrap().push(r);
+                    finished.0.lock().unwrap().insert(task_id);
+                    finished.1.notify_all();
                 }
             });
             handles.push(h);
@@ -781,7 +823,8 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
-        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212])
+        .with_depends_on(&["winget-pin-skip", "winget-git"]),
         Task::new_vec(
             "winget-batch",
             "package-manager",
@@ -799,7 +842,8 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
-        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212]),
+        .with_acceptable_exit_codes(&[-1978335188, -1978335189, -1978335212])
+        .with_depends_on(&["winget-pin-skip", "winget-git"]),
         // Elevated winget refuses to upgrade user-scope (zip/portable) packages
         // ("cannot be uninstalled when running with administrator privileges",
         // e.g. charmbracelet.crush). Re-run the upgrade de-elevated via
@@ -1460,6 +1504,7 @@ impl Task {
             args,
             requires: command,
             resource: "",
+            depends_on: &[],
             skip_reason: None,
             timeout_override: None,
             acceptable_exit_codes: vec![],
@@ -1483,6 +1528,7 @@ impl Task {
             args,
             requires,
             resource: "",
+            depends_on: &[],
             skip_reason: None,
             timeout_override: None,
             acceptable_exit_codes: vec![],
@@ -1497,6 +1543,11 @@ impl Task {
 
     fn with_requires(mut self, requires: &'static str) -> Self {
         self.requires = requires;
+        self
+    }
+
+    fn with_depends_on(mut self, depends_on: &'static [&'static str]) -> Self {
+        self.depends_on = depends_on;
         self
     }
 
@@ -2464,9 +2515,9 @@ $gitDir = 'C:\Program Files\Git'
 if (-not (Test-Path (Join-Path $gitDir 'bin\bash.exe'))) { Write-Output 'Git for Windows not found; skipping.'; exit 0 }
 $list = winget list --id Git.Git --exact --upgrade-available --accept-source-agreements --disable-interactivity 2>&1 | Out-String
 if ($list -notmatch 'Git\.Git') { Write-Output 'Git: no upgrade available.'; exit 0 }
-Write-Output 'Git upgrade available. Stopping Git-dir processes and parking bash.exe (statusline respawns it)...'
+Write-Output 'Git upgrade available. Stopping bash.exe and parking it (statusline respawns it)...'
 $bashPaths = @((Join-Path $gitDir 'usr\bin\bash.exe'), (Join-Path $gitDir 'bin\bash.exe'))
-Get-Process | Where-Object { $_.Path -like "$gitDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process | Where-Object { $_.Path -in $bashPaths } | Stop-Process -Force -ErrorAction SilentlyContinue
 $renamed = @()
 foreach ($p in $bashPaths) {
     if (Test-Path $p) {
@@ -2474,7 +2525,7 @@ foreach ($p in $bashPaths) {
         catch { Write-Output "rename failed: $p -- $($_.Exception.Message)" }
     }
 }
-Get-Process | Where-Object { $_.Path -like "$gitDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process | Where-Object { $_.Path -in $bashPaths } | Stop-Process -Force -ErrorAction SilentlyContinue
 winget upgrade --id Git.Git --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
 $code = $LASTEXITCODE
 foreach ($p in $renamed) {
@@ -3188,20 +3239,43 @@ struct ProcessLock {
 impl ProcessLock {
     fn acquire(state_dir: &Path) -> Option<Self> {
         let path = state_dir.join("update-everything.lock");
-        if path.exists() {
-            if let Ok(text) = fs::read_to_string(&path) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    if is_pid_running(pid) {
-                        eprintln!(
-                            "warn: another instance is already running (PID {pid}); exiting"
-                        );
-                        std::process::exit(5);
+        let _ = fs::create_dir_all(state_dir);
+
+        // Try an atomic exclusive create first so two instances racing to start
+        // can't both observe "no lock" and both write their own PID.
+        for _ in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    let _ = file.write_all(std::process::id().to_string().as_bytes());
+                    return Some(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Ok(pid) = text.trim().parse::<u32>() {
+                            if is_pid_running(pid) {
+                                eprintln!(
+                                    "warn: another instance is already running (PID {pid}); exiting"
+                                );
+                                std::process::exit(5);
+                            }
+                        }
                     }
+                    // Stale lock (process gone or unparseable) — remove and retry the
+                    // exclusive create on the next loop iteration.
+                    let _ = fs::remove_file(&path);
+                }
+                Err(_) => {
+                    // Can't create the lock file at all (e.g. permissions); fall back
+                    // to running without single-instance protection.
+                    return Some(Self { path });
                 }
             }
         }
-        let _ = fs::create_dir_all(state_dir);
-        let _ = fs::write(&path, std::process::id().to_string());
         Some(Self { path })
     }
 }
@@ -3641,13 +3715,13 @@ mod tests {
     }
 
     #[test]
-    fn winget_args_include_excludes() {
+    fn winget_args_omit_include_pinned() {
+        // Skip packages are excluded via pinning (winget-pin-skip task), not --exclude,
+        // and `--include-pinned` must stay absent so pinned packages are left untouched.
         let args = winget_upgrade_args(&["Foo.Bar".to_string(), "Baz.Qux".to_string()]);
         assert!(args.contains(&"--all".to_string()));
-        let pairs: Vec<_> = args.windows(2).filter(|w| w[0] == "--exclude").collect();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0][1], "Foo.Bar");
-        assert_eq!(pairs[1][1], "Baz.Qux");
+        assert!(!args.contains(&"--exclude".to_string()));
+        assert!(!args.contains(&"--include-pinned".to_string()));
     }
 
     #[test]
