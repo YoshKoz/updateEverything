@@ -693,7 +693,7 @@ fn run_task_streaming(
         "Succeeded".to_string()
     } else if timed_out {
         "TimedOut".to_string()
-    } else if code.map_or(false, |c| task.acceptable_exit_codes.contains(&c)) {
+    } else if code.is_some_and(|c| task.acceptable_exit_codes.contains(&c)) {
         "Succeeded".to_string()
     } else {
         exit_status
@@ -3255,15 +3255,12 @@ impl ProcessLock {
                     return Some(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Ok(pid) = text.trim().parse::<u32>() {
-                            if is_pid_running(pid) {
-                                eprintln!(
-                                    "warn: another instance is already running (PID {pid}); exiting"
-                                );
-                                std::process::exit(5);
-                            }
-                        }
+                    if let Ok(text) = fs::read_to_string(&path)
+                        && let Ok(pid) = text.trim().parse::<u32>()
+                        && is_pid_running(pid)
+                    {
+                        eprintln!("warn: another instance is already running (PID {pid}); exiting");
+                        std::process::exit(5);
                     }
                     // Stale lock (process gone or unparseable) — remove and retry the
                     // exclusive create on the next loop iteration.
@@ -3399,21 +3396,21 @@ fn print_update_summary(results: &[TaskSummary]) {
             }
             "pnpm" => {
                 for line in lines {
-                    if line.contains("Switching") && line.contains("from v") && line.contains("to v") {
-                        if let Some(after_from) = line.split("from v").nth(1) {
-                            let tool = line
-                                .split("Switching")
-                                .nth(1)
-                                .unwrap_or("")
-                                .trim()
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("pnpm");
-                            if let Some((old, rest)) = after_from.split_once(" to v") {
-                                let new_ver =
-                                    rest.trim_end_matches('.').trim_end_matches("..").trim();
-                                changes.push(format!("{tool}: {old} → {new_ver}"));
-                            }
+                    if line.contains("Switching")
+                        && line.contains("from v")
+                        && line.contains("to v")
+                        && let Some(after_from) = line.split("from v").nth(1)
+                    {
+                        let tool = line
+                            .split("Switching")
+                            .nth(1)
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("pnpm");
+                        if let Some((old, rest)) = after_from.split_once(" to v") {
+                            let new_ver = rest.trim_end_matches('.').trim_end_matches("..").trim();
+                            changes.push(format!("{tool}: {old} → {new_ver}"));
                         }
                     }
                 }

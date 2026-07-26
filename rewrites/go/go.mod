@@ -1,3 +1,3 @@
 module update-everything
 
-go 1.26.3
+go 1.26.5
