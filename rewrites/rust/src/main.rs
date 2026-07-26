@@ -423,7 +423,7 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                     "dry  {:<22} {} {}",
                     task.id,
                     task.command,
-                    shell_join(&task.args)
+                    shell_join_brief(&task.args)
                 );
                 results.push(make_summary(task, "DryRun", 0, None, vec![]));
             }
@@ -594,7 +594,7 @@ fn run_task_streaming(
             "run  {:<22} {} {}",
             task.id,
             task.command,
-            shell_join(&task.args)
+            shell_join_brief(&task.args)
         );
     }
 
@@ -3234,6 +3234,23 @@ fn shell_join(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Same as `shell_join` but collapses multi-line arguments to a placeholder.
+/// Inline `-c` script bodies are dozens of lines and bury the run/dry echo.
+fn shell_join_brief(args: &[String]) -> String {
+    let brief: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            if arg.contains('\n') {
+                let lines = arg.lines().filter(|l| !l.trim().is_empty()).count();
+                format!("<{lines}-line-script>")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    shell_join(&brief)
 }
 
 #[allow(dead_code)]
