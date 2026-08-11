@@ -915,19 +915,8 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "store-apps",
             "system",
             &["windows", "store"],
-            "winget",
-            {
-                let mut a = vec![
-                    "upgrade".into(), "--all".into(), "--source".into(), "msstore".into(),
-                    "--include-unknown".into(), "--include-pinned".into(),
-                    "--accept-source-agreements".into(), "--disable-interactivity".into(),
-                ];
-                for pkg in &config.store_app_skip_packages {
-                    a.push("--exclude".into());
-                    a.push(pkg.clone());
-                }
-                a
-            },
+            "pwsh",
+            pwsh_cmd(&store_apps_script(&config.store_app_skip_packages)),
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
@@ -1915,35 +1904,89 @@ for ($i = 0; $i -lt $lines.Count; $i++) {{
 if ($null -eq $hdr) {{ Write-Output 'winget: no upgrade table found'; exit 0 }}
 $idStart = $lines[$hdr].IndexOf('Id')
 $verStart = $lines[$hdr].IndexOf('Version')
-$ids = @()
+$pkgs = @()
 for ($i = $hdr + 1; $i -lt $lines.Count; $i++) {{
     $line = $lines[$i]
     if ($line -match '^-{{3,}}$') {{ continue }}
     if ([string]::IsNullOrWhiteSpace($line)) {{ break }}
+    # Trailer prose ("N upgrades available.", "The following packages ...") sits at the
+    # same offsets as the table, so slicing it yields junk ids like "le.".
+    if ($line -match '^\d+ (upgrades|package)' -or $line -match '^The following') {{ break }}
     if ($line.Length -le $idStart) {{ continue }}
     $len = [Math]::Min($verStart - $idStart, $line.Length - $idStart)
     $id = $line.Substring($idStart, $len).Trim()
-    if ($id -and $id -notmatch '\s' -and $id -notin $skip) {{ $ids += $id }}
+    $name = $line.Substring(0, $idStart).Trim()
+    if ($name -and $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*\.[A-Za-z0-9][A-Za-z0-9._+-]*$' -and $id -notin $skip) {{
+        $pkgs += [pscustomobject]@{{ Id = $id; Name = $name }}
+    }}
 }}
-$ids = $ids | Select-Object -Unique
-Write-Output ("winget: {{0}} package(s) to upgrade" -f $ids.Count)
+$pkgs = $pkgs | Sort-Object Id -Unique
+Write-Output ("winget: {{0}} package(s) to upgrade" -f $pkgs.Count)
+
+# Registry install path for a display name, used to satisfy installers that demand
+# --location. Returns $null when the name matches zero or several entries.
+function Get-InstalledLocation($displayName) {{
+    if (-not $displayName) {{ return $null }}
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $hits = @(Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.DisplayName -eq $displayName -and $_.InstallLocation }} |
+        Select-Object -ExpandProperty InstallLocation -Unique)
+    if ($hits.Count -eq 1 -and (Test-Path $hits[0])) {{ return $hits[0] }}
+    return $null
+}}
+
 # Codes winget returns when a listed upgrade cannot apply to this system; not our failure.
-$tolerated = @(-1978335188, -1978335189, -1978335212, -1978335215)
-# Package-level blockers no unattended run can clear: installer needs an install
-# location (-1978335137), newer version uses a different install technology so it
-# needs uninstall+install (-1978335090), or the de-elevated pass cannot touch a
-# machine-scope package (-1978335226). Reported, but they do not fail the task.
-$manual = @(-1978335137, -1978335090, -1978335226)
-$ok = @(); $skipped = @(); $needsManual = @(); $failed = @()
-foreach ($id in $ids) {{
+$tolerated = @(-1978335188, -1978335212, -1978335215)
+# `upgrade` refuses these, but `install --force` over the top does the job: the manifest
+# does not apply to the installed package (-1978335189), or the new version uses a
+# different install technology and winget cannot uninstall the old one (-1978335090).
+$forceable = @(-1978335189, -1978335090)
+# The installer wants an explicit target directory (-1978335137). Retry with the path the
+# package is already installed to; give up if the registry does not identify one.
+$needsLocation = -1978335137
+# The de-elevated pass cannot touch machine-scope packages; the elevated pass covers them.
+$manual = @(-1978335226)
+$ok = @(); $forced = @(); $skipped = @(); $needsManual = @(); $failed = @()
+foreach ($pkg in $pkgs) {{
+    $id = $pkg.Id
     winget upgrade --id $id --exact --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
     $code = $LASTEXITCODE
-    if ($code -eq 0) {{ $ok += $id }}
-    elseif ($tolerated -contains $code) {{ $skipped += ("{{0}} ({{1}})" -f $id, $code) }}
+    if ($code -eq 0) {{ $ok += $id; continue }}
+
+    if ($forceable -contains $code) {{
+        Write-Output ("{{0}}: upgrade returned {{1}}; retrying as forced install" -f $id, $code)
+        winget install --id $id --exact --source winget --include-unknown --force --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
+        $code2 = $LASTEXITCODE
+        if ($code2 -eq 0) {{ $forced += $id }}
+        elseif ($tolerated -contains $code2) {{ $skipped += ("{{0}} ({{1}})" -f $id, $code2) }}
+        else {{ $needsManual += ("{{0}} (upgrade {{1}}, forced install {{2}})" -f $id, $code, $code2) }}
+        continue
+    }}
+
+    if ($code -eq $needsLocation) {{
+        $loc = Get-InstalledLocation $pkg.Name
+        if ($loc) {{
+            Write-Output ("{{0}}: installer requires a location; retrying at {{1}}" -f $id, $loc)
+            winget install --id $id --exact --source winget --include-unknown --force --location "$loc" --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
+            $code2 = $LASTEXITCODE
+            if ($code2 -eq 0) {{ $forced += $id }}
+            else {{ $needsManual += ("{{0}} (needs --location, retry {{1}})" -f $id, $code2) }}
+        }} else {{
+            $needsManual += ("{{0}} (needs --location, no install path found)" -f $id)
+        }}
+        continue
+    }}
+
+    if ($tolerated -contains $code) {{ $skipped += ("{{0}} ({{1}})" -f $id, $code) }}
     elseif ($manual -contains $code) {{ $needsManual += ("{{0}} ({{1}})" -f $id, $code) }}
     else {{ $failed += ("{{0}} ({{1}})" -f $id, $code) }}
 }}
 Write-Output ("upgraded ({{0}}): {{1}}" -f $ok.Count, ($ok -join ', '))
+Write-Output ("upgraded via forced install ({{0}}): {{1}}" -f $forced.Count, ($forced -join ', '))
 Write-Output ("not applicable ({{0}}): {{1}}" -f $skipped.Count, ($skipped -join ', '))
 Write-Output ("needs manual action ({{0}}): {{1}}" -f $needsManual.Count, ($needsManual -join ', '))
 Write-Output ("failed ({{0}}): {{1}}" -f $failed.Count, ($failed -join ', '))
@@ -1953,6 +1996,71 @@ exit 0
     );
 
     script
+}
+
+/// PowerShell that asks the Store to update its apps, then reports what actually moved.
+///
+/// `winget upgrade --source msstore` answers "No installed package found matching input
+/// criteria" on this machine — it never matched a single installed Store app, which is how
+/// a stale Microsoft Defender build sat unnoticed until a manual reinstall pulled a newer
+/// one. The MDM UpdateScanMethod is the only trigger available without the Store UI, and it
+/// returns 0 whether or not anything updates, so the only trustworthy signal is an appx
+/// version snapshot taken before and after. Report the diff; never claim coverage.
+fn store_apps_script(skip_packages: &[String]) -> String {
+    let skip_list = skip_packages
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"
+$skip = @({skip_list})
+function Get-AppxSnapshot {{
+    $map = @{{}}
+    foreach ($p in Get-AppxPackage) {{
+        if ($p.Name -in $skip) {{ continue }}
+        $map[$p.PackageFamilyName] = [pscustomobject]@{{ Name = $p.Name; Version = $p.Version }}
+    }}
+    return $map
+}}
+$before = Get-AppxSnapshot
+Write-Output ("store: {{0}} package(s) before scan" -f $before.Count)
+
+$ns = 'root\cimv2\mdm\dmmap'
+$cls = 'MDM_EnterpriseModernAppManagement_AppManagement01'
+$obj = Get-CimInstance -Namespace $ns -ClassName $cls -ErrorAction SilentlyContinue
+if (-not $obj) {{ Write-Output 'store: MDM app-management class unavailable; cannot trigger a scan.'; exit 0 }}
+$res = Invoke-CimMethod -InputObject $obj -MethodName UpdateScanMethod -ErrorAction SilentlyContinue
+Write-Output ("store: UpdateScanMethod returned {{0}}" -f $res.ReturnValue)
+
+# Installs land asynchronously via AppX deployment; poll for changes rather than guess.
+$deadline = (Get-Date).AddSeconds(240)
+$changed = @{{}}
+while ((Get-Date) -lt $deadline) {{
+    Start-Sleep 15
+    $now = Get-AppxSnapshot
+    foreach ($pfn in $now.Keys) {{
+        $new = $now[$pfn]
+        $old = $before[$pfn]
+        if ($null -eq $old) {{ $changed[$pfn] = ("{{0}} (new {{1}})" -f $new.Name, $new.Version) }}
+        elseif ($old.Version -ne $new.Version) {{ $changed[$pfn] = ("{{0}} {{1}} -> {{2}}" -f $new.Name, $old.Version, $new.Version) }}
+    }}
+    if (-not (Get-Process -Name AppXSVC, AppInstaller, WinStore.App -ErrorAction SilentlyContinue)) {{
+        if ($changed.Count -gt 0) {{ break }}
+    }}
+}}
+if ($changed.Count -gt 0) {{
+    Write-Output ("store: {{0}} app(s) updated" -f $changed.Count)
+    foreach ($v in $changed.Values) {{ Write-Output ("  " + $v) }}
+}} else {{
+    Write-Output 'store: no app versions changed during the scan window.'
+    Write-Output 'store: this does NOT prove every Store app is current - the scan reports no per-app status,'
+    Write-Output 'store: and winget cannot enumerate msstore upgrades. Check Store > Library > Get updates to be sure.'
+}}
+exit 0
+"#
+    )
 }
 
 fn pip_upgrade_args(skip_packages: &[String]) -> Vec<String> {
@@ -2076,7 +2184,13 @@ sys.exit(r.returncode)
 
 fn uv_python_upgrade_args() -> Vec<String> {
     let script = r#"
-import subprocess, sys
+import os, subprocess, sys
+# `python-downloads = "never"` (uv.toml or UV_PYTHON_DOWNLOADS) is a deliberate policy:
+# uv must not fetch interpreters. Installing them anyway is not this task's call, and
+# failing the run over a setting the user chose is noise. Report and skip.
+if os.environ.get("UV_PYTHON_DOWNLOADS", "").strip().lower() == "never":
+    print('uv python: downloads disabled (UV_PYTHON_DOWNLOADS=never); skipping interpreter upgrades')
+    sys.exit(0)
 r = subprocess.run(["uv", "python", "list", "--only-installed"], capture_output=True, text=True)
 if r.returncode != 0:
     print("uv python list failed:", r.stderr.strip())
@@ -2095,7 +2209,13 @@ if not versions:
     print("No uv-managed Python versions installed")
     sys.exit(0)
 print(f"Upgrading {len(versions)} uv Python version(s): {', '.join(versions)}")
-r2 = subprocess.run(["uv", "python", "install"] + versions)
+r2 = subprocess.run(["uv", "python", "install"] + versions, capture_output=True, text=True)
+out = (r2.stdout or "") + (r2.stderr or "")
+print(out.strip())
+# Same policy, but configured in uv.toml rather than the environment.
+if r2.returncode != 0 and "downloads are not allowed" in out:
+    print('uv python: downloads disabled by uv config; skipping interpreter upgrades')
+    sys.exit(0)
 sys.exit(r2.returncode)
 "#;
     vec!["-c".into(), script.into()]
