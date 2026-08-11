@@ -859,7 +859,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "winget",
             "package-manager",
             &["windows", "winget"],
-            "winget",
+            "pwsh",
             winget_upgrade_args,
         )
         .with_resource("winget")
@@ -870,16 +870,10 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "winget-batch",
             "package-manager",
             &["windows", "winget"],
-            "winget",
-            {
-                // No `--exclude` (unsupported by winget). Skips handled via pins.
-                let a: Vec<String> = vec![
-                    "upgrade".into(), "--all".into(), "--source".into(), "winget".into(),
-                    "--include-unknown".into(), "--accept-source-agreements".into(),
-                    "--disable-interactivity".into(),
-                ];
-                a
-            },
+            "pwsh",
+            // Second pass over whatever the first pass could not clear; `--all` is unusable
+            // here for the same reason (see winget_per_package_script).
+            pwsh_cmd(&winget_per_package_script(&config.winget_skip_packages)),
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
@@ -894,7 +888,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "package-manager",
             &["windows", "winget"],
             "pwsh",
-            pwsh_cmd(winget_userscope_script()),
+            pwsh_cmd(&winget_userscope_script(&config.winget_skip_packages)),
         )
         .with_resource("winget")
         .with_timeout(cli.winget_timeout_sec)
@@ -1888,25 +1882,77 @@ fn winget_pin_skip_script(skip_packages: &[String]) -> String {
     )
 }
 
-fn winget_upgrade_args(_skip_packages: &[String]) -> Vec<String> {
-    // NOTE: `winget upgrade` has no `--exclude`. Packages in winget_skip_packages
-    // are excluded by pinning them (see winget-pin-skip task) and omitting
-    // `--include-pinned` here, so pinned packages are left untouched.
-    vec![
-        "upgrade",
-        "--all",
-        "--source",
-        "winget",
-        "--include-unknown",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-        "--disable-interactivity",
-        "--silent",
-        "--force",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+fn winget_upgrade_args(skip_packages: &[String]) -> Vec<String> {
+    pwsh_cmd(&winget_per_package_script(skip_packages))
+}
+
+/// PowerShell that upgrades each outdated winget package individually.
+///
+/// `winget upgrade --all` aborts the whole batch without installing anything when any
+/// listed package needs an install location (e.g. Blizzard.BattleNet): it prints the
+/// table, then exits -1978335137 with zero installs. Per-package keeps one unusable
+/// entry from blocking the rest.
+///
+/// NOTE: `winget upgrade` has no `--exclude`. Packages in winget_skip_packages are
+/// excluded by pinning them (see winget-pin-skip task) and omitting `--include-pinned`
+/// here, so pinned packages are left untouched.
+fn winget_per_package_script(skip_packages: &[String]) -> String {
+    let skip_list = skip_packages
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let script = format!(
+        r#"
+$skip = @({skip_list})
+$raw = winget upgrade --include-unknown --disable-interactivity 2>&1 | Out-String
+$lines = $raw -split "`r?`n"
+$hdr = $null
+for ($i = 0; $i -lt $lines.Count; $i++) {{
+    if ($lines[$i] -match '^Name\s+Id\s+Version') {{ $hdr = $i; break }}
+}}
+if ($null -eq $hdr) {{ Write-Output 'winget: no upgrade table found'; exit 0 }}
+$idStart = $lines[$hdr].IndexOf('Id')
+$verStart = $lines[$hdr].IndexOf('Version')
+$ids = @()
+for ($i = $hdr + 1; $i -lt $lines.Count; $i++) {{
+    $line = $lines[$i]
+    if ($line -match '^-{{3,}}$') {{ continue }}
+    if ([string]::IsNullOrWhiteSpace($line)) {{ break }}
+    if ($line.Length -le $idStart) {{ continue }}
+    $len = [Math]::Min($verStart - $idStart, $line.Length - $idStart)
+    $id = $line.Substring($idStart, $len).Trim()
+    if ($id -and $id -notmatch '\s' -and $id -notin $skip) {{ $ids += $id }}
+}}
+$ids = $ids | Select-Object -Unique
+Write-Output ("winget: {{0}} package(s) to upgrade" -f $ids.Count)
+# Codes winget returns when a listed upgrade cannot apply to this system; not our failure.
+$tolerated = @(-1978335188, -1978335189, -1978335212, -1978335215)
+# Package-level blockers no unattended run can clear: installer needs an install
+# location (-1978335137), newer version uses a different install technology so it
+# needs uninstall+install (-1978335090), or the de-elevated pass cannot touch a
+# machine-scope package (-1978335226). Reported, but they do not fail the task.
+$manual = @(-1978335137, -1978335090, -1978335226)
+$ok = @(); $skipped = @(); $needsManual = @(); $failed = @()
+foreach ($id in $ids) {{
+    winget upgrade --id $id --exact --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {{ $ok += $id }}
+    elseif ($tolerated -contains $code) {{ $skipped += ("{{0}} ({{1}})" -f $id, $code) }}
+    elseif ($manual -contains $code) {{ $needsManual += ("{{0}} ({{1}})" -f $id, $code) }}
+    else {{ $failed += ("{{0}} ({{1}})" -f $id, $code) }}
+}}
+Write-Output ("upgraded ({{0}}): {{1}}" -f $ok.Count, ($ok -join ', '))
+Write-Output ("not applicable ({{0}}): {{1}}" -f $skipped.Count, ($skipped -join ', '))
+Write-Output ("needs manual action ({{0}}): {{1}}" -f $needsManual.Count, ($needsManual -join ', '))
+Write-Output ("failed ({{0}}): {{1}}" -f $failed.Count, ($failed -join ', '))
+if ($failed.Count -gt 0) {{ exit 1 }}
+exit 0
+"#
+    );
+
+    script
 }
 
 fn pip_upgrade_args(skip_packages: &[String]) -> Vec<String> {
@@ -2611,32 +2657,44 @@ exit $code
 "#
 }
 
-fn winget_userscope_script() -> &'static str {
-    r#"
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Output 'Not elevated: user-scope packages already covered by main winget pass.'; exit 0 }
+fn winget_userscope_script(skip_packages: &[String]) -> String {
+    // Same per-package loop as the main pass; `--all` installs nothing when any listed
+    // package needs an install location.
+    let loop_script = winget_per_package_script(skip_packages);
+    format!(
+        r#"
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ Write-Output 'Not elevated: user-scope packages already covered by main winget pass.'; exit 0 }}
 $dir = Join-Path $env:TEMP ('ue-userscope-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 $ps1File = Join-Path $dir 'run.ps1'
+$innerFile = Join-Path $dir 'upgrade.ps1'
 $log = Join-Path $dir 'run.log'
+# Inner script owns the exit code; run.ps1 only invokes it and records the result,
+# so the loop's own `exit` cannot swallow the DONE marker the outer wait polls for.
+$body = @'
+{loop_script}
+'@
+Set-Content -Path $innerFile -Value $body -Encoding utf8
 @(
-    ('winget upgrade --all --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent *> "' + $log + '"'),
+    ('pwsh -NoProfile -ExecutionPolicy Bypass -File "' + $innerFile + '" *> "' + $log + '"'),
     ('"exit: $LASTEXITCODE" | Add-Content -Path "' + $log + '"'),
     ('"DONE" | Add-Content -Path "' + $log + '"')
 ) | Set-Content -Path $ps1File -Encoding utf8
 runas /trustlevel:0x20000 "pwsh -NoProfile -ExecutionPolicy Bypass -File $ps1File" | Out-Null
 $deadline = (Get-Date).AddSeconds(900)
-while ((Get-Date) -lt $deadline) {
-    if ((Test-Path $log) -and (Select-String -Path $log -Pattern '^DONE' -Quiet -ErrorAction SilentlyContinue)) { break }
+while ((Get-Date) -lt $deadline) {{
+    if ((Test-Path $log) -and (Select-String -Path $log -Pattern '^DONE' -Quiet -ErrorAction SilentlyContinue)) {{ break }}
     Start-Sleep 5
-}
-if (-not (Test-Path $log)) { Write-Output 'De-elevated winget produced no log (runas launch failed?).'; exit 1 }
+}}
+if (-not (Test-Path $log)) {{ Write-Output 'De-elevated winget produced no log (runas launch failed?).'; exit 1 }}
 Get-Content $log | Select-Object -Last 40
 $m = Select-String -Path $log -Pattern '^exit: (-?\d+)' | Select-Object -Last 1
-$code = if ($m) { [int]$m.Matches[0].Groups[1].Value } else { 1 }
+$code = if ($m) {{ [int]$m.Matches[0].Groups[1].Value }} else {{ 1 }}
 Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
-if ($code -in 0, -1978335188, -1978335189, -1978335212) { exit 0 }
+if ($code -in 0, -1978335188, -1978335189, -1978335212) {{ exit 0 }}
 exit $code
 "#
+    )
 }
 
 fn windows_update_script() -> &'static str {
@@ -3814,9 +3872,14 @@ mod tests {
         // Skip packages are excluded via pinning (winget-pin-skip task), not --exclude,
         // and `--include-pinned` must stay absent so pinned packages are left untouched.
         let args = winget_upgrade_args(&["Foo.Bar".to_string(), "Baz.Qux".to_string()]);
-        assert!(args.contains(&"--all".to_string()));
-        assert!(!args.contains(&"--exclude".to_string()));
-        assert!(!args.contains(&"--include-pinned".to_string()));
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[2], "-Command");
+        let script = &args[3];
+        assert!(!script.contains("--all"));
+        assert!(!script.contains("--exclude"));
+        assert!(!script.contains("--include-pinned"));
+        assert!(script.contains("'Foo.Bar'"));
+        assert!(script.contains("'Baz.Qux'"));
     }
 
     #[test]
