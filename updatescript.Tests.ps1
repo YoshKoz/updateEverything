@@ -39,7 +39,7 @@ BeforeAll {
     }
 
     foreach ($funcDef in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-        Invoke-Expression $funcDef.Extent.Text
+        . ([scriptblock]::Create($funcDef.Extent.Text))
     }
 
     $script:Version = 'test-version'
@@ -425,7 +425,6 @@ Describe 'Get-RunNotes' {
     }
 
     It 'emits admin note when admin tasks were skipped' {
-        $task = New-UpdateTask -Name 'windows-update' -Category 'system' -Script {}
         $skipped = [pscustomobject]@{ Name = 'windows-update'; Id = 'windows-update'; Category = 'system'; Status = 'Skipped'; Reason = 'requires Administrator' }
         $notes = Get-RunNotes -Results @() -Skipped @($skipped)
         ($notes | Where-Object { $_.Message -match 'Admin-only' }).Count | Should -BeGreaterThan 0
