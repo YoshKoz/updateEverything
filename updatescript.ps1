@@ -1,4 +1,4 @@
-#requires -version 7.0
+﻿#requires -version 7.0
 <#
 .SYNOPSIS
     Updates common Windows 11 package managers, developer tools, runtimes, WSL distros, Defender, and maintenance tasks.
@@ -27,6 +27,7 @@ param(
     [switch]$FastMode,
     [switch]$UltraFast,
     [switch]$NoElevate,
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidDefaultValueSwitchParameter', '', Justification = 'elevation is the default; -NoElevate opts out')]
     [switch]$AutoElevate = $true,
     [switch]$SkipWSL,
     [switch]$SkipWSLDistros,
@@ -526,7 +527,7 @@ function Show-ResultTable
     Write-Host ''
 }
 
-function Write-Log
+function Write-UpdateLog
 {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -555,7 +556,7 @@ function Write-Status
         [string]$Level = 'Info'
     )
 
-    Write-Log -Message $Message -Level $Level
+    Write-UpdateLog -Message $Message -Level $Level
     if ($Quiet -and $Level -notin @('Warning', 'Error'))
     { return
     }
@@ -3647,7 +3648,7 @@ function Invoke-TaskQueue
             {
                 Write-Status ("[{0}] failed; queueing retry {1}/{2}" -f $task.Name, $item.Attempt, $RetryCount) -Level Warning
                 foreach ($line in $combinedOutput)
-                { Write-Log -Message ("[{0}] attempt {1}: {2}" -f $task.Name, $item.Attempt, $line) -Level Warning
+                { Write-UpdateLog -Message ("[{0}] attempt {1}: {2}" -f $task.Name, $item.Attempt, $line) -Level Warning
                 }
                 $queue.Add([pscustomobject]@{ Task = $task; Attempt = ($item.Attempt + 1) }) | Out-Null
                 continue
@@ -3663,7 +3664,7 @@ function Invoke-TaskQueue
             if ($combinedOutput.Count -gt 0)
             {
                 foreach ($line in $combinedOutput)
-                { Write-Log -Message ("[{0}] {1}" -f $task.Name, $line) -Level Muted
+                { Write-UpdateLog -Message ("[{0}] {1}" -f $task.Name, $line) -Level Muted
                 }
                 if (-not $Quiet)
                 {
