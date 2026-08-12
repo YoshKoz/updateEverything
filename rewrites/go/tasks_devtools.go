@@ -431,8 +431,8 @@ func taskVSCodeExtensions() *Task {
 		RequiresCommand: []string{"code"}, TimeoutSec: 900,
 		Run: func(tc *TaskContext) error {
 			_, err := tc.RunCmd("code", RunOpts{
-				Args: []string{"--update-extensions"},
-				Env:  []string{"NODE_NO_WARNINGS=1"},
+				Args:    []string{"--update-extensions"},
+				Env:     []string{"NODE_NO_WARNINGS=1"},
 				Retries: 1,
 			})
 			return err
