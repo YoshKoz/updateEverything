@@ -20,6 +20,7 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'the -Skip* switches are consumed as -Disabled:$SkipX, which PSSA does not count as a use')]
 param(
     [switch]$SkipWindowsUpdate,
     [switch]$SkipReboot,
@@ -3096,6 +3097,7 @@ function New-TaskResult
 
 function Start-UpdateTaskJob
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseUsingScopeModifierInNewRunspaces', '', Justification = 'the thread job declares its own param() block and is fed by -ArgumentList')]
     param(
         [Parameter(Mandatory)]$Task,
         [Parameter(Mandatory)][int]$Attempt
