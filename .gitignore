@@ -39,6 +39,10 @@ release-monitor.log
 rewrites/go/*.exe
 rewrites/go/stdout.txt
 rewrites/go/stderr.txt
+rewrites/zig/updateeverything-zig.exe
+rewrites/zig/updateeverything-zig.pdb
+rewrites/zig/zig-out/
+rewrites/zig/.zig-cache/
 
 # Rust
 target/

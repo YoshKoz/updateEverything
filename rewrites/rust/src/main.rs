@@ -415,15 +415,23 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
         for task in &tasks {
             if let Some(reason) = &task.skip_reason {
                 if !cli.quiet {
-                    println!("skip {:<22} {}", task.id, reason);
+                    println!(
+                        "{} {:<22} {}",
+                        marker("⏭", "skip", GREY),
+                        task.id,
+                        paint(reason, GREY)
+                    );
                 }
                 results.push(make_summary(task, "Skipped", 0, None, vec![]));
             } else {
                 println!(
-                    "dry  {:<22} {} {}",
+                    "{} {:<22} {}",
+                    marker("◌", "dry ", CYAN),
                     task.id,
-                    task.command,
-                    shell_join_brief(&task.args)
+                    paint(
+                        &format!("{} {}", task.command, shell_join_brief(&task.args)),
+                        DIM
+                    )
                 );
                 results.push(make_summary(task, "DryRun", 0, None, vec![]));
             }
@@ -437,7 +445,12 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
     for task in &skipped {
         let reason = task.skip_reason.as_deref().unwrap_or("");
         if !cli.quiet {
-            println!("skip {:<22} {}", task.id, reason);
+            println!(
+                "{} {:<22} {}",
+                marker("⏭", "skip", GREY),
+                task.id,
+                paint(reason, GREY)
+            );
         }
         results.push(make_summary(task, "Skipped", 0, None, vec![]));
     }
@@ -559,7 +572,10 @@ const SKIP_PREFIX: &str = "SKIPPED:";
 /// Matches on the exact resolved path so an unrelated same-named binary
 /// elsewhere on PATH is never touched.
 const CLOSE_BLOCKERS_PY: &str = r#"
-import os as _os, subprocess as _sp
+import os as _os, shutil as _sh, subprocess as _sp
+
+# pwsh starts noticeably faster than Windows PowerShell; 5.1 is only the fallback.
+_PS = _sh.which("pwsh") or "powershell"
 
 def close_locking_processes(bindir, names):
     targets = [_os.path.join(bindir, n) for n in names]
@@ -573,7 +589,7 @@ def close_locking_processes(bindir, names):
         "  Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }"
     )
     r = _sp.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        [_PS, "-NoProfile", "-NonInteractive", "-Command", ps],
         capture_output=True, text=True,
     )
     out = (r.stdout or "").strip()
@@ -591,10 +607,13 @@ fn run_task_streaming(
 ) -> TaskSummary {
     if !quiet {
         println!(
-            "run  {:<22} {} {}",
+            "{} {:<22} {}",
+            marker("▶", "run ", BLUE),
             task.id,
-            task.command,
-            shell_join_brief(&task.args)
+            paint(
+                &format!("{} {}", task.command, shell_join_brief(&task.args)),
+                DIM
+            )
         );
     }
 
@@ -619,7 +638,12 @@ fn run_task_streaming(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            eprintln!("fail {:<22} spawn failed: {err}", task.id);
+            eprintln!(
+                "{} {:<22} {}",
+                marker("✖", "fail", RED),
+                task.id,
+                paint(&format!("spawn failed: {err}"), RED)
+            );
             return make_summary(
                 task,
                 "Failed",
@@ -744,10 +768,11 @@ fn run_task_streaming(
 
     if !quiet {
         println!(
-            "done {:<22} {} ({:.1}s)",
+            "{} {:<22} {} {}",
+            marker(status_glyph(&status), "done", status_color(&status)),
             task.id,
-            status,
-            duration_ms as f64 / 1000.0
+            paint(&status, status_color(&status)),
+            paint(&format!("({:.1}s)", duration_ms as f64 / 1000.0), DIM)
         );
     }
 
@@ -790,6 +815,64 @@ fn make_summary(
         command: task.command.to_string(),
         args: task.args.clone(),
         output_tail,
+    }
+}
+
+// ─── Terminal styling ────────────────────────────────────────────────────────
+
+/// Colour is opt-out (NO_COLOR) and only used on a real terminal, so the
+/// scheduled task's redirected log keeps the plain format it always had.
+fn color_enabled() -> bool {
+    use std::io::IsTerminal;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
+}
+
+fn paint(text: &str, code: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+const DIM: &str = "2";
+const BOLD: &str = "1";
+const RED: &str = "31";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const BLUE: &str = "34";
+const CYAN: &str = "36";
+const GREY: &str = "90";
+
+/// Leading marker for a live line: a glyph when styled, the old word otherwise.
+fn marker(glyph: &str, word: &str, code: &str) -> String {
+    if color_enabled() {
+        format!("{} {}", paint(glyph, code), word)
+    } else {
+        word.to_string()
+    }
+}
+
+fn status_color(status: &str) -> &'static str {
+    match status {
+        "Succeeded" => GREEN,
+        "Failed" => RED,
+        "TimedOut" => YELLOW,
+        "Skipped" => GREY,
+        "DryRun" => CYAN,
+        _ => "0",
+    }
+}
+
+fn status_glyph(status: &str) -> &'static str {
+    match status {
+        "Succeeded" => "✔",
+        "Failed" => "✖",
+        "TimedOut" => "⏱",
+        "Skipped" => "⏭",
+        "DryRun" => "◌",
+        _ => "•",
     }
 }
 
@@ -2037,6 +2120,7 @@ Write-Output ("store: UpdateScanMethod returned {{0}}" -f $res.ReturnValue)
 # Installs land asynchronously via AppX deployment; poll for changes rather than guess.
 $deadline = (Get-Date).AddSeconds(240)
 $changed = @{{}}
+$idle = 0
 while ((Get-Date) -lt $deadline) {{
     Start-Sleep 15
     $now = Get-AppxSnapshot
@@ -2046,8 +2130,14 @@ while ((Get-Date) -lt $deadline) {{
         if ($null -eq $old) {{ $changed[$pfn] = ("{{0}} (new {{1}})" -f $new.Name, $new.Version) }}
         elseif ($old.Version -ne $new.Version) {{ $changed[$pfn] = ("{{0}} {{1}} -> {{2}}" -f $new.Name, $old.Version, $new.Version) }}
     }}
-    if (-not (Get-Process -Name AppXSVC, AppInstaller, WinStore.App -ErrorAction SilentlyContinue)) {{
+    if (Get-Process -Name AppXSVC, AppInstaller, WinStore.App -ErrorAction SilentlyContinue) {{
+        $idle = 0
+    }} else {{
         if ($changed.Count -gt 0) {{ break }}
+        # Nothing deploying and nothing moved: the scan had no work to do, so
+        # sitting out the rest of the window just burns run time.
+        $idle++
+        if ($idle -ge 3) {{ break }}
     }}
 }}
 if ($changed.Count -gt 0) {{
@@ -2084,11 +2174,24 @@ if not pkgs:
     print("All pip packages up to date")
     sys.exit(0)
 failed = []
-for p in pkgs:
-    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", p], check=False).returncode
-    print(("upgraded " if rc == 0 else "FAILED ") + p)
-    if rc != 0:
-        failed.append(p)
+# One pip process per package costs ~3s of interpreter+resolver startup each.
+# Upgrade them in a single resolve, and only fall back to the per-package loop
+# when the batch fails, since one bad package aborts the whole batch.
+print(f"pip: upgrading {{len(pkgs)}} package(s) in one resolve")
+batch = subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", *pkgs],
+    check=False,
+).returncode
+if batch == 0:
+    for p in pkgs:
+        print("upgraded " + p)
+else:
+    print("pip: batch upgrade failed; retrying package by package")
+    for p in pkgs:
+        rc = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", p], check=False).returncode
+        print(("upgraded " if rc == 0 else "FAILED ") + p)
+        if rc != 0:
+            failed.append(p)
 sys.exit(1 if failed else 0)
 "#
     );
@@ -2230,23 +2333,37 @@ fn npm_upgrade_args(skip_packages: &[String]) -> Vec<String> {
 
     let script = format!(
         r#"
-import json, shutil, subprocess, sys
+import json, os, shutil, subprocess, sys
 skip = [{skip_json}]
+# A half-downloaded browser dir makes puppeteer's postinstall fail forever instead
+# of re-downloading, so drop any version dir that has no .exe in it.
+cache = os.path.join(os.path.expanduser("~"), ".cache", "puppeteer")
+for browser in (os.listdir(cache) if os.path.isdir(cache) else []):
+    bdir = os.path.join(cache, browser)
+    if not os.path.isdir(bdir):
+        continue
+    for ver in os.listdir(bdir):
+        vdir = os.path.join(bdir, ver)
+        if not os.path.isdir(vdir):
+            continue
+        if not any(f.endswith(".exe") for _r, _d, fs in os.walk(vdir) for f in fs):
+            print("removing incomplete puppeteer browser: " + vdir)
+            shutil.rmtree(vdir, ignore_errors=True)
 # Bare "npm" is npm.cmd on Windows; subprocess needs the resolved path (or
 # shell=True) or CreateProcess fails with WinError 2.
 npm = shutil.which("npm")
 if not npm:
     print("npm not found in PATH; skipping.")
     sys.exit(0)
-r = subprocess.run([npm, "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True)
+# npm outdated exits 1 when anything is outdated, so parse stdout, not the code.
+r = subprocess.run([npm, "outdated", "-g", "--depth=0", "--json"], capture_output=True, text=True)
 try:
     data = json.loads(r.stdout or "{{}}")
-    pkgs = [k for k in data.get("dependencies", {{}}).keys() if k not in skip and not k.startswith("npm")]
+    pkgs = [k for k in data.keys() if k not in skip and not k.startswith("npm")]
 except Exception:
     pkgs = []
 if not pkgs:
-    print("npm: no global packages to upgrade (or npm ls failed)")
-    subprocess.run([npm, "update", "-g"])
+    print("npm: all global packages up to date")
     sys.exit(0)
 failed = []
 for p in pkgs:
@@ -2683,7 +2800,9 @@ if platform.system() == "Windows":
     subprocess.run(["ipconfig", "/flushdns"], capture_output=True)
     print("DNS cache flushed.")
     if not skip_destructive:
-        subprocess.run(["powershell", "-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"], capture_output=True)
+        import shutil as _sh
+        ps = _sh.which("pwsh") or "powershell"
+        subprocess.run([ps, "-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"], capture_output=True)
         print("Recycle bin emptied.")
     if deep and not skip_destructive:
         print("Running DISM component cleanup (this may take a while)...")
@@ -3224,11 +3343,23 @@ fn write_summary(path: &Path, summary: &RunSummary) -> Result<()> {
 // ─── Output ──────────────────────────────────────────────────────────────────
 
 fn print_task_list(tasks: &[Task]) {
-    println!("{:<26} {:<20} State", "Task", "Category");
-    println!("{:<26} {:<20} -----", "----", "--------");
+    println!(
+        "{}",
+        paint(&format!("{:<26} {:<20} State", "Task", "Category"), BOLD)
+    );
+    println!(
+        "{}",
+        paint(&format!("{:<26} {:<20} -----", "----", "--------"), DIM)
+    );
     for task in tasks {
+        let planned = task.skip_reason.is_none();
         let state = task.skip_reason.as_deref().unwrap_or("planned");
-        println!("{:<26} {:<20} {}", task.id, task.category, state);
+        println!(
+            "{:<26} {} {}",
+            task.id,
+            paint(&format!("{:<20}", task.category), DIM),
+            paint(state, if planned { GREEN } else { GREY })
+        );
     }
 }
 
@@ -3239,8 +3370,20 @@ fn print_summary(summary: &RunSummary) {
     }
 
     println!();
-    println!("{:<26} {:<12} {:<8} Exit", "Task", "Status", "Time(s)");
-    println!("{:<26} {:<12} {:<8} ----", "----", "------", "-------");
+    println!(
+        "{}",
+        paint(
+            &format!("{:<26} {:<12} {:<8} Exit", "Task", "Status", "Time(s)"),
+            BOLD
+        )
+    );
+    println!(
+        "{}",
+        paint(
+            &format!("{:<26} {:<12} {:<8} ----", "----", "------", "-------"),
+            DIM
+        )
+    );
     // Skipped rows are almost all "tool not installed"; they drown out the tasks
     // that actually ran. Counted below, just not listed.
     for r in summary.results.iter().filter(|r| r.status != "Skipped") {
@@ -3249,12 +3392,13 @@ fn print_summary(summary: &RunSummary) {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
         let secs = r.duration_ms as f64 / 1000.0;
+        let exit_color = if exit == "0" || exit == "-" { DIM } else { YELLOW };
         println!(
-            "{:<26} {:<12} {:<8} {}",
+            "{:<26} {} {} {}",
             r.id,
-            r.status,
-            format!("{:.1}", secs),
-            exit
+            paint(&format!("{:<12}", r.status), status_color(&r.status)),
+            paint(&format!("{:<8}", format!("{secs:.1}")), DIM),
+            paint(&exit, exit_color)
         );
     }
     println!();
@@ -3266,8 +3410,15 @@ fn print_summary(summary: &RunSummary) {
     let skipped = counts.get("Skipped").copied().unwrap_or_default();
     let dry = counts.get("DryRun").copied().unwrap_or_default();
     let total_secs = summary.duration_ms as f64 / 1000.0;
+    let bad = |n: usize| if n > 0 { RED } else { DIM };
     println!(
-        "done  total={total}  succeeded={succeeded}  failed={failed}  timed-out={timed_out}  skipped={skipped}  dry={dry}  duration={total_secs:.1}s"
+        "{} total={total}  succeeded={}  failed={}  timed-out={}  skipped={}  dry={dry}  duration={}",
+        marker("■", "done ", if failed + timed_out > 0 { RED } else { GREEN }),
+        paint(&succeeded.to_string(), GREEN),
+        paint(&failed.to_string(), bad(failed)),
+        paint(&timed_out.to_string(), bad(timed_out)),
+        paint(&skipped.to_string(), GREY),
+        paint(&format!("{total_secs:.1}s"), CYAN)
     );
 }
 
@@ -3298,23 +3449,59 @@ fn resolve_command_path(name: &str) -> Option<PathBuf> {
         vec!["".to_string()]
     };
 
+    if cfg!(windows) {
+        // Probing ~85 commands as dir × extension stat calls costs ~450ms here;
+        // listing each PATH directory once and looking names up is ~20x cheaper.
+        let index = path_index(&path);
+        let mut best: Option<&(usize, PathBuf)> = None;
+        for ext in &extensions {
+            if let Some(hit) = index.get(&format!("{name}{ext}").to_ascii_lowercase())
+                && best.is_none_or(|current| hit.0 < current.0)
+            {
+                best = Some(hit);
+            }
+        }
+        return best.map(|hit| hit.1.clone());
+    }
+
     for dir in env::split_paths(&path) {
         if is_foreign_windows_mount(&dir) {
             continue;
         }
-        if cfg!(windows) {
-            for ext in &extensions {
-                let candidate = dir.join(format!("{name}{ext}"));
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        } else if dir.join(name).is_file() {
+        if dir.join(name).is_file() {
             return Some(dir.join(name));
         }
     }
 
     None
+}
+
+/// Lowercased file name -> (PATH position, full path), first position winning.
+/// Built once per process; `resolve_command_path` matches the old probe order by
+/// preferring the earliest PATH entry and, within it, the PATHEXT order.
+fn path_index(path: &std::ffi::OsStr) -> &'static HashMap<String, (usize, PathBuf)> {
+    static INDEX: std::sync::OnceLock<HashMap<String, (usize, PathBuf)>> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map: HashMap<String, (usize, PathBuf)> = HashMap::new();
+        for (position, dir) in env::split_paths(path).enumerate() {
+            if is_foreign_windows_mount(&dir) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                match map.get(&name) {
+                    Some(existing) if existing.0 <= position => continue,
+                    _ => {
+                        map.insert(name, (position, entry.path()));
+                    }
+                }
+            }
+        }
+        map
+    })
 }
 
 /// Build a Command that can actually spawn on Windows. Bare `Command::new("yarn")`
@@ -3681,7 +3868,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                             .unwrap_or("pnpm");
                         if let Some((old, rest)) = after_from.split_once(" to v") {
                             let new_ver = rest.trim_end_matches('.').trim_end_matches("..").trim();
-                            changes.push(format!("{tool}: {old} → {new_ver}"));
+                            if old.trim() != new_ver {
+                                changes.push(format!("{tool}: {old} → {new_ver}"));
+                            }
                         }
                     }
                 }
@@ -3939,11 +4128,15 @@ fn print_update_summary(results: &[TaskSummary]) {
     }
 
     println!();
-    println!("What's Changed:");
+    println!("{}", paint("What's Changed:", BOLD));
     for entry in &entries {
-        println!("  {:<18}  {}", entry.task, entry.changes[0]);
+        println!(
+            "  {} {}",
+            paint(&format!("{:<18}", entry.task), CYAN),
+            entry.changes[0]
+        );
         for change in entry.changes.iter().skip(1) {
-            println!("  {:<18}  {}", "", change);
+            println!("  {:<18} {}", "", change);
         }
     }
 }
