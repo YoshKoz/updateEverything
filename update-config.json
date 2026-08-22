@@ -14,11 +14,19 @@
   ],
   "GithubTools": [
     {
+      "Repo": "ikemen-engine/Ikemen-GO",
+      "Tag": "nightly",
+      "InstallDir": "D:\\Games\\Ikemen_nightly",
+      "AssetRegex": "^Ikemen_GO-dev-windows\\.zip$"
+    },
+    {
       "Repo": "ggml-org/llama.cpp",
       "InstallDir": "C:\\Tools\\llama.cpp",
       "AssetRegex": "^llama-.*-bin-win-cuda.*x64\\.zip$",
       "VersionCmd": "& .\\llama-cli.exe --version",
-      "VersionRegex": "version:\\s*(\\d+)"
+      "VersionRegex": "build (\\d+)",
+      "PreUpdate": "Stop-ScheduledTask -TaskName llama-server -ErrorAction SilentlyContinue",
+      "PostUpdate": "Start-ScheduledTask -TaskName llama-server"
     },
     {
       "Repo": "neovim/neovim",

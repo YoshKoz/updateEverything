@@ -35,22 +35,108 @@ const skip_prefix = "SKIPPED:";
 
 var out_mu: Io.Mutex = .init;
 
-fn p(io: Io, comptime fmt: []const u8, args: anytype) void {
-    var buf: [8192]u8 = undefined;
-    var w = Io.File.stdout().writer(io, &buf);
+var color_on: bool = false;
+var log_file: ?Io.File = null;
+var log_pos: u64 = 0;
+
+const A = struct {
+    const reset = "\x1b[0m";
+    const bold = "\x1b[1m";
+    const dim = "\x1b[2m";
+    const red = "\x1b[38;2;255;95;95m";
+    const green = "\x1b[38;2;95;215;135m";
+    const yellow = "\x1b[38;2;255;200;80m";
+    const blue = "\x1b[38;2;110;170;255m";
+    const magenta = "\x1b[38;2;215;135;255m";
+    const cyan = "\x1b[38;2;95;215;255m";
+    const grey = "\x1b[38;2;130;130;130m";
+};
+
+/// Nerd Font glyphs (escaped so the source file stays ASCII-safe).
+const G = struct {
+    const run = "\u{f04b}";
+    const ok = "\u{f00c}";
+    const fail = "\u{f00d}";
+    const timeout = "\u{f0f2}";
+    const skip = "\u{f056}";
+    const dry = "\u{f06e}";
+    const retry = "\u{f021}";
+    const changed = "\u{f135}";
+    const summary = "\u{f0ce}";
+    const gear = "\u{f013}";
+};
+
+fn col(code: []const u8) []const u8 {
+    return if (color_on) code else "";
+}
+
+fn statusColor(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "Succeeded")) return col(A.green);
+    if (std.mem.eql(u8, status, "Failed")) return col(A.red);
+    if (std.mem.eql(u8, status, "TimedOut")) return col(A.yellow);
+    if (std.mem.eql(u8, status, "Skipped")) return col(A.grey);
+    if (std.mem.eql(u8, status, "DryRun")) return col(A.magenta);
+    return "";
+}
+
+fn statusGlyph(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "Succeeded")) return G.ok;
+    if (std.mem.eql(u8, status, "Failed")) return G.fail;
+    if (std.mem.eql(u8, status, "TimedOut")) return G.timeout;
+    if (std.mem.eql(u8, status, "Skipped")) return G.skip;
+    if (std.mem.eql(u8, status, "DryRun")) return G.dry;
+    return " ";
+}
+
+/// Drop CSI sequences (ESC [ ... final-byte) so the log file stays plain text.
+fn stripAnsi(src: []const u8, dst: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == 0x1b and i + 1 < src.len and src[i + 1] == '[') {
+            i += 2;
+            while (i < src.len and (src[i] < 0x40 or src[i] > 0x7e)) : (i += 1) {}
+            continue;
+        }
+        dst[n] = src[i];
+        n += 1;
+    }
+    return dst[0..n];
+}
+
+fn emit(io: Io, file: Io.File, comptime fmt: []const u8, args: anytype) void {
+    var buf: [16384]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
     out_mu.lockUncancelable(io);
     defer out_mu.unlock(io);
-    w.interface.print(fmt, args) catch {};
+    // Streaming mode: a positional writer restarts at offset 0 on every call,
+    // which silently overwrote the log when stdout was redirected to a file.
+    var w = file.writerStreaming(io, &wbuf);
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch {
+        w.interface.print(fmt, args) catch {};
+        w.interface.flush() catch {};
+        return;
+    };
+    w.interface.writeAll(text) catch {};
     w.interface.flush() catch {};
+    if (log_file) |lf| {
+        var plain_buf: [16384]u8 = undefined;
+        const plain = stripAnsi(text, &plain_buf);
+        var lbuf: [4096]u8 = undefined;
+        var lw = lf.writer(io, &lbuf);
+        lw.pos = log_pos;
+        lw.interface.writeAll(plain) catch {};
+        lw.interface.flush() catch {};
+        log_pos = lw.pos;
+    }
+}
+
+fn p(io: Io, comptime fmt: []const u8, args: anytype) void {
+    emit(io, Io.File.stdout(), fmt, args);
 }
 
 fn pe(io: Io, comptime fmt: []const u8, args: anytype) void {
-    var buf: [8192]u8 = undefined;
-    var w = Io.File.stderr().writer(io, &buf);
-    out_mu.lockUncancelable(io);
-    defer out_mu.unlock(io);
-    w.interface.print(fmt, args) catch {};
-    w.interface.flush() catch {};
+    emit(io, Io.File.stderr(), fmt, args);
 }
 
 fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
@@ -236,6 +322,8 @@ const Cli = struct {
     skip: []const []const u8 = &.{},
     config: ?[]const u8 = null,
     json_summary: ?[]const u8 = null,
+    log_file: ?[]const u8 = null,
+    color: ?bool = null,
     quiet: bool = false,
     task_timeout_sec: u64 = 1800,
     jobs: usize = 1,
@@ -273,7 +361,7 @@ const Cli = struct {
 
     update_ollama_models: bool = false,
     update_powershell_help: bool = false,
-    update_github_tools: bool = false,
+    update_github_tools: bool = true,
     bypass_protection: bool = false,
     winget_timeout_sec: u64 = 600,
     ollama_timeout_sec: u64 = 600,
@@ -298,6 +386,8 @@ const help_text =
     \\      --skip <SKIP>
     \\      --config <CONFIG>
     \\      --json-summary <JSON_SUMMARY>
+    \\      --log-file <LOG_FILE>      plain-text copy of console output (appended)
+    \\      --color / --no-color       [default: auto-detect terminal]
     \\      --quiet
     \\      --task-timeout-sec <TASK_TIMEOUT_SEC>   [default: 1800]
     \\      --jobs <JOBS>                           [default: 1]
@@ -333,7 +423,7 @@ const help_text =
     \\      --skip-pip-health
     \\      --update-ollama-models
     \\      --update-powershell-help
-    \\      --update-github-tools
+    \\      --update-github-tools   [default: on]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
     \\      --ollama-timeout-sec <OLLAMA_TIMEOUT_SEC>   [default: 600]
@@ -383,6 +473,7 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             inline for (.{
                 .{ "only", Kind.list },       .{ "skip", Kind.list },
                 .{ "config", Kind.string },   .{ "json-summary", Kind.string },
+                .{ "log-file", Kind.string },
                 .{ "state-dir", Kind.string }, .{ "profile", Kind.string },
                 .{ "schedule-time", Kind.string },
                 .{ "task-timeout-sec", Kind.u64v }, .{ "winget-timeout-sec", Kind.u64v },
@@ -409,6 +500,12 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
 
         if (std.mem.eql(u8, name, "dry-run")) {
             cli.dry_run = true;
+        } else if (std.mem.eql(u8, name, "log-file")) {
+            cli.log_file = value;
+        } else if (std.mem.eql(u8, name, "color")) {
+            cli.color = true;
+        } else if (std.mem.eql(u8, name, "no-color")) {
+            cli.color = false;
         } else if (std.mem.eql(u8, name, "list-tasks")) {
             cli.list_tasks = true;
         } else if (std.mem.eql(u8, name, "fast")) {
@@ -534,6 +631,11 @@ const GithubTool = struct {
     version_cmd: ?[]const u8 = null,
     version_regex: ?[]const u8 = null,
     id: ?[]const u8 = null,
+    /// Pin to a named release tag (e.g. rolling "nightly"); version = published_at.
+    tag: ?[]const u8 = null,
+    /// pwsh snippets run before extract / after marker write (e.g. stop/start a service).
+    pre_update: ?[]const u8 = null,
+    post_update: ?[]const u8 = null,
 };
 
 const Config = struct {
@@ -668,6 +770,9 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
                     .version_cmd = jsonString(gpa, o.get("VersionCmd")),
                     .version_regex = jsonString(gpa, o.get("VersionRegex")),
                     .id = jsonString(gpa, o.get("Id")),
+                    .tag = jsonString(gpa, o.get("Tag")),
+                    .pre_update = jsonString(gpa, o.get("PreUpdate")),
+                    .post_update = jsonString(gpa, o.get("PostUpdate")),
                 }) catch @panic("oom");
             }
             config.github_tools = tools.toOwnedSlice(gpa) catch @panic("oom");
@@ -931,8 +1036,15 @@ const github_release_body =
     \\}
     \\
     \\$hdr = @{ 'User-Agent' = 'updateEverything' }
-    \\$rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $hdr
-    \\$tag = $rel.tag_name
+    \\if ($tagName) {
+    \\  $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tagName" -Headers $hdr
+    \\  # Rolling tag: the name never changes, so publish time is the version.
+    \\  $pa = $rel.published_at
+    \\  $tag = if ($pa -is [datetime]) { $pa.ToUniversalTime().ToString('yyyyMMddHHmmss') } else { ([string]$pa) -replace '\D', '' }
+    \\} else {
+    \\  $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $hdr
+    \\  $tag = $rel.tag_name
+    \\}
     \\$latest = if ($tag -match '([\d.]+)') { $matches[1] } else { $null }
     \\
     \\# Compare local vs latest: semver via [version] when both parse, else numeric.
@@ -959,6 +1071,13 @@ const github_release_body =
     \\Write-Host "downloading $($dl.name)"
     \\Invoke-WebRequest -Uri $dl.browser_download_url -OutFile $tmp -Headers $hdr
     \\if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    \\if ($preCmd.Trim()) { Write-Host "pre-update: $preCmd"; & ([scriptblock]::Create($preCmd)) 2>&1 | Out-String | Write-Host }
+    \\# Anything still running from InstallDir holds its DLLs and makes Expand-Archive fail.
+    \\$dirFull = (Resolve-Path $dir).Path.TrimEnd('\') + '\'
+    \\Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dirFull, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object {
+    \\  Write-Host "stopping $($_.ProcessName) (pid $($_.Id)) - locks $dir"
+    \\  Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    \\}
     \\if ($dl.name -match '\.zip$') {
     \\  Write-Host "extracting to $dir"
     \\  Expand-Archive -Path $tmp -DestinationPath $dir -Force
@@ -968,6 +1087,7 @@ const github_release_body =
     \\Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     \\Set-Content -Path $marker -Value $tag -NoNewline
     \\Write-Host "updated $repo -> $tag"
+    \\if ($postCmd.Trim()) { Write-Host "post-update: $postCmd"; & ([scriptblock]::Create($postCmd)) 2>&1 | Out-String | Write-Host }
     \\
 ;
 
@@ -980,6 +1100,9 @@ fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
         "$dir     = '", tool.install_dir, "'\n",
         "$assetRe = '", tool.asset_regex, "'\n",
         "$verRe   = '", tool.version_regex orelse "(\\d+)", "'\n",
+        "$tagName = '", tool.tag orelse "", "'\n",
+        "$preCmd  = @'\n", tool.pre_update orelse "", "\n'@\n",
+        "$postCmd = @'\n", tool.post_update orelse "", "\n'@\n",
         "$verCmd  = @'\n", tool.version_cmd orelse "", "\n'@\n",
         github_release_body,
     });
@@ -992,6 +1115,52 @@ fn githubReleaseArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
     if (std.mem.eql(u8, provider, "gitlab")) return gitlabReleaseArgs(gpa, tool);
     if (std.mem.eql(u8, provider, "gitlab-artifact")) return gitlabArtifactArgs(gpa, tool);
     return githubReleaseInnerArgs(gpa, tool);
+}
+
+const github_notify_body =
+    \\
+    \\$raw = & gh api 'notifications?all=true&per_page=100' --jq '.[] | select(.subject.type=="Release") | .repository.full_name + "\t" + (.subject.title // "")' 2>&1
+    \\if ($LASTEXITCODE -ne 0) { Write-Host "gh api failed: $raw"; exit 1 }
+    \\$known = @{ 'NousResearch/hermes-agent' = 'hermes task'; 'anthropics/claude-code' = 'self-updating, NpmSkipPackages' }
+    \\$seen = [ordered]@{}
+    \\foreach ($line in ($raw -split "`n")) {
+    \\  $p = $line.Trim() -split "`t"
+    \\  if ($p.Count -lt 2 -or -not $p[0]) { continue }
+    \\  if (-not $seen.Contains($p[0])) { $seen[$p[0]] = $p[1] }
+    \\}
+    \\if ($seen.Count -eq 0) { Write-Host "no release notifications"; exit 0 }
+    \\$wl = (& winget list --disable-interactivity --accept-source-agreements 2>$null | Out-String).ToLowerInvariant()
+    \\$npm = (& npm ls -g --depth=0 2>$null | Out-String).ToLowerInvariant()
+    \\foreach ($repo in $seen.Keys) {
+    \\  $rel = $seen[$repo]
+    \\  $name = ($repo -split '/')[-1].ToLowerInvariant()
+    \\  if ($managed -contains $repo) { Write-Host "managed   $repo  $rel  (GithubTools task)"; continue }
+    \\  if ($known.Contains($repo)) { Write-Host "managed   $repo  $rel  ($($known[$repo]))"; continue }
+    \\  if ($npm.Contains("/$name@") -or $npm.Contains(" $name@")) { Write-Host "npm       $repo  $rel"; continue }
+    \\  if ($wl.Contains($name)) { Write-Host "winget    $repo  $rel"; continue }
+    \\  Write-Host "UNMANAGED $repo  $rel  https://github.com/$repo/releases"
+    \\}
+    \\
+;
+
+/// Scan GitHub release notifications (subscribed repos) and report which are
+/// covered by GithubTools, which winget tracks, and which are unmanaged.
+fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool) []const []const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    list.appendSlice(gpa, "$managed = @(") catch @panic("oom");
+    for (tools, 0..) |tool, i| {
+        if (i > 0) list.appendSlice(gpa, ",") catch @panic("oom");
+        list.appendSlice(gpa, "'") catch @panic("oom");
+        list.appendSlice(gpa, tool.repo) catch @panic("oom");
+        list.appendSlice(gpa, "'") catch @panic("oom");
+    }
+    list.appendSlice(gpa, ")\n") catch @panic("oom");
+    const script = concat(gpa, &.{
+        "$ErrorActionPreference = 'Stop'\n",
+        list.items,
+        github_notify_body,
+    });
+    return pwshCmd(gpa, script);
 }
 
 const winget_pin_skip_body =
@@ -2304,6 +2473,9 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     }));
     // pipx defaults to the uv backend; force pip so it works when uv is not installed.
     add(&tasks, gpa, mk("pipx", "python", &.{"python"}, "pipx", &.{ "upgrade-all", "--backend", "pip" }));
+    add(&tasks, gpa, with(mk("hermes", "agents", &.{ "python", "agents" }, "hermes", &.{ "update", "--yes", "--no-backup" }), .{
+        .timeout_sec = 900,
+    }));
     add(&tasks, gpa, mk("uv", "python", &.{"python"}, "python", pyCmd(gpa, concat(gpa, &.{ close_blockers_py, uv_self_update_script }))));
     add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "uv", &.{ "tool", "upgrade", "--all" }), .{ .skip = uv_tools_skip }));
     add(&tasks, gpa, with(mk("uv-python", "python", &.{ "python", "uv" }, "python", pyCmd(gpa, uv_python_upgrade_script)), .{
@@ -2518,6 +2690,11 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
             .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
         }));
     }
+    add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools)), .{
+        .requires = "gh",
+        .timeout_sec = 180,
+        .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
+    }));
 
     // Only mark missing if no explicit skip_reason is already set (e.g. disabled by flag)
     for (tasks.items) |*task| {
@@ -2757,10 +2934,11 @@ fn readerThread(sink: *LineSink) void {
         const line = std.mem.trimEnd(u8, raw, "\r\n");
         const owned = sink.gpa.dupe(u8, line) catch @panic("oom");
         if (!sink.quiet) {
+            const tone = if (sink.is_err) col(A.yellow) else col(A.grey);
             if (sink.prefix) {
-                if (sink.is_err) pe(sink.io, "[{s}] {s}\n", .{ sink.id, owned }) else p(sink.io, "[{s}] {s}\n", .{ sink.id, owned });
+                if (sink.is_err) pe(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, owned, col(A.reset) }) else p(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, owned, col(A.reset) });
             } else {
-                if (sink.is_err) pe(sink.io, "  {s}\n", .{owned}) else p(sink.io, "  {s}\n", .{owned});
+                if (sink.is_err) pe(sink.io, "  {s}{s}{s}\n", .{ tone, owned, col(A.reset) }) else p(sink.io, "  {s}{s}{s}\n", .{ tone, owned, col(A.reset) });
             }
         }
         sink.mu.lockUncancelable(sink.io);
@@ -2819,7 +2997,7 @@ fn runTaskStreaming(
     resource_locks: *std.StringHashMap(*Io.Mutex),
 ) TaskSummary {
     if (!quiet) {
-        p(io, "run  {s: <22} {s} {s}\n", .{ task.id, task.command, shellJoinBrief(gpa, task.args) });
+        p(io, "{s}{s} run {s}  {s}{s: <22}{s} {s}{s} {s}{s}\n", .{ col(A.cyan), G.run, col(A.reset), col(A.bold), task.id, col(A.reset), col(A.grey), task.command, shellJoinBrief(gpa, task.args), col(A.reset) });
     }
 
     var held: ?*Io.Mutex = null;
@@ -2923,7 +3101,7 @@ fn runTaskStreaming(
     }
 
     if (!quiet) {
-        p(io, "done {s: <22} {s} ({d:.1}s)\n", .{ task.id, status, @as(f64, @floatFromInt(duration_ms)) / 1000.0 });
+        p(io, "{s}{s} done{s} {s: <22} {s}{s}{s} {s}({d:.1}s){s}\n", .{ statusColor(status), statusGlyph(status), col(A.reset), task.id, statusColor(status), status, col(A.reset), col(A.grey), @as(f64, @floatFromInt(duration_ms)) / 1000.0, col(A.reset) });
     }
 
     // Normalize whitelisted exit codes to 0 in the summary so the report column
@@ -3014,7 +3192,7 @@ const Runner = struct {
             if (!std.mem.eql(u8, result.status, "Failed") and !std.mem.eql(u8, result.status, "TimedOut")) break;
             const shift: u6 = @intCast(@min(attempt, 4));
             const delay_sec: u64 = 3 * (@as(u64, 1) << shift);
-            pe(self.io, "retry {d}/{d} {s} (waiting {d}s)\n", .{ attempt, self.retry_count, task.id, delay_sec });
+            pe(self.io, "{s}{s} retry {d}/{d}{s} {s} {s}(waiting {d}s){s}\n", .{ col(A.yellow), G.retry, attempt, self.retry_count, col(A.reset), task.id, col(A.grey), delay_sec, col(A.reset) });
             sleepMs(self.io, delay_sec * 1000);
             result = runTaskStreaming(self.gpa, self.io, task, self.quiet, self.timeout_ms, self.prefix_output, &self.resource_locks);
         }
@@ -3114,25 +3292,39 @@ fn countStatus(results: []const TaskSummary, status: []const u8) usize {
 
 fn printSummary(gpa: Allocator, io: Io, results: []const TaskSummary, total_duration_ms: u64) void {
     p(io, "\n", .{});
-    p(io, "{s: <26} {s: <12} {s: <8} Exit\n", .{ "Task", "Status", "Time(s)" });
-    p(io, "{s: <26} {s: <12} {s: <8} ----\n", .{ "----", "------", "-------" });
+    p(io, "{s}{s}  {s: <26} {s: <12} {s: <8} Exit{s}\n", .{ col(A.bold), G.summary, "Task", "Status", "Time(s)", col(A.reset) });
+    p(io, "{s}   {s: <26} {s: <12} {s: <8} ----{s}\n", .{ col(A.grey), "----", "------", "-------", col(A.reset) });
     // Skipped rows are almost all "tool not installed"; they drown out the tasks
     // that actually ran. Counted below, just not listed.
     for (results) |r| {
         if (std.mem.eql(u8, r.status, "Skipped")) continue;
-        const exit = if (r.exit_code) |c| fmtAlloc(gpa, "{d}", .{c}) else "-";
+        const exit = if (r.exit_code) |code| fmtAlloc(gpa, "{d}", .{code}) else "-";
         const secs = fmtAlloc(gpa, "{d:.1}", .{@as(f64, @floatFromInt(r.duration_ms)) / 1000.0});
-        p(io, "{s: <26} {s: <12} {s: <8} {s}\n", .{ r.id, r.status, secs, exit });
+        p(io, "{s}{s}{s}  {s: <26} {s}{s: <12}{s} {s: <8} {s}\n", .{ statusColor(r.status), statusGlyph(r.status), col(A.reset), r.id, statusColor(r.status), r.status, col(A.reset), secs, exit });
     }
     p(io, "\n", .{});
 
-    p(io, "done  total={d}  succeeded={d}  failed={d}  timed-out={d}  skipped={d}  dry={d}  duration={d:.1}s\n", .{
+    const failed = countStatus(results, "Failed");
+    const timed_out = countStatus(results, "TimedOut");
+    const tone = if (failed + timed_out > 0) col(A.red) else col(A.green);
+    p(io, "{s}{s} done{s}  total={d}  {s}succeeded={d}{s}  {s}failed={d}{s}  {s}timed-out={d}{s}  {s}skipped={d}  dry={d}{s}  duration={d:.1}s\n", .{
+        tone,
+        G.gear,
+        col(A.reset),
         results.len,
+        col(A.green),
         countStatus(results, "Succeeded"),
-        countStatus(results, "Failed"),
-        countStatus(results, "TimedOut"),
+        col(A.reset),
+        if (failed > 0) col(A.red) else col(A.grey),
+        failed,
+        col(A.reset),
+        if (timed_out > 0) col(A.yellow) else col(A.grey),
+        timed_out,
+        col(A.reset),
+        col(A.grey),
         countStatus(results, "Skipped"),
         countStatus(results, "DryRun"),
+        col(A.reset),
         @as(f64, @floatFromInt(total_duration_ms)) / 1000.0,
     });
 }
@@ -3519,9 +3711,9 @@ fn printUpdateSummary(gpa: Allocator, io: Io, results: []const TaskSummary) void
     if (entries.items.len == 0) return;
 
     p(io, "\n", .{});
-    p(io, "What's Changed:\n", .{});
+    p(io, "{s}{s}{s} What's Changed:{s}\n", .{ col(A.magenta), G.changed, col(A.bold), col(A.reset) });
     for (entries.items) |entry| {
-        p(io, "  {s: <18}  {s}\n", .{ entry.task, entry.changes[0] });
+        p(io, "  {s}{s: <18}{s}  {s}\n", .{ col(A.cyan), entry.task, col(A.reset), entry.changes[0] });
         for (entry.changes[1..]) |change| {
             p(io, "  {s: <18}  {s}\n", .{ "", change });
         }
@@ -3692,6 +3884,19 @@ pub fn main(init: std.process.Init) !void {
 
     const argv = try init.minimal.args.toSlice(gpa);
     const cli = parseCli(gpa, io, argv);
+
+    color_on = cli.color orelse blk: {
+        const out = Io.File.stdout();
+        out.enableAnsiEscapeCodes(io) catch {};
+        break :blk out.supportsAnsiEscapeCodes(io) catch false;
+    };
+    if (cli.log_file) |path| {
+        // .read needed: length() stats the handle, which fails on a write-only handle.
+        if (Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true })) |f| {
+            log_file = f;
+            log_pos = f.length(io) catch 0;
+        } else |err| pe(io, "warn: could not open --log-file {s}: {t}\n", .{ path, err });
+    }
 
     // Handle --schedule before anything else
     if (cli.schedule) {
