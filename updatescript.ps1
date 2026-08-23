@@ -2379,6 +2379,9 @@ fi
                             if ($cmd.Parameters.ContainsKey('AcceptLicense'))
                             { $moduleArgs.AcceptLicense = $true
                             }
+                            if ($cmd.Parameters.ContainsKey('TrustRepository'))
+                            { $moduleArgs.TrustRepository = $true
+                            }
                             try
                             { Update-PSResource @moduleArgs | Out-String | Write-Output
                             } catch
