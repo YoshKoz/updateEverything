@@ -2134,7 +2134,7 @@ const msys2_script = "$bash=@('C:\\msys64\\usr\\bin\\bash.exe','C:\\tools\\msys6
     "if(-not $bash){Write-Output 'MSYS2 not installed; skipping.';return};" ++
     "Write-Output \"Updating MSYS2 via $bash\";" ++
     "& $bash -lc 'if [ -f /var/lib/pacman/db.lck ] && ! pgrep -x pacman >/dev/null 2>&1; then echo \"removing stale pacman lock\"; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm';" ++
-    "if($LASTEXITCODE-ne 0){Write-Output \"MSYS2 pacman exit $LASTEXITCODE\"}";
+    "if($LASTEXITCODE-ne 0){Write-Output \"MSYS2 pacman exit $LASTEXITCODE\";exit $LASTEXITCODE}";
 
 /// Every package manager is gated behind `sudo -n true` so a distro whose user
 /// lacks passwordless sudo is skipped instead of hanging on a password prompt.
@@ -2209,7 +2209,7 @@ const powershell_modules_script = "if(Get-Command Update-PSResource -EA Silently
     "if($mods.Count-eq 0){Write-Output 'No installed PSResource modules found.';return};" ++
     "$failed=@();" ++
     "foreach($m in ($mods|Sort-Object Name -Unique)){" ++
-    "try{Update-PSResource -Name $m.Name -AcceptLicense -EA Stop|Out-String|Write-Output}" ++
+    "try{Update-PSResource -Name $m.Name -AcceptLicense -TrustRepository -EA Stop|Out-String|Write-Output}" ++
     "catch{Write-Output \"Not updated: $($m.Name) — $($_.Exception.Message)\";$failed+=$m.Name}};" ++
     "if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\"}" ++
     "}elseif(Get-Command Update-Module -EA SilentlyContinue){" ++
@@ -2437,7 +2437,10 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     }));
     // ── Linux packages (Arch/WSL) ────────────────────────────────────────────
     add(&tasks, gpa, with(mk("pacman", "package-manager", &.{ "linux", "arch" }, "sudo", &.{ "pacman", "-Syu", "--noconfirm" }), .{
+        // On Windows, PATH resolves pacman to the MSYS2 install; running it here
+        // races the dedicated msys2 task on the same package DB.
         .requires = "pacman",
+        .skip = if (is_windows) "Linux-only; native MSYS2 is handled by the msys2 task" else null,
     }));
     // ── MSYS2 (native Windows) ───────────────────────────────────────────────
     add(&tasks, gpa, with(mk("msys2", "package-manager", &.{ "windows", "msys2" }, "pwsh", pwshCmd(gpa, msys2_script)), .{

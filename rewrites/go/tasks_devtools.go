@@ -506,6 +506,7 @@ if (Get-Command Update-PSResource -EA SilentlyContinue) {
     $args = @{ Name = '*'; ErrorAction = 'Stop' }
     $cmd = Get-Command Update-PSResource -EA SilentlyContinue
     if ($cmd.Parameters.ContainsKey('AcceptLicense')) { $args.AcceptLicense = $true }
+    if ($cmd.Parameters.ContainsKey('TrustRepository')) { $args.TrustRepository = $true }
     Update-PSResource @args | Out-String
 } elseif (Get-Command Update-Module -EA SilentlyContinue) {
     $failed = @()
