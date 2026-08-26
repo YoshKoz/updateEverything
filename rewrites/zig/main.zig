@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const is_windows = @import("builtin").os.tag == .windows;
 
-const version = "0.1.0";
+const version = "0.2.0";
 
 // Zig 0.16 truncates a Windows exit status to u8 in Child.Term, which destroys
 // the negative winget codes the task table matches on, so read the raw DWORD.
@@ -1130,14 +1130,37 @@ const github_notify_body =
     \\}
     \\if ($seen.Count -eq 0) { Write-Host "no release notifications"; exit 0 }
     \\$wl = (& winget list --disable-interactivity --accept-source-agreements 2>$null | Out-String).ToLowerInvariant()
-    \\$npm = (& npm ls -g --depth=0 2>$null | Out-String).ToLowerInvariant()
+    \\$npmRaw = (& npm ls -g --depth=0 2>$null | Out-String)
+    \\$npm = $npmRaw.ToLowerInvariant()
+    \\# Pending winget upgrades, used to resolve a package Id for a repo name.
+    \\$upRaw = (& winget upgrade --include-unknown --disable-interactivity --accept-source-agreements 2>$null | Out-String)
     \\foreach ($repo in $seen.Keys) {
     \\  $rel = $seen[$repo]
     \\  $name = ($repo -split '/')[-1].ToLowerInvariant()
     \\  if ($managed -contains $repo) { Write-Host "managed   $repo  $rel  (GithubTools task)"; continue }
     \\  if ($known.Contains($repo)) { Write-Host "managed   $repo  $rel  ($($known[$repo]))"; continue }
-    \\  if ($npm.Contains("/$name@") -or $npm.Contains(" $name@")) { Write-Host "npm       $repo  $rel"; continue }
-    \\  if ($wl.Contains($name)) { Write-Host "winget    $repo  $rel"; continue }
+    \\  if ($npm.Contains("/$name@") -or $npm.Contains(" $name@")) {
+    \\    $pkg = $null
+    \\    foreach ($l in ($npmRaw -split "`n")) {
+    \\      if ($l -match '((?:@[^@\s/]+/)?[^@\s]+)@[^\s]+\s*$' -and $matches[1].ToLowerInvariant().EndsWith($name)) { $pkg = $matches[1]; break }
+    \\    }
+    \\    if ($pkg) {
+    \\      Write-Host "npm       $repo  $rel  -> npm i -g $pkg@latest"
+    \\      & npm install -g "$pkg@latest" 2>&1 | Out-String | Write-Host
+    \\    } else { Write-Host "npm       $repo  $rel  (package name not resolved)" }
+    \\    continue
+    \\  }
+    \\  if ($wl.Contains($name)) {
+    \\    $id = $null
+    \\    foreach ($l in ($upRaw -split "`n")) {
+    \\      if ($l.ToLowerInvariant().Contains($name) -and $l -match '\s([\w.\-]+\.[\w.\-]+)\s') { $id = $matches[1]; break }
+    \\    }
+    \\    if ($id) {
+    \\      Write-Host "winget    $repo  $rel  -> winget upgrade --id $id"
+    \\      & winget upgrade --id $id --exact --include-unknown --disable-interactivity --accept-package-agreements --accept-source-agreements 2>&1 | Out-String | Write-Host
+    \\    } else { Write-Host "winget    $repo  $rel  (no pending upgrade)" }
+    \\    continue
+    \\  }
     \\  Write-Host "UNMANAGED $repo  $rel  https://github.com/$repo/releases"
     \\}
     \\
@@ -1941,7 +1964,12 @@ const cleanup_body =
     \\        continue
     \\    print(f"Cleaning temp files older than {days} day(s): {td}")
     \\    cleaned = 0
-    \\    for item in p.iterdir():
+    \\    try:
+    \\        items = list(p.iterdir())
+    \\    except OSError as exc:
+    \\        print(f"  Skipped {td}: {exc.strerror or exc}")
+    \\        continue
+    \\    for item in items:
     \\        try:
     \\            st = item.stat()
     \\            if st.st_mtime < cutoff and "WinGet" not in str(item):
@@ -2260,7 +2288,11 @@ const mise_script = "import shutil, subprocess, sys\n" ++
     "if \"winget\" in p or \"/microsoft/\" in p or \"/scoop/\" in p or \"/homebrew/\" in p:\n" ++
     "    print(\"mise is package-manager-managed; update handled by winget/scoop task\")\n" ++
     "    sys.exit(0)\n" ++
-    "r = subprocess.run([\"mise\", \"self-upgrade\"])\n" ++
+    "exe = shutil.which(\"mise\")\n" ++
+    "if not exe:\n" ++
+    "    print(\"mise not found on PATH; nothing to upgrade\")\n" ++
+    "    sys.exit(0)\n" ++
+    "r = subprocess.run([exe, \"self-upgrade\"])\n" ++
     "sys.exit(r.returncode)";
 
 const chocolatey_pre = "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Write-Output 'Chocolatey skipped: requires elevation (run elevated to upgrade choco packages).';exit 0}; & choco upgrade all -y --no-progress";
