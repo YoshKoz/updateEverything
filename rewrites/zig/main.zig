@@ -365,7 +365,7 @@ const Cli = struct {
     bypass_protection: bool = false,
     winget_timeout_sec: u64 = 600,
     ollama_timeout_sec: u64 = 600,
-    retry_count: u32 = 1,
+    retry_count: u32 = 3,
     profile: ?[]const u8 = null,
     show_skipped: bool = false,
     schedule: bool = false,
@@ -427,7 +427,7 @@ const help_text =
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
     \\      --ollama-timeout-sec <OLLAMA_TIMEOUT_SEC>   [default: 600]
-    \\      --retry-count <RETRY_COUNT>                 [default: 1]
+    \\      --retry-count <RETRY_COUNT>                 [default: 3]
     \\      --profile <PROFILE>
     \\      --show-skipped
     \\      --schedule
@@ -3032,7 +3032,7 @@ fn runTaskStreaming(
     resource_locks: *std.StringHashMap(*Io.Mutex),
 ) TaskSummary {
     if (!quiet) {
-        p(io, "{s}{s} run {s}  {s}{s: <22}{s} {s}{s} {s}{s}\n", .{ col(A.cyan), G.run, col(A.reset), col(A.bold), task.id, col(A.reset), col(A.grey), task.command, shellJoinBrief(gpa, task.args), col(A.reset) });
+        p(io, "{s}{s} run {s} {s}{s: <22}{s} {s}{s} {s}{s}\n", .{ col(A.cyan), G.run, col(A.reset), col(A.bold), task.id, col(A.reset), col(A.grey), task.command, shellJoinBrief(gpa, task.args), col(A.reset) });
     }
 
     var held: ?*Io.Mutex = null;
@@ -3053,7 +3053,7 @@ fn runTaskStreaming(
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch |err| {
-        pe(io, "fail {s: <22} spawn failed: {t}\n", .{ task.id, err });
+        pe(io, "{s}{s} fail{s} {s: <22} spawn failed: {t}\n", .{ col(A.red), G.fail, col(A.reset), task.id, err });
         const lines = gpa.alloc([]const u8, 1) catch @panic("oom");
         lines[0] = fmtAlloc(gpa, "spawn failed: {t}", .{err});
         return makeSummary(gpa, task, "Failed", @intCast(nowMs(io) - start), null, lines);
@@ -3164,6 +3164,7 @@ const Runner = struct {
     finished: std.StringHashMap(void),
     runnable: std.StringHashMap(void),
     resource_locks: std.StringHashMap(*Io.Mutex),
+    resource_busy: std.StringHashMap(void),
     quiet: bool,
     timeout_ms: u64,
     retry_count: u32,
@@ -3183,13 +3184,16 @@ const Runner = struct {
             var i = self.next;
             while (i < self.tasks.len) : (i += 1) {
                 if (self.taken.items[i]) continue;
-                if (self.dependenciesMet(self.tasks[i])) {
+                const t = self.tasks[i];
+                if (t.resource.len != 0 and self.resource_busy.contains(t.resource)) continue;
+                if (self.dependenciesMet(t)) {
                     index = i;
                     break;
                 }
             }
             if (index) |idx| {
                 self.taken.items[idx] = true;
+                if (self.tasks[idx].resource.len != 0) self.resource_busy.put(self.tasks[idx].resource, {}) catch @panic("oom");
                 while (self.next < self.tasks.len and self.taken.items[self.next]) self.next += 1;
                 self.queue_mu.unlock(self.io);
                 return self.tasks[idx];
@@ -3214,12 +3218,6 @@ const Runner = struct {
         return true;
     }
 
-    fn markFinished(self: *Runner, id: []const u8) void {
-        self.queue_mu.lockUncancelable(self.io);
-        defer self.queue_mu.unlock(self.io);
-        self.finished.put(id, {}) catch @panic("oom");
-    }
-
     fn runOne(self: *Runner, task: Task) void {
         var result = runTaskStreaming(self.gpa, self.io, task, self.quiet, self.timeout_ms, self.prefix_output, &self.resource_locks);
         var attempt: u32 = 1;
@@ -3234,7 +3232,10 @@ const Runner = struct {
         self.results_mu.lockUncancelable(self.io);
         self.results.append(self.gpa, result) catch @panic("oom");
         self.results_mu.unlock(self.io);
-        self.markFinished(task.id);
+        self.queue_mu.lockUncancelable(self.io);
+        if (task.resource.len != 0) _ = self.resource_busy.remove(task.resource);
+        self.finished.put(task.id, {}) catch @panic("oom");
+        self.queue_mu.unlock(self.io);
     }
 
     fn workerLoop(self: *Runner) void {
@@ -3248,10 +3249,10 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
     if (cli.dry_run) {
         for (tasks) |task| {
             if (task.skip_reason) |reason| {
-                if (!cli.quiet) p(io, "skip {s: <22} {s}\n", .{ task.id, reason });
+                if (!cli.quiet) p(io, "{s}{s} skip{s} {s: <22} {s}{s}{s}\n", .{ col(A.grey), G.skip, col(A.reset), task.id, col(A.grey), reason, col(A.reset) });
                 results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, &.{})) catch @panic("oom");
             } else {
-                p(io, "dry  {s: <22} {s} {s}\n", .{ task.id, task.command, shellJoinBrief(gpa, task.args) });
+                p(io, "{s}{s} dry {s} {s: <22} {s}{s} {s}{s}\n", .{ col(A.cyan), G.dry, col(A.reset), task.id, col(A.grey), task.command, shellJoinBrief(gpa, task.args), col(A.reset) });
                 results.append(gpa, makeSummary(gpa, task, "DryRun", 0, null, &.{})) catch @panic("oom");
             }
         }
@@ -3261,7 +3262,7 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
     var to_run: std.ArrayList(Task) = .empty;
     for (tasks) |task| {
         if (task.skip_reason) |reason| {
-            if (!cli.quiet) p(io, "skip {s: <22} {s}\n", .{ task.id, reason });
+            if (!cli.quiet) p(io, "{s}{s} skip{s} {s: <22} {s}{s}{s}\n", .{ col(A.grey), G.skip, col(A.reset), task.id, col(A.grey), reason, col(A.reset) });
             results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, &.{})) catch @panic("oom");
         } else {
             to_run.append(gpa, task) catch @panic("oom");
@@ -3275,6 +3276,7 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
         .finished = .init(gpa),
         .runnable = .init(gpa),
         .resource_locks = .init(gpa),
+        .resource_busy = .init(gpa),
         .quiet = cli.quiet,
         .timeout_ms = timeout_ms,
         .retry_count = cli.retry_count,

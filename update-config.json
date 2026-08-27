@@ -3,7 +3,9 @@
     "charmbracelet.crush"
   ],
   "SkipManagers": [],
-  "PipSkipPackages": [],
+  "PipSkipPackages": [
+    "sglang"
+  ],
   "NpmSkipPackages": [
     "@anthropic-ai/claude-code"
   ],
