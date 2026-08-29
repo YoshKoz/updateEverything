@@ -25,6 +25,7 @@ const SystemTime = extern struct {
 extern "kernel32" fn GetLocalTime(lpSystemTime: *SystemTime) callconv(.winapi) void;
 
 const still_active: u32 = 259;
+const reader_drain_ms: i64 = 3_000;
 
 /// Task scripts print a line starting with this when they deliberately took no
 /// action. Without it an intentional no-op reports as Succeeded, which reads as
@@ -471,14 +472,13 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
         const Kind = enum { flag, string, list, u64v, usizev, u32v, f64v };
         const needs: Kind = blk: {
             inline for (.{
-                .{ "only", Kind.list },       .{ "skip", Kind.list },
-                .{ "config", Kind.string },   .{ "json-summary", Kind.string },
-                .{ "log-file", Kind.string },
-                .{ "state-dir", Kind.string }, .{ "profile", Kind.string },
-                .{ "schedule-time", Kind.string },
-                .{ "task-timeout-sec", Kind.u64v }, .{ "winget-timeout-sec", Kind.u64v },
+                .{ "only", Kind.list },               .{ "skip", Kind.list },
+                .{ "config", Kind.string },           .{ "json-summary", Kind.string },
+                .{ "log-file", Kind.string },         .{ "state-dir", Kind.string },
+                .{ "profile", Kind.string },          .{ "schedule-time", Kind.string },
+                .{ "task-timeout-sec", Kind.u64v },   .{ "winget-timeout-sec", Kind.u64v },
                 .{ "ollama-timeout-sec", Kind.u64v }, .{ "jobs", Kind.usizev },
-                .{ "retry-count", Kind.u32v }, .{ "since-hours", Kind.f64v },
+                .{ "retry-count", Kind.u32v },        .{ "since-hours", Kind.f64v },
             }) |entry| {
                 if (std.mem.eql(u8, name, entry[0])) break :blk entry[1];
             }
@@ -656,6 +656,7 @@ const Config = struct {
     temp_cleanup_days: u32 = 7,
     log_retention_days: u32 = 14,
     github_tools: []const GithubTool = &.{},
+    github_notification_ignore: []const []const u8 = &.{},
 };
 
 fn jsonStringArray(gpa: Allocator, value: ?std.json.Value) []const []const u8 {
@@ -753,6 +754,7 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
     if (obj.get("CrossManagerFallback")) |v| {
         if (v == .object) config.cross_manager_fallback = jsonToString(gpa, v);
     }
+    config.github_notification_ignore = jsonStringArray(gpa, obj.get("GithubNotificationIgnore"));
     if (obj.get("GithubTools")) |v| {
         if (v == .array) {
             var tools: std.ArrayList(GithubTool) = .empty;
@@ -970,10 +972,18 @@ const gitlab_release_body =
 fn gitlabReleaseArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
     const script = concat(gpa, &.{
         tool_script_prelude,
-        "$repo    = '", tool.repo,           "'\n",
-        "$dir     = '", tool.install_dir,    "'\n",
-        "$assetRe = '", tool.asset_regex,    "'\n",
-        "$proj    = '", tool.project_id orelse "", "'\n",
+        "$repo    = '",
+        tool.repo,
+        "'\n",
+        "$dir     = '",
+        tool.install_dir,
+        "'\n",
+        "$assetRe = '",
+        tool.asset_regex,
+        "'\n",
+        "$proj    = '",
+        tool.project_id orelse "",
+        "'\n",
         gitlab_release_body,
     });
     return pwshCmd(gpa, script);
@@ -1007,11 +1017,21 @@ const gitlab_artifact_body =
 fn gitlabArtifactArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
     const script = concat(gpa, &.{
         tool_script_prelude,
-        "$repo = '", tool.repo,        "'\n",
-        "$dir  = '", tool.install_dir, "'\n",
-        "$proj = '", tool.project_id orelse "", "'\n",
-        "$ref  = '", tool.git_ref orelse "master", "'\n",
-        "$job  = '", tool.job orelse "", "'\n",
+        "$repo = '",
+        tool.repo,
+        "'\n",
+        "$dir  = '",
+        tool.install_dir,
+        "'\n",
+        "$proj = '",
+        tool.project_id orelse "",
+        "'\n",
+        "$ref  = '",
+        tool.git_ref orelse "master",
+        "'\n",
+        "$job  = '",
+        tool.job orelse "",
+        "'\n",
         gitlab_artifact_body,
     });
     return pwshCmd(gpa, script);
@@ -1096,14 +1116,30 @@ const github_release_body =
 fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
     const script = concat(gpa, &.{
         "$ErrorActionPreference = 'Stop'\n",
-        "$repo    = '", tool.repo,        "'\n",
-        "$dir     = '", tool.install_dir, "'\n",
-        "$assetRe = '", tool.asset_regex, "'\n",
-        "$verRe   = '", tool.version_regex orelse "(\\d+)", "'\n",
-        "$tagName = '", tool.tag orelse "", "'\n",
-        "$preCmd  = @'\n", tool.pre_update orelse "", "\n'@\n",
-        "$postCmd = @'\n", tool.post_update orelse "", "\n'@\n",
-        "$verCmd  = @'\n", tool.version_cmd orelse "", "\n'@\n",
+        "$repo    = '",
+        tool.repo,
+        "'\n",
+        "$dir     = '",
+        tool.install_dir,
+        "'\n",
+        "$assetRe = '",
+        tool.asset_regex,
+        "'\n",
+        "$verRe   = '",
+        tool.version_regex orelse "(\\d+)",
+        "'\n",
+        "$tagName = '",
+        tool.tag orelse "",
+        "'\n",
+        "$preCmd  = @'\n",
+        tool.pre_update orelse "",
+        "\n'@\n",
+        "$postCmd = @'\n",
+        tool.post_update orelse "",
+        "\n'@\n",
+        "$verCmd  = @'\n",
+        tool.version_cmd orelse "",
+        "\n'@\n",
         github_release_body,
     });
     return pwshCmd(gpa, script);
@@ -1120,7 +1156,14 @@ fn githubReleaseArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
 const github_notify_body =
     \\
     \\$raw = & gh api 'notifications?all=true&per_page=100' --jq '.[] | select(.subject.type=="Release") | .repository.full_name + "\t" + (.subject.title // "")' 2>&1
-    \\if ($LASTEXITCODE -ne 0) { Write-Host "gh api failed: $raw"; exit 1 }
+    \\if ($LASTEXITCODE -ne 0) {
+    \\  if ("$raw" -match '(?i)(requires authentication|http 401|bad credentials)') {
+    \\    Write-Host "SKIPPED: GitHub CLI is not authenticated"
+    \\    exit 0
+    \\  }
+    \\  Write-Host "gh api failed: $raw"
+    \\  exit 1
+    \\}
     \\$known = @{ 'NousResearch/hermes-agent' = 'hermes task'; 'anthropics/claude-code' = 'self-updating, NpmSkipPackages' }
     \\$seen = [ordered]@{}
     \\foreach ($line in ($raw -split "`n")) {
@@ -1135,6 +1178,7 @@ const github_notify_body =
     \\# Pending winget upgrades, used to resolve a package Id for a repo name.
     \\$upRaw = (& winget upgrade --include-unknown --disable-interactivity --accept-source-agreements 2>$null | Out-String)
     \\foreach ($repo in $seen.Keys) {
+    \\  if ($repo -in $ignored) { continue }
     \\  $rel = $seen[$repo]
     \\  $name = ($repo -split '/')[-1].ToLowerInvariant()
     \\  if ($managed -contains $repo) { Write-Host "managed   $repo  $rel  (GithubTools task)"; continue }
@@ -1168,7 +1212,7 @@ const github_notify_body =
 
 /// Scan GitHub release notifications (subscribed repos) and report which are
 /// covered by GithubTools, which winget tracks, and which are unmanaged.
-fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool) []const []const u8 {
+fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool, ignored: []const []const u8) []const []const u8 {
     var list: std.ArrayList(u8) = .empty;
     list.appendSlice(gpa, "$managed = @(") catch @panic("oom");
     for (tools, 0..) |tool, i| {
@@ -1177,6 +1221,8 @@ fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool) []const []const u
         list.appendSlice(gpa, tool.repo) catch @panic("oom");
         list.appendSlice(gpa, "'") catch @panic("oom");
     }
+    list.appendSlice(gpa, ")\n$ignored = @(") catch @panic("oom");
+    list.appendSlice(gpa, psList(gpa, ignored, ", ")) catch @panic("oom");
     list.appendSlice(gpa, ")\n") catch @panic("oom");
     const script = concat(gpa, &.{
         "$ErrorActionPreference = 'Stop'\n",
@@ -1393,6 +1439,12 @@ const pip_upgrade_pre =
 ;
 const pip_upgrade_post =
     \\}
+    \\health = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
+    \\if health.returncode != 0:
+    \\    print("SKIPPED: pip dependency conflicts detected; upgrades deferred to preserve this shared environment")
+    \\    for line in (health.stdout or health.stderr).strip().splitlines():
+    \\        print("  " + line)
+    \\    sys.exit(0)
     \\subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=False)
     \\r = subprocess.run([sys.executable, "-m", "pip", "list", "--outdated", "--format=json"], capture_output=True, text=True)
     \\pkgs = [p["name"] for p in json.loads(r.stdout or "[]") if p["name"].lower() not in skip]
@@ -1425,6 +1477,30 @@ const pip_upgrade_post =
 fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8) []const []const u8 {
     return pyCmd(gpa, concat(gpa, &.{ pip_upgrade_pre, pyList(gpa, skip_packages, true), pip_upgrade_post }));
 }
+
+const python_venvs_script =
+    \\
+    \\import json, os, pathlib, subprocess, sys
+    \\roots = [os.environ.get("WORKON_HOME"), str(pathlib.Path.home() / ".virtualenvs"), str(pathlib.Path.home() / ".venvs")]
+    \\seen = set(); failed = []
+    \\for root in filter(None, roots):
+    \\    base = pathlib.Path(root)
+    \\    if not base.is_dir(): continue
+    \\    for cfg in base.rglob("pyvenv.cfg"):
+    \\        exe = cfg.parent / "Scripts" / "python.exe"
+    \\        if not exe.is_file() or str(exe).lower() in seen: continue
+    \\        seen.add(str(exe).lower()); print(f"Updating venv: {cfg.parent}")
+    \\        subprocess.run([str(exe), "-m", "pip", "install", "--upgrade", "pip"], check=False)
+    \\        r = subprocess.run([str(exe), "-m", "pip", "list", "--outdated", "--format=json"], capture_output=True, text=True)
+    \\        try: packages = [p["name"] for p in json.loads(r.stdout or "[]")]
+    \\        except json.JSONDecodeError: packages = []
+    \\        for package in packages:
+    \\            if subprocess.run([str(exe), "-m", "pip", "install", "--upgrade", package]).returncode != 0: failed.append(f"{cfg.parent}:{package}")
+    \\if not seen: print("SKIPPED: no virtual environments found in WORKON_HOME, ~/.virtualenvs, or ~/.venvs")
+    \\else: print(f"python-venvs: scanned {len(seen)} environment(s)")
+    \\sys.exit(1 if failed else 0)
+    \\
+;
 
 const pip_health_pre =
     \\
@@ -1637,12 +1713,12 @@ const vscode_extensions_script =
     \\if not shutil.which("code"):
     \\    print("code not in PATH")
     \\    sys.exit(0)
-    \\r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Code.exe", "/NH"],
-    \\                   capture_output=True, text=True, errors="ignore")
-    \\if "Code.exe" not in r.stdout:
-    \\    print("VSCode not running; skipping extension update (run with VSCode open)")
-    \\    sys.exit(0)
-    \\r2 = subprocess.run(["code", "--update-extensions"])
+    \\# The CLI manages extensions without a running editor; requiring Code.exe
+    \\# only left otherwise-updatable extensions behind.
+    \\# Capture, don't inherit: code leaves helper processes holding the parent's
+    \\# stdout pipe, so the runner would wait on EOF forever.
+    \\r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore")
+    \\print((r2.stdout or "").strip() or "no output")
     \\sys.exit(r2.returncode)
     \\
 ;
@@ -1779,12 +1855,20 @@ fn githubVersionCheckArgs(gpa: Allocator, bin: []const u8, ver_args: []const []c
         pyList(gpa, ver_args, false),
         "], capture_output=True, text=True, timeout=30)\n",
         "    cur = (r.stdout + r.stderr).strip().splitlines()[0] if (r.stdout + r.stderr).strip() else \"unknown\"\n",
-        "    print(f\"Current ", bin, ": {cur}\")\n",
-        "    with urllib.request.urlopen(f\"https://api.github.com/repos/", repo, "/releases/latest\", timeout=15) as resp:\n",
+        "    print(f\"Current ",
+        bin,
+        ": {cur}\")\n",
+        "    with urllib.request.urlopen(f\"https://api.github.com/repos/",
+        repo,
+        "/releases/latest\", timeout=15) as resp:\n",
         "        data = json.loads(resp.read())\n",
-        "    print(f\"Latest ", bin, ": {data['tag_name']}\")\n",
+        "    print(f\"Latest ",
+        bin,
+        ": {data['tag_name']}\")\n",
         "except Exception as e:\n",
-        "    print(f\"", bin, " version check skipped: {e}\")\n",
+        "    print(f\"",
+        bin,
+        " version check skipped: {e}\")\n",
         "sys.exit(0)\n",
     });
     return pyCmd(gpa, script);
@@ -1875,7 +1959,9 @@ fn ollamaModelsUpgradeArgs(gpa: Allocator, timeout_sec: u64) []const []const u8 
     const head = concat(gpa, &.{
         "\nimport re, subprocess, sys\n",
         "MAX_GB = 20.0                       # skip models larger than this\n",
-        "per_model = min(", timeout, ", 300) # hard cap per pull\n",
+        "per_model = min(",
+        timeout,
+        ", 300) # hard cap per pull\n",
     });
     return pyCmd(gpa, concat(gpa, &.{ head, replaceAll(gpa, ollama_body, "TIMEOUT_SEC", timeout) }));
 }
@@ -1939,8 +2025,9 @@ const codex_script =
 
 fn advisoryScript(gpa: Allocator, bin: []const u8, msg: []const u8) []const []const u8 {
     const script = concat(gpa, &.{
-        "import shutil, sys\np = shutil.which(\"", bin, "\")\nif p:\n    print(f\"",
-        bin, ": {p}\")\nprint(\"", msg, "\")\nsys.exit(0)\n",
+        "import shutil, sys\np = shutil.which(\"", bin,                  "\")\nif p:\n    print(f\"",
+        bin,                                       ": {p}\")\nprint(\"", msg,
+        "\")\nsys.exit(0)\n",
     });
     return pyCmd(gpa, script);
 }
@@ -2026,9 +2113,15 @@ const cleanup_body =
 fn cleanupArgs(gpa: Allocator, days: u32, deep: bool, skip_destructive: bool) []const []const u8 {
     const head = concat(gpa, &.{
         "\nimport os, sys, time, pathlib, platform\n",
-        "days = ", fmtAlloc(gpa, "{d}", .{days}), "\n",
-        "deep = ", if (deep) "True" else "False", "\n",
-        "skip_destructive = ", if (skip_destructive) "True" else "False", "\n",
+        "days = ",
+        fmtAlloc(gpa, "{d}", .{days}),
+        "\n",
+        "deep = ",
+        if (deep) "True" else "False",
+        "\n",
+        "skip_destructive = ",
+        if (skip_destructive) "True" else "False",
+        "\n",
     });
     return pyCmd(gpa, concat(gpa, &.{ head, cleanup_body }));
 }
@@ -2205,7 +2298,21 @@ const wsl_distros_script =
     \\    echo "Skipping pacman: WSL DNS/network is unavailable"
     \\    exit 0
     \\  fi
-    \\  sudo -n pacman -Syu --noconfirm --needed
+    \\  # Remove only a stale lock; a live pacman process keeps the lock intact.
+    \\  if [ -e /var/lib/pacman/db.lck ] && ! pgrep -x pacman >/dev/null 2>&1; then
+    \\    echo "removing stale pacman lock"
+    \\    sudo -n rm -f /var/lib/pacman/db.lck
+    \\  fi
+    \\  pacman_lock_retries=0
+    \\  while :; do
+    \\    sudo -n pacman -Syu --noconfirm --needed
+    \\    pacman_status=$?
+    \\    if [ "$pacman_status" -eq 0 ]; then exit 0; fi
+    \\    if [ ! -e /var/lib/pacman/db.lck ] || [ "$pacman_lock_retries" -ge 5 ]; then exit "$pacman_status"; fi
+    \\    pacman_lock_retries=$((pacman_lock_retries + 1))
+    \\    echo "pacman database locked; waiting 20 seconds (retry $pacman_lock_retries/5)"
+    \\    sleep 20
+    \\  done
     \\elif command -v dnf >/dev/null 2>&1; then
     \\  if ! sudo -n true >/dev/null 2>&1; then
     \\    echo "Skipping dnf: sudo requires a password"
@@ -2226,10 +2333,14 @@ const wsl_distros_script =
     \\  echo "No supported Linux package manager found"
     \\fi
     \\'@
+    \\$failed=@()
     \\foreach($d in $distros){
     \\  Write-Output "Updating WSL distro: $d"
     \\  wsl --distribution $d --exec sh -lc $linuxScript
+    \\  if($LASTEXITCODE -ne 0){$failed+=$d;Write-Output "WSL distro failed: $d (exit $LASTEXITCODE)"}
     \\}
+    \\if($failed.Count -gt 0){Write-Output ("failed WSL distros ({0}): {1}" -f $failed.Count,($failed -join ', '));exit 1}
+    \\
 ;
 
 const powershell_modules_script = "if(Get-Command Update-PSResource -EA SilentlyContinue){" ++
@@ -2255,16 +2366,10 @@ fn windowsFeaturesScript(gpa: Allocator, features: []const []const u8) []const u
         return "Write-Output 'No WindowsOptionalFeatures configured in update-config.json.'";
     }
     return concat(gpa, &.{
-        "$features=@(", psList(gpa, features, ","), ");",
-        "$enabled=0;$skipped=0;",
-        "foreach($f in $features){",
-        "$state=Get-WindowsOptionalFeature -Online -FeatureName $f -EA SilentlyContinue;",
-        "if($state -and $state.State-ne 'Enabled'){",
-        "Write-Output \"Enabling: $f\";",
-        "Enable-WindowsOptionalFeature -Online -FeatureName $f -All -LimitAccess -EA SilentlyContinue|Out-Null;",
-        "$enabled++",
-        "}else{$skipped++}}",
-        "Write-Output \"Windows Features: $enabled enabled, $skipped already present.\"",
+        "$features=@(",                               psList(gpa, features, ","),       ");",
+        "$enabled=0;$skipped=0;",                     "foreach($f in $features){",      "$state=Get-WindowsOptionalFeature -Online -FeatureName $f -EA SilentlyContinue;",
+        "if($state -and $state.State-ne 'Enabled'){", "Write-Output \"Enabling: $f\";", "Enable-WindowsOptionalFeature -Online -FeatureName $f -All -LimitAccess -EA SilentlyContinue|Out-Null;",
+        "$enabled++",                                 "}else{$skipped++}}",             "Write-Output \"Windows Features: $enabled enabled, $skipped already present.\"",
     });
 }
 
@@ -2399,19 +2504,7 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
         .codes = &winget_ok_codes,
         .depends_on = &.{ "winget-pin-skip", "winget-git" },
     }));
-    // Second pass over whatever the first pass could not clear.
-    add(&tasks, gpa, with(mk("winget-batch", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, wingetPerPackageScript(gpa, config.winget_skip_packages, false))), .{
-        .resource = "winget",
-        .timeout_sec = cli.winget_timeout_sec,
-        .codes = &winget_ok_codes,
-        .depends_on = &.{ "winget-pin-skip", "winget-git" },
-    }));
-    add(&tasks, gpa, with(mk("winget-userscope", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, wingetUserscopeScript(gpa, config.winget_skip_packages))), .{
-        .resource = "winget",
-        .timeout_sec = cli.winget_timeout_sec,
-        .requires = "winget",
-        .codes = &winget_ok_codes,
-    }));
+    // A single per-package pass is authoritative; duplicate passes can replay stale entries.
     add(&tasks, gpa, with(mk("winget-pin-audit", "package-manager", &.{ "windows", "winget" }, "winget", &.{ "pin", "list" }), .{
         .codes = &winget_ok_codes,
     }));
@@ -2503,6 +2596,7 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     }));
     // ── Python ───────────────────────────────────────────────────────────────
     add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items)));
+    add(&tasks, gpa, mk("python-venvs", "python", &.{ "python", "venv" }, "python", pyCmd(gpa, python_venvs_script)));
     add(&tasks, gpa, with(mk("pip-health", "python", &.{ "python", "health" }, "python", pipHealthArgs(gpa, config.pip_ignore_health_packages)), .{
         .skip = if (cli.skip_pip_health) "disabled by --skip-pip-health" else null,
     }));
@@ -2566,9 +2660,9 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, mk("dotnet-tools", "dotnet", &.{"dotnet"}, "dotnet", &.{ "tool", "update", "--global", "--all" }));
     // ── PowerShell ───────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("powershell7", "system", &.{ "windows", "powershell" }, "winget", &.{
-        "upgrade",                     "--id",                        "Microsoft.PowerShell",
-        "--exact",                     "--include-unknown",           "--disable-interactivity",
-        "--accept-package-agreements", "--accept-source-agreements",  "--silent",
+        "upgrade",                     "--id",                       "Microsoft.PowerShell",
+        "--exact",                     "--include-unknown",          "--disable-interactivity",
+        "--accept-package-agreements", "--accept-source-agreements", "--silent",
     }), .{
         .timeout_sec = 300,
         .codes = &winget_ok_codes,
@@ -2725,7 +2819,7 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
             .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
         }));
     }
-    add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools)), .{
+    add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools, config.github_notification_ignore)), .{
         .requires = "gh",
         .timeout_sec = 180,
         .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
@@ -2745,33 +2839,33 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
 
 // Matches PS1 FastModeSkip
 const fast_skip_ids = [_][]const u8{
-    "chocolatey",  "wsl-distros",       "npm",             "pnpm",              "yarn",
-    "bun",         "deno",              "rustup",          "cargo",             "go",
-    "pip",         "pip-health",        "pipx",            "uv",                "uv-tools",
-    "poetry",      "composer",          "ruby-gems",       "flutter",           "juliaup",
-    "oh-my-posh",  "yt-dlp",            "volta",           "fnm",               "dotnet-tools",
+    "chocolatey",       "wsl-distros",       "npm",                "pnpm",            "yarn",
+    "bun",              "deno",              "rustup",             "cargo",           "go",
+    "pip",              "pip-health",        "pipx",               "uv",              "uv-tools",
+    "poetry",           "composer",          "ruby-gems",          "flutter",         "juliaup",
+    "oh-my-posh",       "yt-dlp",            "volta",              "fnm",             "dotnet-tools",
     "dotnet-workloads", "vscode-extensions", "powershell-modules", "powershell-help", "uv-python",
-    "ollama-models", "vcpkg",           "conda",           "gcloud",            "az",
-    "aws",         "terraform",         "pulumi",          "kubectl",           "helm",
-    "hugo",        "opentofu",          "starship",        "zoxide",            "gitleaks",
-    "trivy",       "packer",            "nvm",             "devcontainer",      "cross-manager",
-    "mise-upgrade", "tldr",
+    "ollama-models",    "vcpkg",             "conda",              "gcloud",          "az",
+    "aws",              "terraform",         "pulumi",             "kubectl",         "helm",
+    "hugo",             "opentofu",          "starship",           "zoxide",          "gitleaks",
+    "trivy",            "packer",            "nvm",                "devcontainer",    "cross-manager",
+    "mise-upgrade",     "tldr",
 };
 
 // Matches PS1 UltraFastSkip
 const ultra_skip_ids = [_][]const u8{
-    "windows-update", "store-apps",       "wsl",    "wsl-distros", "defender",
-    "cleanup",        "winget",           "winget-source", "winget-userscope", "scoop",
+    "windows-update", "store-apps", "wsl",           "wsl-distros",      "defender",
+    "cleanup",        "winget",     "winget-source", "winget-userscope", "scoop",
 };
 
 const minimal_profile_skip = [_][]const u8{
-    "vcpkg", "conda", "gcloud", "az",   "aws",      "terraform", "pulumi", "kubectl", "helm",
-    "hugo",  "opentofu", "starship", "gitleaks", "trivy", "packer", "nvm", "devcontainer",
+    "vcpkg", "conda",    "gcloud",   "az",       "aws",   "terraform", "pulumi", "kubectl",      "helm",
+    "hugo",  "opentofu", "starship", "gitleaks", "trivy", "packer",    "nvm",    "devcontainer",
 };
 
 const gaming_profile_skip = [_][]const u8{
-    "vcpkg", "conda", "gcloud", "az",   "aws",      "terraform", "pulumi", "kubectl", "helm",
-    "hugo",  "opentofu", "gitleaks", "trivy", "packer", "nvm", "devcontainer", "powershell-modules",
+    "vcpkg", "conda",    "gcloud",   "az",    "aws",    "terraform", "pulumi",       "kubectl",            "helm",
+    "hugo",  "opentofu", "gitleaks", "trivy", "packer", "nvm",       "devcontainer", "powershell-modules",
 };
 
 fn matchesAny(gpa: Allocator, task: Task, values: *const StringSet) bool {
@@ -2959,6 +3053,7 @@ const LineSink = struct {
     id: []const u8,
     is_err: bool,
     file: Io.File,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn readerThread(sink: *LineSink) void {
@@ -2977,9 +3072,10 @@ fn readerThread(sink: *LineSink) void {
             }
         }
         sink.mu.lockUncancelable(sink.io);
-        defer sink.mu.unlock(sink.io);
         sink.lines.append(sink.gpa, owned) catch @panic("oom");
+        sink.mu.unlock(sink.io);
     }
+    sink.done.store(true, .release);
 }
 
 const Watchdog = struct {
@@ -3022,6 +3118,90 @@ fn makeSummary(
     };
 }
 
+const Outcome = struct {
+    timed_out: bool,
+    ok_on_timeout: bool,
+    code: ?i32,
+    acceptable_exit_codes: []const i32,
+    lines: []const []const u8,
+};
+
+fn classifyStatus(o: Outcome) []const u8 {
+    var status: []const u8 = undefined;
+    if (o.timed_out and o.ok_on_timeout) {
+        status = "Succeeded";
+    } else if (o.timed_out) {
+        status = "TimedOut";
+    } else if (o.code != null and containsCode(o.acceptable_exit_codes, o.code.?)) {
+        status = "Succeeded";
+    } else if (o.code != null and o.code.? == 0) {
+        status = "Succeeded";
+    } else {
+        status = "Failed";
+    }
+    if (!std.mem.eql(u8, status, "Succeeded")) return status;
+    for (o.lines) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, skip_prefix)) return "Skipped";
+        // winget helper scripts keep running after an individual package needs
+        // intervention, then exit 0. Surface that in the task status.
+        if ((std.mem.startsWith(u8, trimmed, "failed (") or
+            std.mem.startsWith(u8, trimmed, "needs manual action (")) and
+            std.mem.indexOf(u8, trimmed, "(0)") == null)
+        {
+            return "Failed";
+        }
+    }
+    return status;
+}
+
+test "classifyStatus" {
+    const ok: Outcome = .{
+        .timed_out = false,
+        .ok_on_timeout = false,
+        .code = 0,
+        .acceptable_exit_codes = &.{},
+        .lines = &.{},
+    };
+    const expect = std.testing.expectEqualStrings;
+
+    try expect("Succeeded", classifyStatus(ok));
+
+    var o = ok;
+    o.code = 1;
+    try expect("Failed", classifyStatus(o));
+
+    o = ok;
+    o.code = -1978335189;
+    o.acceptable_exit_codes = &.{-1978335189};
+    try expect("Succeeded", classifyStatus(o));
+
+    o = ok;
+    o.timed_out = true;
+    try expect("TimedOut", classifyStatus(o));
+    o.ok_on_timeout = true;
+    try expect("Succeeded", classifyStatus(o));
+
+    o = ok;
+    o.lines = &.{"  needs manual action (1): TheStellaTeam.Stella"};
+    try expect("Failed", classifyStatus(o));
+
+    o.lines = &.{"needs manual action (0)"};
+    try expect("Succeeded", classifyStatus(o));
+
+    o.lines = &.{"failed (2): something"};
+    try expect("Failed", classifyStatus(o));
+
+    o.lines = &.{skip_prefix ++ " nothing to do"};
+    try expect("Skipped", classifyStatus(o));
+
+    // A non-zero exit is not rescued by a clean-looking log line.
+    o = ok;
+    o.code = 1;
+    o.lines = &.{skip_prefix ++ " nothing to do"};
+    try expect("Failed", classifyStatus(o));
+}
+
 fn runTaskStreaming(
     gpa: Allocator,
     io: Io,
@@ -3059,7 +3239,10 @@ fn runTaskStreaming(
         return makeSummary(gpa, task, "Failed", @intCast(nowMs(io) - start), null, lines);
     };
 
-    var out_sink: LineSink = .{
+    // Heap, not stack: a reader blocked on a pipe a grandchild still holds gets
+    // detached below and must not outlive its sink.
+    const out_sink = gpa.create(LineSink) catch @panic("oom");
+    out_sink.* = .{
         .gpa = gpa,
         .io = io,
         .quiet = quiet,
@@ -3068,7 +3251,8 @@ fn runTaskStreaming(
         .is_err = false,
         .file = child.stdout.?,
     };
-    var err_sink: LineSink = .{
+    const err_sink = gpa.create(LineSink) catch @panic("oom");
+    err_sink.* = .{
         .gpa = gpa,
         .io = io,
         .quiet = quiet,
@@ -3084,18 +3268,15 @@ fn runTaskStreaming(
         .deadline_ms = start + @as(i64, @intCast(timeout_ms)),
     };
 
-    const out_thread = std.Thread.spawn(.{}, readerThread, .{&out_sink}) catch @panic("thread spawn failed");
-    const err_thread = std.Thread.spawn(.{}, readerThread, .{&err_sink}) catch @panic("thread spawn failed");
+    const out_thread = std.Thread.spawn(.{}, readerThread, .{out_sink}) catch @panic("thread spawn failed");
+    const err_thread = std.Thread.spawn(.{}, readerThread, .{err_sink}) catch @panic("thread spawn failed");
     const dog_thread = std.Thread.spawn(.{}, watchdogThread, .{&watchdog}) catch @panic("thread spawn failed");
 
-    out_thread.join();
-    err_thread.join();
-
-    // The pipes hit EOF as soon as the child exits, but the exit status can lag
-    // by a moment; read the raw DWORD before `wait` closes the handle.
+    // Wait on the process, never on pipe EOF: a grandchild that inherited the
+    // pipe (VS Code helpers, service hosts) holds it open long after the child
+    // exits, and joining the readers first hangs the task until its timeout.
     var raw_code: u32 = still_active;
-    const code_deadline = nowMs(io) + 5_000;
-    while (nowMs(io) < code_deadline) {
+    while (true) {
         if (GetExitCodeProcess(child.id.?, &raw_code) == .FALSE) break;
         if (raw_code != still_active) break;
         sleepMs(io, 5);
@@ -3105,35 +3286,42 @@ fn runTaskStreaming(
     dog_thread.join();
     const timed_out = watchdog.timed_out.load(.acquire);
 
-    _ = child.wait(io) catch {};
+    const drain_deadline = nowMs(io) + reader_drain_ms;
+    while (nowMs(io) < drain_deadline and
+        !(out_sink.done.load(.acquire) and err_sink.done.load(.acquire)))
+    {
+        sleepMs(io, 10);
+    }
+
+    if (out_sink.done.load(.acquire) and err_sink.done.load(.acquire)) {
+        out_thread.join();
+        err_thread.join();
+        _ = child.wait(io) catch {};
+    } else {
+        // Sinks and pipe handles leak on purpose: closing a pipe under a
+        // blocking read is not safe, and the run is short-lived.
+        out_thread.detach();
+        err_thread.detach();
+    }
     const duration_ms: u64 = @intCast(nowMs(io) - start);
 
     var all_lines: std.ArrayList([]const u8) = .empty;
+    out_sink.mu.lockUncancelable(io);
     all_lines.appendSlice(gpa, out_sink.lines.items) catch @panic("oom");
+    out_sink.mu.unlock(io);
+    err_sink.mu.lockUncancelable(io);
     all_lines.appendSlice(gpa, err_sink.lines.items) catch @panic("oom");
+    err_sink.mu.unlock(io);
 
     const code: ?i32 = if (raw_code == still_active) null else @as(i32, @bitCast(raw_code));
 
-    var status: []const u8 = undefined;
-    if (timed_out and task.ok_on_timeout) {
-        status = "Succeeded";
-    } else if (timed_out) {
-        status = "TimedOut";
-    } else if (code != null and containsCode(task.acceptable_exit_codes, code.?)) {
-        status = "Succeeded";
-    } else if (code != null and code.? == 0) {
-        status = "Succeeded";
-    } else {
-        status = "Failed";
-    }
-    if (std.mem.eql(u8, status, "Succeeded")) {
-        for (all_lines.items) |line| {
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), skip_prefix)) {
-                status = "Skipped";
-                break;
-            }
-        }
-    }
+    const status = classifyStatus(.{
+        .timed_out = timed_out,
+        .ok_on_timeout = task.ok_on_timeout,
+        .code = code,
+        .acceptable_exit_codes = task.acceptable_exit_codes,
+        .lines = all_lines.items,
+    });
 
     if (!quiet) {
         p(io, "{s}{s} done{s} {s: <22} {s}{s}{s} {s}({d:.1}s){s}\n", .{ statusColor(status), statusGlyph(status), col(A.reset), task.id, statusColor(status), status, col(A.reset), col(A.grey), @as(f64, @floatFromInt(duration_ms)) / 1000.0, col(A.reset) });
