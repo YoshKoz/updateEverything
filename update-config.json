@@ -6,6 +6,10 @@
   "PipSkipPackages": [
     "sglang"
   ],
+  "GithubNotificationIgnore": [
+    "jellyfin/jellyfin",
+    "pop-os/cosmic-epoch"
+  ],
   "NpmSkipPackages": [
     "@anthropic-ai/claude-code"
   ],
