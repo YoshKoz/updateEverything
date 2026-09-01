@@ -366,6 +366,8 @@ const Cli = struct {
     /// gh-notify-releases reports by default; installing from a release notification
     /// is opt-in because the repo->package mapping can only ever be a guess.
     notify_apply: bool = false,
+    /// Let a GitHub-release install stop processes that block it, for every tool.
+    force_kill: bool = false,
     bypass_protection: bool = false,
     winget_timeout_sec: u64 = 600,
     ollama_timeout_sec: u64 = 600,
@@ -429,6 +431,7 @@ const help_text =
     \\      --update-powershell-help
     \\      --update-github-tools   [default: on]
     \\      --notify-apply          install mapped packages found by gh-notify-releases [default: report only]
+    \\      --force-kill            stop processes blocking a GitHub-release install [default: off]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
     \\      --ollama-timeout-sec <OLLAMA_TIMEOUT_SEC>   [default: 600]
@@ -598,6 +601,8 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             cli.update_github_tools = true;
         } else if (std.mem.eql(u8, name, "notify-apply")) {
             cli.notify_apply = true;
+        } else if (std.mem.eql(u8, name, "force-kill")) {
+            cli.force_kill = true;
         } else if (std.mem.eql(u8, name, "bypass-protection")) {
             cli.bypass_protection = true;
         } else if (std.mem.eql(u8, name, "winget-timeout-sec")) {
@@ -646,6 +651,8 @@ const GithubTool = struct {
     /// Pick the newest release whose tag matches this regex instead of trusting
     /// `releases/latest`, which lags on repos that tag every build (llama.cpp).
     tag_regex: ?[]const u8 = null,
+    /// Allow stopping processes that block the install, and only then.
+    allow_process_kill: bool = false,
     /// pwsh snippets run before extract / after marker write (e.g. stop/start a service).
     pre_update: ?[]const u8 = null,
     post_update: ?[]const u8 = null,
@@ -695,6 +702,11 @@ fn jsonString(gpa: Allocator, value: ?std.json.Value) ?[]const u8 {
     const v = value orelse return null;
     if (v != .string) return null;
     return gpa.dupe(u8, v.string) catch @panic("oom");
+}
+
+fn jsonBool(value: ?std.json.Value, default: bool) bool {
+    const v = value orelse return default;
+    return if (v == .bool) v.bool else default;
 }
 
 fn jsonU32(value: ?std.json.Value, default: u32) u32 {
@@ -811,6 +823,7 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
                     .tag = jsonString(gpa, o.get("Tag")),
                     .version_scheme = jsonString(gpa, o.get("VersionScheme")),
                     .tag_regex = jsonString(gpa, o.get("TagRegex")),
+                    .allow_process_kill = jsonBool(o.get("AllowProcessKill"), false),
                     .pre_update = jsonString(gpa, o.get("PreUpdate")),
                     .post_update = jsonString(gpa, o.get("PostUpdate")),
                 }) catch @panic("oom");
@@ -1174,17 +1187,42 @@ const github_release_body =
     \\Invoke-WebRequest -Uri $dl.browser_download_url -OutFile $tmp -Headers $hdr
     \\if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     \\if ($preCmd.Trim()) { Write-Host "pre-update: $preCmd"; & ([scriptblock]::Create($preCmd)) 2>&1 | Out-String | Write-Host }
-    \\# Anything still running from InstallDir holds its DLLs and makes Expand-Archive fail.
     \\$dirFull = (Resolve-Path $dir).Path.TrimEnd('\') + '\'
-    \\Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dirFull, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object {
-    \\  Write-Host "stopping $($_.ProcessName) (pid $($_.Id)) - locks $dir"
-    \\  Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    \\
+    \\function Get-LockingProcesses {
+    \\  Get-Process -ErrorAction SilentlyContinue |
+    \\    Where-Object { $_.Path -and $_.Path.StartsWith($dirFull, [StringComparison]::OrdinalIgnoreCase) }
     \\}
-    \\if ($dl.name -match '\.zip$') {
-    \\  Write-Host "extracting to $dir"
-    \\  Expand-Archive -Path $tmp -DestinationPath $dir -Force
-    \\} else {
-    \\  Copy-Item $tmp (Join-Path $dir $dl.name) -Force
+    \\
+    \\function Install-Payload {
+    \\  if ($dl.name -match '\.zip$') {
+    \\    Write-Host "extracting to $dir"
+    \\    Expand-Archive -Path $tmp -DestinationPath $dir -Force -ErrorAction Stop
+    \\  } else {
+    \\    Copy-Item $tmp (Join-Path $dir $dl.name) -Force -ErrorAction Stop
+    \\  }
+    \\}
+    \\
+    \\# Only a process that actually blocks the write gets stopped, and only when the
+    \\# tool opted in. Killing every process under InstallDir up front took down apps
+    \\# that were merely running.
+    \\try {
+    \\  Install-Payload
+    \\} catch {
+    \\  $locking = @(Get-LockingProcesses)
+    \\  if (-not $locking) { throw }
+    \\  $names = ($locking | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }) -join ', '
+    \\  if (-not $allowKill) {
+    \\    Write-Host "install blocked by: $names"
+    \\    Write-Host "not stopping them: set AllowProcessKill on this tool, or pass --force-kill"
+    \\    throw
+    \\  }
+    \\  foreach ($proc in $locking) {
+    \\    Write-Host "stopping $($proc.ProcessName) (pid $($proc.Id)) - locks $dir"
+    \\    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    \\  }
+    \\  Start-Sleep -Milliseconds 500
+    \\  Install-Payload
     \\}
     \\Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     \\Set-Content -Path $marker -Value $tag -NoNewline
@@ -1195,7 +1233,7 @@ const github_release_body =
 
 /// Build the pwsh args for a GitHub-release tool update: compare local version
 /// to the latest release, download + extract the matching asset when behind.
-fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
+fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool, force_kill: bool) []const []const u8 {
     const script = concat(gpa, &.{
         "$ErrorActionPreference = 'Stop'\n",
         "$repo    = '",
@@ -1219,6 +1257,7 @@ fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
         "$tagRe   = '",
         tool.tag_regex orelse "",
         "'\n",
+        if (tool.allow_process_kill or force_kill) "$allowKill = $True\n" else "$allowKill = $False\n",
         "$preCmd  = @'\n",
         tool.pre_update orelse "",
         "\n'@\n",
@@ -1234,11 +1273,11 @@ fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
 }
 
 /// Dispatch to the right provider builder for a managed tool.
-fn githubReleaseArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
+fn githubReleaseArgs(gpa: Allocator, tool: GithubTool, force_kill: bool) []const []const u8 {
     const provider = tool.provider orelse "github";
     if (std.mem.eql(u8, provider, "gitlab")) return gitlabReleaseArgs(gpa, tool);
     if (std.mem.eql(u8, provider, "gitlab-artifact")) return gitlabArtifactArgs(gpa, tool);
-    return githubReleaseInnerArgs(gpa, tool);
+    return githubReleaseInnerArgs(gpa, tool, force_kill);
 }
 
 const github_notify_body =
@@ -2941,7 +2980,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
             break :blk it.first();
         };
         const id = concat(gpa, &.{ "gh-", name });
-        add(&tasks, gpa, with(mk(id, "github-tools", &.{ "github", "tools" }, "pwsh", githubReleaseArgs(gpa, tool)), .{
+        add(&tasks, gpa, with(mk(id, "github-tools", &.{ "github", "tools" }, "pwsh", githubReleaseArgs(gpa, tool, cli.force_kill)), .{
             .resource = "github-tools",
             .timeout_sec = 900,
             .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
@@ -2981,6 +3020,28 @@ fn dependsOn(task: Task, id: []const u8) bool {
         if (std.mem.eql(u8, dep, id)) return true;
     }
     return false;
+}
+
+test "release install only kills processes when allowed" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tool: GithubTool = .{ .repo = "x/y", .install_dir = "C:\\Tools\\y", .asset_regex = "\\.zip$" };
+
+    const off = githubReleaseInnerArgs(a, tool, false);
+    const off_script = off[off.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, off_script, "$allowKill = $False") != null);
+    // The kill must sit behind the failed-install path, not run before every extract.
+    const kill_at = std.mem.indexOf(u8, off_script, "Stop-Process").?;
+    const catch_at = std.mem.indexOf(u8, off_script, "} catch {").?;
+    try std.testing.expect(catch_at < kill_at);
+
+    try std.testing.expect(std.mem.indexOf(u8, githubReleaseInnerArgs(a, tool, true)[off.len - 1], "$allowKill = $True") != null);
+
+    const opted_in: GithubTool = .{ .repo = "x/y", .install_dir = "C:\\Tools\\y", .asset_regex = "\\.zip$", .allow_process_kill = true };
+    try std.testing.expect(std.mem.indexOf(u8, githubReleaseInnerArgs(a, opted_in, false)[off.len - 1], "$allowKill = $True") != null);
 }
 
 test "gh-notify-releases reports without installing unless asked" {
