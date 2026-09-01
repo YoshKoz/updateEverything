@@ -1577,7 +1577,7 @@ const store_apps_body =
     \\    Write-Output ("store: {0} app(s) updated" -f $changed.Count)
     \\    foreach ($v in $changed.Values) { Write-Output ("  " + $v) }
     \\} else {
-    \\    Write-Output 'store: no app versions changed during the scan window.'
+    \\    Write-Output 'SKIPPED: store: no app versions changed during the scan window.'
     \\    Write-Output 'store: this does NOT prove every Store app is current - the scan reports no per-app status,'
     \\    Write-Output 'store: and winget cannot enumerate msstore upgrades. Check Store > Library > Get updates to be sure.'
     \\}
@@ -3508,6 +3508,9 @@ test "classifyStatus" {
     try expect("Failed", classifyStatus(o));
 
     o.lines = &.{skip_prefix ++ " nothing to do"};
+    try expect("Skipped", classifyStatus(o));
+
+    o.lines = &.{"SKIPPED: store: no app versions changed during the scan window."};
     try expect("Skipped", classifyStatus(o));
 
     // A non-zero exit is not rescued by a clean-looking log line.
