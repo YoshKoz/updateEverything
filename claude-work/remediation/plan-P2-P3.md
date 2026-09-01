@@ -1,0 +1,44 @@
+# Remediation plan — scope P2 + P3 (AUDIT-20260901.md)
+
+Scope note: the prompt's scope field arrived as the unfilled placeholder
+`[P2 / P3 / SPECIFIC ITEMS]`. Interpreted as **all of P2 and all of P3**.
+The report's "Architectuur" section is neither P2 nor P3 and is therefore out of scope.
+P1-1..P1-3 are done and are not revisited.
+
+Verification gates (all four per item):
+G1 `zig build test --summary all`
+G2 PowerShell body via `Parser::ParseInput` — 0 errors
+G3 python body via `py_compile` — exit 0
+G4 `--dry-run` builds every task
+
+| id | finding as written in the report | root cause in actual code | proposed fix | blast radius | verification | failure criterion | rollback |
+|----|----------------------------------|---------------------------|--------------|--------------|--------------|-------------------|----------|
+| P2-4 | "Geen `depends_on` van `uv-tools` op `uv`" + "PATH-cache resolve't paden één keer bij startup; een binary die tijdens de run verplaatst wordt, blijft naar het oude pad wijzen" | **PARTIAL MISMATCH.** Half 1 confirmed: `main.zig:2689` `mk("uv-tools",...)` carries only `.skip`, no `.depends_on`; the `uv` task is `main.zig:2688`. Half 2 not confirmed: `resolveCommandPath` (`main.zig:3081`) caches `name -> path`, but uv is a WinGet Links shim at a **stable** path, so the cache does not return a wrong path; `spawn FileNotFound` is the shim being briefly absent mid-reinstall. Re-resolving would return `null` and downgrade the task to "missing command", which is worse. | Implement half 1 only: `.depends_on = &.{"uv"}` on `uv-tools`. Extract `Runner.dependenciesMet` into a free `depsMet(runnable, finished, task)` so it is unit-testable. Explicitly do **not** touch the resolve cache. | uv-tools no longer runs concurrently with uv; adds up to ~38s serialisation in the python resource group. | G1-G4 + new test `depsMet blocks until dependency finished` | any gate red, or `--dry-run` no longer lists uv-tools | `git revert` the item commit |
+| P2-5 | "De 'notify'-task muteert het systeem"; fuzzy substring match; installeert `npm i -g` en `winget upgrade` zelf | CONFIRMED. `github_notify_body` (`main.zig:1200-1250`) runs `npm install -g "$pkg@latest"` and `winget upgrade --id $id` inline. Match is substring: `$npm.Contains("/$name@")` / `$wl.Contains($name)`; `$id` comes from a loose regex over `winget upgrade` output. | Add `$apply` (CLI `--notify-apply`, default **off**) so the task reports by default and only installs when asked. Resolve packages from an explicit `GithubNotificationPackages` repo→id map in `update-config.json`; drop the substring fallback. | **Behaviour change**: this run auto-installed `@google/gemini-cli`; after the fix that requires the flag. | G1-G4 + new test `parseCli --notify-apply` | any gate red | `git revert` the item commit |
+| P2-6 | "GitHub-release updater kilt draaiende apps zonder vragen" | CONFIRMED. `github_release_body` runs `Get-Process \| Where Path.StartsWith($dirFull) \| Stop-Process -Force` unconditionally before every extract, i.e. also when nothing is locked. | Try `Expand-Archive` first; only on a locking failure enumerate and stop processes, and only when the tool opts in (`AllowProcessKill: true`) or `--force-kill` is passed. Keep the existing "stopping <name> (pid)" log line. | Tools whose install dir is genuinely in use now fail loudly on first attempt instead of silently killing; llama.cpp already stops its scheduled task via `PreUpdate`. | G1, G2, G4 | any gate red | `git revert` the item commit |
+| P2-7 | "Geen integriteitscheck op downloads" | CONFIRMED. `Invoke-WebRequest -Uri $dl.browser_download_url -OutFile $tmp` then straight into `Expand-Archive -Force`; no hash, no signature anywhere in the body. | Compare `Get-FileHash -Algorithm SHA256` against the asset's `digest` field (`sha256:<hex>`) when the API supplies it; abort on mismatch. When absent, print `unverified download: <asset>` and continue. | Downloads abort on a real mismatch; repos without `digest` are unchanged apart from one log line. | G2, G4 + offline unit test of the compare helper. Real download path is **MANUAL** (needs network). | any gate red | `git revert` the item commit |
+| P3-8 | "Niet-deterministische summary; resultaten in completion-volgorde" | CONFIRMED. `runTasks` appends skipped tasks first, then `runner.results` in completion order (`main.zig:3627`); neither `printSummary` nor `writeSummaryJson` sorts. | Record the task's index on `TaskSummary` and sort by it before printing and before writing JSON. | Summary row order changes to definition order — cosmetic but visible. | G1, G4 + new test `sortByTaskIndex` | any gate red | `git revert` the item commit |
+| P3-9 | "`pip` skipt permanent; één conflict blokkeert alle upgrades" | CONFIRMED. `pip_upgrade_post`: `pip check` non-zero → print `SKIPPED:` plus every line, `sys.exit(0)`. No baseline, so a pre-existing conflict blocks upgrades forever. | Persist the conflict set under the state dir; block only when a **new** conflict appears, otherwise proceed and print the suppressed count (mirrors what `pip-health` already does with its ignore list). | pip starts upgrading again on this machine; a genuinely new conflict still blocks. | G3, G4 + offline test of the diff helper | any gate red | `git revert` the item commit |
+| P3-10 | "`cleanup` meldt 1016 orphaned .exe's en doet niets → opruimen achter `--deep-clean`" | CONFIRMED that it reports and acts on nothing (`main.zig:2153-2175`). **Deviation from the report's proposed fix**: the counter is not orphan detection at all — it counts every `.exe` in PATH with `mtime < cutoff` outside a managed dir. Auto-deleting on that signal would remove working binaries. | Do not add deletion. Relabel to what it measures ("N .exe(s) in PATH not modified in N days (informational)") and only emit it under `--deep-clean`. | One log line changes; default runs get quieter. | G3, G4 | any gate red | `git revert` the item commit |
+| P3-11 | "`store-apps` rapporteert Succeeded terwijl het zelf zegt niks te kunnen bewijzen" | CONFIRMED. `store_apps_body` prints the disclaimer (`main.zig:1477`) and exits 0, so `classifyStatus` yields `Succeeded`. | Prefix the no-change branch with the existing `SKIPPED:` marker so `classifyStatus` (`main.zig:3145`) reports `Skipped` with the reason. Uses the mechanism already in place; no new status. | store-apps moves from Succeeded to Skipped in the summary and in `succeeded=` counts. | G1, G2, G4 + extend `classifyStatus` test with the real store-apps line | any gate red | `git revert` the item commit |
+| P3-12 | "`winget-pin-audit` print `Failed in attempting to update the source: winget` maar exit 0 → verborgen bronfout" | **MISMATCH — STOPPING ON THIS ITEM.** `winget pin list` genuinely succeeded; it printed the pin table. The quoted line is winget's own source-refresh advisory, emitted by many winget invocations, and `winget-source` is a separate task that already reports source health. Treating it as a task failure would turn a transient advisory into a red run. No defect in the code as written. | None. Per the instruction, not implementing the report's wording. | n/a | n/a | n/a | n/a |
+| P3-13 | "`stripProgress` draait alleen op de tail, niet op de streaming output" | CONFIRMED. `stripProgress` is called only at `main.zig:3807`, `3830`, `4031` (all in `changesFor` / `printUpdateSummary`). `readerThread` (`main.zig:3132`) splits on `\n` only, so embedded `\r` from scoop/pnpm/winget progress bars reaches the terminal and rewrites the current line — the staircase in the run log. | In `readerThread`, keep only the segment after the last `\r` before emitting (the final state of a progress line); leave the captured `lines` untouched so `changesFor` still sees the full text. | Live output loses intermediate progress frames; stored output and change detection unaffected. | G1, G4 + new test `lastProgressSegment` | any gate red | `git revert` the item commit |
+
+## Items stopped in Phase 1
+
+- **P3-12** — report describes a hidden failure; the code is correct. Not implemented.
+- **P2-4** — implemented at half scope; the PATH-cache half of the report's root cause is wrong and implementing it would regress the task to "missing command".
+
+## Blocker before Phase 2
+
+`C:\Users\yoshi\CLAUDE.md` was updated during this session and now states, under
+"Project invariants ... without exception":
+
+> Writing inside `./claude-work/` allowed and expected.
+> Outside that directory change nothing: ... no existing project files.
+> Commands that write outside `./claude-work/` fall under Write scope: propose, do not run.
+
+Phase 2 of this task requires editing `rewrites/zig/main.zig`, `update-config.json`
+and appending to `AUDIT-20260901.md` — all outside `./claude-work/`.
+This plan file is inside the allowed area; the code edits are not.
+Awaiting a decision before applying anything (see the two options in the chat reply).

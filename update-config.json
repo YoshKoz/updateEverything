@@ -31,6 +31,8 @@
       "AssetRegex": "^llama-.*-bin-win-cuda.*x64\\.zip$",
       "VersionCmd": "& .\\llama-cli.exe --version",
       "VersionRegex": "build (\\d+)",
+      "VersionScheme": "build",
+      "TagRegex": "^b\\d+$",
       "PreUpdate": "Stop-ScheduledTask -TaskName llama-server -ErrorAction SilentlyContinue",
       "PostUpdate": "Start-ScheduledTask -TaskName llama-server"
     },
@@ -39,7 +41,8 @@
       "InstallDir": "C:\\Tools\\neovim",
       "AssetRegex": "^nvim-win64\\.zip$",
       "VersionCmd": "& .\\nvim-win64\\bin\\nvim.exe --version",
-      "VersionRegex": "v([\\d.]+)"
+      "VersionRegex": "v([\\d.]+)",
+      "VersionScheme": "semver"
     },
     {
       "Repo": "schmaldeo/DS4Windows",
