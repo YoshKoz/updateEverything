@@ -1,0 +1,5 @@
+PASS  digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' got='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'  valid lowercase digest
+PASS  digest='SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' got='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'  uppercase accepted, normalised
+PASS  digest='                        ' got=''  absent digest -> unverified, not blocked
+PASS  digest='sha256:deadbeef         ' got=''  truncated hex rejected
+PASS  digest='md5:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' got=''  non-sha256 algorithm rejected
