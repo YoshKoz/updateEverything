@@ -633,6 +633,13 @@ const GithubTool = struct {
     id: ?[]const u8 = null,
     /// Pin to a named release tag (e.g. rolling "nightly"); version = published_at.
     tag: ?[]const u8 = null,
+    /// How to order local vs latest: "semver", "build" (single integer), "date", or
+    /// "auto" (default). Never falls back to stripping non-digits, which made
+    /// `10649` compare as newer than `v0.3.0`.
+    version_scheme: ?[]const u8 = null,
+    /// Pick the newest release whose tag matches this regex instead of trusting
+    /// `releases/latest`, which lags on repos that tag every build (llama.cpp).
+    tag_regex: ?[]const u8 = null,
     /// pwsh snippets run before extract / after marker write (e.g. stop/start a service).
     pre_update: ?[]const u8 = null,
     post_update: ?[]const u8 = null,
@@ -773,6 +780,8 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
                     .version_regex = jsonString(gpa, o.get("VersionRegex")),
                     .id = jsonString(gpa, o.get("Id")),
                     .tag = jsonString(gpa, o.get("Tag")),
+                    .version_scheme = jsonString(gpa, o.get("VersionScheme")),
+                    .tag_regex = jsonString(gpa, o.get("TagRegex")),
                     .pre_update = jsonString(gpa, o.get("PreUpdate")),
                     .post_update = jsonString(gpa, o.get("PostUpdate")),
                 }) catch @panic("oom");
@@ -801,6 +810,9 @@ const Task = struct {
     timeout_ms: ?u64 = null,
     acceptable_exit_codes: []const i32 = &.{},
     ok_on_timeout: bool = false,
+    /// Substrings that mark a failure as permanent for this run. Retrying an
+    /// upstream mirror mismatch or a paused service just burns the backoff.
+    no_retry_patterns: []const []const u8 = &.{},
 
     fn skipIf(self: Task, condition: bool, reason: []const u8) Task {
         var task = self;
@@ -1055,29 +1067,70 @@ const github_release_body =
     \\  $local = (Get-Content $marker -Raw).Trim()
     \\}
     \\
+    \\# Ordering key per scheme. Returns $null when the string does not fit the
+    \\# scheme, which callers must treat as "cannot compare", never as up to date.
+    \\function Get-VersionKey($v) {
+    \\  if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    \\  $s = ([string]$v).Trim().TrimStart('vV')
+    \\  switch ($scheme) {
+    \\    'semver' {
+    \\      if ($s -notmatch '^(\d+(?:\.\d+){0,3})') { return $null }
+    \\      $parts = @($matches[1] -split '\.') + @('0','0','0','0')
+    \\      return [version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2], [int]$parts[3])
+    \\    }
+    \\    'build' {
+    \\      # A single integer run, optionally prefixed (llama.cpp "b10711").
+    \\      if ($s -notmatch '^[A-Za-z]*(\d+)$') { return $null }
+    \\      return [int64]$matches[1]
+    \\    }
+    \\    'date' {
+    \\      $d = ($s -replace '\D', '')
+    \\      if ($d.Length -lt 8) { return $null }
+    \\      return [int64]$d
+    \\    }
+    \\    default {
+    \\      # auto: semver when it looks like semver, else a bare integer, else give up.
+    \\      if ($s -match '^(\d+(?:\.\d+){1,3})') {
+    \\        $parts = @($matches[1] -split '\.') + @('0','0','0','0')
+    \\        return [version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2], [int]$parts[3])
+    \\      }
+    \\      if ($s -match '^[A-Za-z]*(\d+)$') { return [int64]$matches[1] }
+    \\      return $null
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\function Test-UpToDate($l, $r) {
+    \\  $lk = Get-VersionKey $l
+    \\  $rk = Get-VersionKey $r
+    \\  if ($null -eq $lk -or $null -eq $rk) { return $false }
+    \\  if ($lk.GetType() -ne $rk.GetType()) {
+    \\    Write-Host "version scheme mismatch: local '$l' vs latest '$r'; treating as behind"
+    \\    return $false
+    \\  }
+    \\  return $lk -ge $rk
+    \\}
+    \\
     \\$hdr = @{ 'User-Agent' = 'updateEverything' }
     \\if ($tagName) {
     \\  $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tagName" -Headers $hdr
     \\  # Rolling tag: the name never changes, so publish time is the version.
     \\  $pa = $rel.published_at
     \\  $tag = if ($pa -is [datetime]) { $pa.ToUniversalTime().ToString('yyyyMMddHHmmss') } else { ([string]$pa) -replace '\D', '' }
+    \\  if (-not $scheme) { $scheme = 'date' }
+    \\} elseif ($tagRe) {
+    \\  # releases/latest lags on repos that tag every build, so rank the matching
+    \\  # tags ourselves and take the highest under the declared scheme.
+    \\  $all = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=50" -Headers $hdr
+    \\  $cands = @($all | Where-Object { $_.tag_name -match $tagRe })
+    \\  if (-not $cands) { Write-Host "no release tag matched /$tagRe/"; exit 1 }
+    \\  $rel = $cands | Sort-Object -Property @{ Expression = { Get-VersionKey $_.tag_name } } -Descending | Select-Object -First 1
+    \\  $tag = $rel.tag_name
     \\} else {
     \\  $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $hdr
     \\  $tag = $rel.tag_name
     \\}
-    \\$latest = if ($tag -match '([\d.]+)') { $matches[1] } else { $null }
-    \\
-    \\# Compare local vs latest: semver via [version] when both parse, else numeric.
-    \\function Test-UpToDate($l, $r) {
-    \\  if ($null -eq $l -or $null -eq $r) { return $false }
-    \\  $lv = $null; $rv = $null
-    \\  if ([version]::TryParse($l, [ref]$lv) -and [version]::TryParse($r, [ref]$rv)) {
-    \\    return $lv -ge $rv
-    \\  }
-    \\  $ln = ($l -replace '\D', ''); $rn = ($r -replace '\D', '')
-    \\  if ($ln -and $rn) { return [int64]$ln -ge [int64]$rn }
-    \\  return $false
-    \\}
+    \\$latest = $tag
     \\
     \\Write-Host "$repo  local=$local  latest=$tag"
     \\if (Test-UpToDate $local $latest) {
@@ -1130,6 +1183,12 @@ fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool) []const []const u8 {
         "'\n",
         "$tagName = '",
         tool.tag orelse "",
+        "'\n",
+        "$scheme  = '",
+        tool.version_scheme orelse "",
+        "'\n",
+        "$tagRe   = '",
+        tool.tag_regex orelse "",
         "'\n",
         "$preCmd  = @'\n",
         tool.pre_update orelse "",
@@ -1717,8 +1776,16 @@ const vscode_extensions_script =
     \\# only left otherwise-updatable extensions behind.
     \\# Capture, don't inherit: code leaves helper processes holding the parent's
     \\# stdout pipe, so the runner would wait on EOF forever.
-    \\r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore")
-    \\print((r2.stdout or "").strip() or "no output")
+    \\try:
+    \\    r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore", timeout=300)
+    \\except subprocess.TimeoutExpired:
+    \\    print("code --update-extensions timed out after 300s")
+    \\    sys.exit(1)
+    \\out = (r2.stdout or "").strip()
+    \\if not out:
+    \\    print("SKIPPED: code --update-extensions produced no output; nothing verified")
+    \\    sys.exit(r2.returncode)
+    \\print(out)
     \\sys.exit(r2.returncode)
     \\
 ;
@@ -2442,6 +2509,7 @@ const Opts = struct {
     codes: ?[]const i32 = null,
     depends_on: ?[]const []const u8 = null,
     skip: ?[]const u8 = null,
+    no_retry_patterns: ?[]const []const u8 = null,
 };
 
 fn with(base: Task, opts: Opts) Task {
@@ -2452,6 +2520,7 @@ fn with(base: Task, opts: Opts) Task {
     if (opts.codes) |v| task.acceptable_exit_codes = v;
     if (opts.depends_on) |v| task.depends_on = v;
     if (opts.skip) |v| task.skip_reason = v;
+    if (opts.no_retry_patterns) |v| task.no_retry_patterns = v;
     return task;
 }
 
@@ -2550,6 +2619,11 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
         .resource = "wsl",
         .timeout_sec = 3600,
         .requires = "wsl",
+        // A mirror mid-sync serves the same short Packages index to every retry.
+        .no_retry_patterns = &.{
+            "File has unexpected size",
+            "Mirror sync in progress",
+        },
         .skip = if (cli.skip_wsl or cli.skip_wsl_distros) "disabled by WSL skip flag" else null,
     }));
     // ── Windows Features ─────────────────────────────────────────────────────
@@ -2604,6 +2678,12 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, mk("pipx", "python", &.{"python"}, "pipx", &.{ "upgrade-all", "--backend", "pip" }));
     add(&tasks, gpa, with(mk("hermes", "agents", &.{ "python", "agents" }, "hermes", &.{ "update", "--yes", "--no-backup" }), .{
         .timeout_sec = 900,
+        // A service stuck in a paused/pending SCM state needs manual attention;
+        // the gateway ownership probe fails the same way on every attempt.
+        .no_retry_patterns = &.{
+            "has indeterminate status",
+            "SCM service enumeration failed",
+        },
     }));
     add(&tasks, gpa, mk("uv", "python", &.{"python"}, "python", pyCmd(gpa, concat(gpa, &.{ close_blockers_py, uv_self_update_script }))));
     add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "uv", &.{ "tool", "upgrade", "--all" }), .{ .skip = uv_tools_skip }));
@@ -2681,6 +2761,9 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
     // ── Editor ───────────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("vscode-extensions", "editor", &.{"vscode"}, "python", pyCmd(gpa, vscode_extensions_script)), .{
         .requires = "code",
+        // The inner python already caps at 300s; this is the outer backstop so a
+        // wedged `code` helper cannot hold the whole run for the 1800s default.
+        .timeout_sec = 360,
         .skip = if (cli.skip_vscode_extensions) "disabled by --skip-vscode-extensions" else null,
     }));
     // ── Dev tools ────────────────────────────────────────────────────────────
@@ -3341,6 +3424,42 @@ fn containsCode(codes: []const i32, code: i32) bool {
     return false;
 }
 
+/// Returns the pattern that marks this failure as permanent, or null to retry.
+fn matchNoRetry(patterns: []const []const u8, lines: []const []const u8) ?[]const u8 {
+    for (patterns) |pattern| {
+        for (lines) |line| {
+            if (std.mem.indexOf(u8, line, pattern) != null) return pattern;
+        }
+    }
+    return null;
+}
+
+fn sameOutput(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len == 0 or a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
+test "matchNoRetry" {
+    const patterns = [_][]const u8{"has indeterminate status"};
+    const lines = [_][]const u8{ "boot", "RuntimeError: SCM service QingpingLogger has indeterminate status: paused" };
+    try std.testing.expectEqualStrings("has indeterminate status", matchNoRetry(&patterns, &lines).?);
+    try std.testing.expect(matchNoRetry(&patterns, &.{"unrelated"}) == null);
+    try std.testing.expect(matchNoRetry(&.{}, &lines) == null);
+}
+
+test "sameOutput" {
+    const a = [_][]const u8{ "one", "two" };
+    const b = [_][]const u8{ "one", "two" };
+    const c = [_][]const u8{ "one", "three" };
+    try std.testing.expect(sameOutput(&a, &b));
+    try std.testing.expect(!sameOutput(&a, &c));
+    // No output is not evidence of a repeated failure.
+    try std.testing.expect(!sameOutput(&.{}, &.{}));
+}
+
 const Runner = struct {
     gpa: Allocator,
     io: Io,
@@ -3411,11 +3530,24 @@ const Runner = struct {
         var attempt: u32 = 1;
         while (attempt <= self.retry_count) : (attempt += 1) {
             if (!std.mem.eql(u8, result.status, "Failed") and !std.mem.eql(u8, result.status, "TimedOut")) break;
+            if (matchNoRetry(task.no_retry_patterns, result.output_tail)) |hit| {
+                pe(self.io, "{s}{s} noretry{s} {s} {s}(permanent: {s}){s}\n", .{ col(A.yellow), G.skip, col(A.reset), task.id, col(A.grey), hit, col(A.reset) });
+                break;
+            }
+            const previous = result.output_tail;
             const shift: u6 = @intCast(@min(attempt, 4));
             const delay_sec: u64 = 3 * (@as(u64, 1) << shift);
             pe(self.io, "{s}{s} retry {d}/{d}{s} {s} {s}(waiting {d}s){s}\n", .{ col(A.yellow), G.retry, attempt, self.retry_count, col(A.reset), task.id, col(A.grey), delay_sec, col(A.reset) });
             sleepMs(self.io, delay_sec * 1000);
             result = runTaskStreaming(self.gpa, self.io, task, self.quiet, self.timeout_ms, self.prefix_output, &self.resource_locks);
+            // A byte-identical failure means the cause is not transient; a third
+            // identical run only adds noise and backoff.
+            if ((std.mem.eql(u8, result.status, "Failed") or std.mem.eql(u8, result.status, "TimedOut")) and
+                sameOutput(previous, result.output_tail))
+            {
+                pe(self.io, "{s}{s} noretry{s} {s} {s}(identical failure output){s}\n", .{ col(A.yellow), G.skip, col(A.reset), task.id, col(A.grey), col(A.reset) });
+                break;
+            }
         }
         self.results_mu.lockUncancelable(self.io);
         self.results.append(self.gpa, result) catch @panic("oom");
