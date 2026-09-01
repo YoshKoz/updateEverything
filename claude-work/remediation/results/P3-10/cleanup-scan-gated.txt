@@ -1,0 +1,4 @@
+2281: \\if not deep:
+2283: \\print("Scanning PATH for long-untouched binaries...")
+2302: \\    print(f"PATH age scan: {orphans} .exe(s) not modified in {days} day(s) (informational; nothing removed).")
+2304: \\    print(f"PATH age scan: every .exe in PATH modified within {days} day(s).")

@@ -2275,8 +2275,12 @@ const cleanup_body =
     \\        print("Running DISM component cleanup (this may take a while)...")
     \\        subprocess.run(["DISM.exe", "/Online", "/Cleanup-Image", "/StartComponentCleanup"])
     \\
-    \\# Stale binary scan
-    \\print("Checking for orphaned binaries in PATH...")
+    \\# Age scan, informational only. It counts every .exe in PATH whose mtime is older
+    \\# than the cutoff and that sits outside a known managed dir - that is not the same
+    \\# as "orphaned", so nothing here is ever deleted on the strength of it.
+    \\if not deep:
+    \\    sys.exit(0)
+    \\print("Scanning PATH for long-untouched binaries...")
     \\path_dirs = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and os.path.isdir(p)]
     \\managed = ["scoop\\apps", "chocolatey\\lib", "Microsoft\\WinGet", "pipx\\venvs",
     \\           "Python\\Scripts", ".cargo\\bin", "node_modules\\.bin", ".dotnet\\tools",
@@ -2295,9 +2299,9 @@ const cleanup_body =
     \\            except Exception:
     \\                pass
     \\if orphans:
-    \\    print(f"Stale binary scan: {orphans} orphaned .exe(s) older than {days} day(s) found in PATH.")
+    \\    print(f"PATH age scan: {orphans} .exe(s) not modified in {days} day(s) (informational; nothing removed).")
     \\else:
-    \\    print("Stale binary scan: no orphaned binaries found.")
+    \\    print(f"PATH age scan: every .exe in PATH modified within {days} day(s).")
     \\sys.exit(0)
     \\
 ;
