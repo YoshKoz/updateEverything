@@ -1,0 +1,6 @@
+Build Summary: 3/3 steps succeeded; 9/9 tests passed
+test success
++- run test 9 pass (9 total) 166ms MaxRSS:4M
+   +- compile test Debug native success 2s MaxRSS:266M
+
+

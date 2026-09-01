@@ -1,0 +1,155 @@
+ dry  winget-source          winget source update
+ dry  winget-pre             cmd /c "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & exit 0"
+ dry  winget-git             pwsh -NoProfile -NonInteractive -Command <24-line-script>
+ dry  winget-pin-skip        pwsh -NoProfile -NonInteractive -Command <7-line-script>
+ dry  winget                 pwsh -NoProfile -NonInteractive -Command <95-line-script>
+ dry  winget-pin-audit       winget pin list
+ dry  cross-manager          python -c <20-line-script>
+ dry  store-apps             pwsh -NoProfile -NonInteractive -Command <49-line-script>
+ dry  scoop                  pwsh -NoProfile -NonInteractive -Command "scoop update; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; scoop update *"
+ dry  chocolatey             pwsh -NoProfile -NonInteractive -Command "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Write-Output 'Chocolatey skipped: requires elevation (run elevated to upgrade choco packages).';exit 0}; & choco upgrade all -y --no-progress; exit $LASTEXITCODE"
+ dry  windows-update         pwsh -NoProfile -NonInteractive -Command "$s=New-Object -ComObject Microsoft.Update.Session;$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Software'\");if($r.Updates.Count-eq 0){Write-Output 'Windows: no updates available.';return};Write-Output \"Found $($r.Updates.Count) update(s). Downloading...\";$d=New-Object -ComObject Microsoft.Update.Downloader;$d.Updates=$r.Updates;$d.Download();$i=New-Object -ComObject Microsoft.Update.Installer;$i.Updates=$r.Updates;$ir=$i.Install();Write-Output \"Windows Update: $($r.Updates.Count) update(s) installed. Reboot required: $($ir.RebootRequired)\""
+ dry  defender               pwsh -NoProfile -NonInteractive -Command "$mode = try { (Get-MpComputerStatus -ErrorAction Stop).AMRunningMode } catch { $null }; if ($mode -and $mode -ne 'Normal') { Write-Output \"Defender signature update skipped: AMRunningMode='$mode' (third-party AV active, Defender passive).\"; return }; try { Update-MpSignature -ErrorAction Stop; Write-Output 'Defender signatures updated.' } catch { Write-Output \"Defender update skipped: $($_.Exception.Message)\" }"
+ dry  wsl                    wsl --update
+ dry  wsl-distros            pwsh -NoProfile -NonInteractive -Command <78-line-script>
+ dry  windows-features       pwsh -NoProfile -NonInteractive -Command "Write-Output 'No WindowsOptionalFeatures configured in update-config.json.'"
+ dry  appx-repair            pwsh -NoProfile -NonInteractive -Command "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Write-Output 'AppX repair skipped: requires elevation (Get-AppxPackage -AllUsers needs admin).';return};$pkgs=@(Get-AppxPackage -AllUsers -EA SilentlyContinue|Where-Object{$_.SignatureKind-eq 'Store'-and-not $_.IsFramework-and$_.Name-match '(Microsoft\.WindowsStore|Microsoft\.Store|Microsoft\.WindowsCalculator|Microsoft\.Windows\.Photos|Microsoft\.Windows\.Camera|Microsoft\.People|Microsoft\.MSPaint|Microsoft\.ScreenSketch|Microsoft\.WindowsNotepad|Microsoft\.WindowsTerminal)'});$repaired=0;foreach($p in $pkgs){try{$m=Get-AppxPackageManifest -Package $p -EA SilentlyContinue;if($m){Add-AppxPackage -Register -DisableDevelopmentMode -EA SilentlyContinue \"$($p.InstallLocation)\AppxManifest.xml\" *>$null;$repaired++}}catch{Write-Output \"AppX repair failed for $($p.Name): $($_.Exception.Message)\"}};Write-Output \"AppX re-registration: $repaired package(s) re-registered.\""
+ skip pacman                 Linux-only; native MSYS2 is handled by the msys2 task
+ dry  msys2                  pwsh -NoProfile -NonInteractive -Command "$bash=@('C:\msys64\usr\bin\bash.exe','C:\tools\msys64\usr\bin\bash.exe',\"$env:SystemDrive\msys64\usr\bin\bash.exe\")|Where-Object{Test-Path $_}|Select-Object -First 1;if(-not $bash){Write-Output 'MSYS2 not installed; skipping.';return};Write-Output \"Updating MSYS2 via $bash\";& $bash -lc 'if [ -f /var/lib/pacman/db.lck ] && ! pgrep -x pacman >/dev/null 2>&1; then echo \"removing stale pacman lock\"; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm';if($LASTEXITCODE-ne 0){Write-Output \"MSYS2 pacman exit $LASTEXITCODE\";exit $LASTEXITCODE}"
+ dry  npm                    python -c <39-line-script>
+ dry  pnpm                   pnpm self-update
+ dry  yarn                   yarn global upgrade
+ dry  bun                    bun upgrade
+ dry  deno                   deno upgrade
+ skip volta                  missing command: volta
+ dry  fnm                    python -c <6-line-script>
+ skip nvm                    missing command: nvm
+ dry  pip                    python -c <57-line-script>
+ dry  python-venvs           python -c <19-line-script>
+ dry  pip-health             python -c <18-line-script>
+ dry  pipx                   pipx upgrade-all --backend pip
+ dry  hermes                 hermes update --yes --no-backup
+ dry  uv                     python -c <46-line-script>
+ dry  uv-tools               uv tool upgrade --all
+ dry  uv-python              python -c <33-line-script>
+ dry  poetry                 python -c <12-line-script>
+ skip conda                  missing command: conda
+ dry  rustup                 rustup update
+ dry  cargo                  cargo install-update -a
+ dry  go                     go install golang.org/x/tools/gopls@latest
+ dry  composer               composer self-update --no-interaction
+ dry  ruby-gems              gem update
+ skip flutter                missing command: flutter
+ dry  juliaup                juliaup update
+ dry  gh                     python -c <19-line-script>
+ dry  dotnet-workloads       dotnet workload update
+ dry  dotnet-tools           dotnet tool update --global --all
+ dry  powershell7            winget upgrade --id Microsoft.PowerShell --exact --include-unknown --disable-interactivity --accept-package-agreements --accept-source-agreements --silent
+ dry  powershell-modules     pwsh -NoProfile -NonInteractive -Command "if(Get-Command Update-PSResource -EA SilentlyContinue){$mods=@(Get-PSResource -Name '*' -EA SilentlyContinue);if($mods.Count-eq 0){Write-Output 'No installed PSResource modules found.';return};$failed=@();foreach($m in ($mods|Sort-Object Name -Unique)){try{Update-PSResource -Name $m.Name -AcceptLicense -TrustRepository -EA Stop|Out-String|Write-Output}catch{Write-Output \"Not updated: $($m.Name) — $($_.Exception.Message)\";$failed+=$m.Name}};if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\"}}elseif(Get-Command Update-Module -EA SilentlyContinue){$mods=@(Get-InstalledModule -EA SilentlyContinue);if($mods.Count-eq 0){Write-Output 'No installed PowerShellGet modules found.';return};$failed=@();foreach($m in $mods){try{Update-Module -Name $m.Name -Force -EA Stop}catch{Write-Output \"Not updated: $($m.Name) — $($_.Exception.Message)\";$failed+=$m.Name}};if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\"}}else{Write-Output 'No PowerShell module updater found.'}"
+ skip powershell-help        opt-in via --update-powershell-help
+ dry  vscode-extensions      python -c <19-line-script>
+ dry  git-lfs                git lfs install --skip-repo
+ dry  gh-extensions          gh extension upgrade --all
+ skip devcontainer           missing command: devcontainer
+ dry  mise                   python -c <11-line-script>
+ dry  mise-upgrade           mise upgrade
+ dry  yt-dlp                 python -c <13-line-script>
+ dry  oh-my-posh             python -c <27-line-script>
+ dry  starship               python -c <21-line-script>
+ dry  zoxide                 python -c <6-line-script>
+ skip tldr                   missing command: tldr
+ skip gcloud                 missing command: gcloud
+ skip az                     missing command: az
+ skip aws                    missing command: aws
+ skip terraform              missing command: terraform
+ skip pulumi                 missing command: pulumi
+ skip opentofu               missing command: tofu
+ skip packer                 missing command: packer
+ dry  kubectl                python -c <22-line-script>
+ skip helm                   missing command: helm
+ dry  gitleaks               python -c <11-line-script>
+ skip trivy                  missing command: trivy
+ skip hugo                   missing command: hugo
+ skip vcpkg                  missing command: vcpkg
+ dry  claude                 python -c <16-line-script>
+ dry  codex                  python -c <31-line-script>
+ skip ollama-models          use --update-ollama-models to refresh local models
+ skip docker-prune           opt-in: requires --deep-clean and docker running
+ dry  cleanup                python -c <74-line-script>
+ dry  self-update            python -c <22-line-script>
+ dry  gh-Ikemen-GO           pwsh -NoProfile -NonInteractive -Command <160-line-script>
+ dry  gh-llama.cpp           pwsh -NoProfile -NonInteractive -Command <163-line-script>
+ dry  gh-neovim              pwsh -NoProfile -NonInteractive -Command <161-line-script>
+ dry  gh-DS4Windows          pwsh -NoProfile -NonInteractive -Command <160-line-script>
+ dry  gh-OpenRGB             pwsh -NoProfile -NonInteractive -Command <33-line-script>
+ dry  gh-notify-releases     pwsh -NoProfile -NonInteractive -Command <49-line-script>
+
+  Task                       Status       Time(s)  Exit
+   ----                       ------       -------  ----
+  winget-source              DryRun       0.0      -
+  winget-pre                 DryRun       0.0      -
+  winget-git                 DryRun       0.0      -
+  winget-pin-skip            DryRun       0.0      -
+  winget                     DryRun       0.0      -
+  winget-pin-audit           DryRun       0.0      -
+  cross-manager              DryRun       0.0      -
+  store-apps                 DryRun       0.0      -
+  scoop                      DryRun       0.0      -
+  chocolatey                 DryRun       0.0      -
+  windows-update             DryRun       0.0      -
+  defender                   DryRun       0.0      -
+  wsl                        DryRun       0.0      -
+  wsl-distros                DryRun       0.0      -
+  windows-features           DryRun       0.0      -
+  appx-repair                DryRun       0.0      -
+  msys2                      DryRun       0.0      -
+  npm                        DryRun       0.0      -
+  pnpm                       DryRun       0.0      -
+  yarn                       DryRun       0.0      -
+  bun                        DryRun       0.0      -
+  deno                       DryRun       0.0      -
+  fnm                        DryRun       0.0      -
+  pip                        DryRun       0.0      -
+  python-venvs               DryRun       0.0      -
+  pip-health                 DryRun       0.0      -
+  pipx                       DryRun       0.0      -
+  hermes                     DryRun       0.0      -
+  uv                         DryRun       0.0      -
+  uv-tools                   DryRun       0.0      -
+  uv-python                  DryRun       0.0      -
+  poetry                     DryRun       0.0      -
+  rustup                     DryRun       0.0      -
+  cargo                      DryRun       0.0      -
+  go                         DryRun       0.0      -
+  composer                   DryRun       0.0      -
+  ruby-gems                  DryRun       0.0      -
+  juliaup                    DryRun       0.0      -
+  gh                         DryRun       0.0      -
+  dotnet-workloads           DryRun       0.0      -
+  dotnet-tools               DryRun       0.0      -
+  powershell7                DryRun       0.0      -
+  powershell-modules         DryRun       0.0      -
+  vscode-extensions          DryRun       0.0      -
+  git-lfs                    DryRun       0.0      -
+  gh-extensions              DryRun       0.0      -
+  mise                       DryRun       0.0      -
+  mise-upgrade               DryRun       0.0      -
+  yt-dlp                     DryRun       0.0      -
+  oh-my-posh                 DryRun       0.0      -
+  starship                   DryRun       0.0      -
+  zoxide                     DryRun       0.0      -
+  kubectl                    DryRun       0.0      -
+  gitleaks                   DryRun       0.0      -
+  claude                     DryRun       0.0      -
+  codex                      DryRun       0.0      -
+  cleanup                    DryRun       0.0      -
+  self-update                DryRun       0.0      -
+  gh-Ikemen-GO               DryRun       0.0      -
+  gh-llama.cpp               DryRun       0.0      -
+  gh-neovim                  DryRun       0.0      -
+  gh-DS4Windows              DryRun       0.0      -
+  gh-OpenRGB                 DryRun       0.0      -
+  gh-notify-releases         DryRun       0.0      -
+
+ done  total=85  succeeded=0  failed=0  timed-out=0  skipped=21  dry=64  duration=0.0s
+

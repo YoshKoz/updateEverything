@@ -1,0 +1,5 @@
+PASS  first run blocks on 3 unseen conflicts (new=3)
+PASS  unchanged conflicts no longer block (known=3)
+PASS  a new conflict still blocks (new=1, known=3)
+PASS  clean pip check does not block
+FAILURES: 0

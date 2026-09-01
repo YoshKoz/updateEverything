@@ -1598,16 +1598,36 @@ const pip_upgrade_pre =
     \\if os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")):
     \\    print("pip: externally managed environment (PEP 668); skipping")
     \\    sys.exit(0)
+    \\BASELINE_DIR = r"STATE_DIR_PLACEHOLDER"
     \\skip = {
 ;
 const pip_upgrade_post =
     \\}
     \\health = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
-    \\if health.returncode != 0:
-    \\    print("SKIPPED: pip dependency conflicts detected; upgrades deferred to preserve this shared environment")
-    \\    for line in (health.stdout or health.stderr).strip().splitlines():
+    \\# A conflict that was already there last run is the status quo, not a reason to
+    \\# stop upgrading forever. Only a conflict we have not seen before blocks.
+    \\baseline_path = os.path.join(BASELINE_DIR, "pip-conflicts.json")
+    \\current = sorted(l.strip() for l in (health.stdout or health.stderr).splitlines() if l.strip())
+    \\try:
+    \\    with open(baseline_path, encoding="utf-8") as fh:
+    \\        known = set(json.load(fh))
+    \\except (OSError, ValueError):
+    \\    known = set()
+    \\new_conflicts = [l for l in current if l not in known]
+    \\if health.returncode != 0 and new_conflicts:
+    \\    print("SKIPPED: new pip dependency conflicts detected; upgrades deferred to preserve this shared environment")
+    \\    for line in new_conflicts:
     \\        print("  " + line)
+    \\    print(f"  ({len(current) - len(new_conflicts)} previously known conflict(s) suppressed)")
+    \\    os.makedirs(BASELINE_DIR, exist_ok=True)
+    \\    with open(baseline_path, "w", encoding="utf-8") as fh:
+    \\        json.dump(current, fh, indent=1)
     \\    sys.exit(0)
+    \\if health.returncode != 0:
+    \\    print(f"pip: {len(current)} known conflict(s) unchanged since last run; continuing")
+    \\os.makedirs(BASELINE_DIR, exist_ok=True)
+    \\with open(baseline_path, "w", encoding="utf-8") as fh:
+    \\    json.dump(current, fh, indent=1)
     \\subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=False)
     \\r = subprocess.run([sys.executable, "-m", "pip", "list", "--outdated", "--format=json"], capture_output=True, text=True)
     \\pkgs = [p["name"] for p in json.loads(r.stdout or "[]") if p["name"].lower() not in skip]
@@ -1637,8 +1657,9 @@ const pip_upgrade_post =
     \\
 ;
 
-fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8) []const []const u8 {
-    return pyCmd(gpa, concat(gpa, &.{ pip_upgrade_pre, pyList(gpa, skip_packages, true), pip_upgrade_post }));
+fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8, state_dir: []const u8) []const []const u8 {
+    const head = replaceAll(gpa, pip_upgrade_pre, "STATE_DIR_PLACEHOLDER", replaceAll(gpa, state_dir, "\"", ""));
+    return pyCmd(gpa, concat(gpa, &.{ head, pyList(gpa, skip_packages, true), pip_upgrade_post }));
 }
 
 const python_venvs_script =
@@ -2777,7 +2798,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .skip = node_skip,
     }));
     // ── Python ───────────────────────────────────────────────────────────────
-    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items)));
+    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli))));
     add(&tasks, gpa, mk("python-venvs", "python", &.{ "python", "venv" }, "python", pyCmd(gpa, python_venvs_script)));
     add(&tasks, gpa, with(mk("pip-health", "python", &.{ "python", "health" }, "python", pipHealthArgs(gpa, config.pip_ignore_health_packages)), .{
         .skip = if (cli.skip_pip_health) "disabled by --skip-pip-health" else null,
