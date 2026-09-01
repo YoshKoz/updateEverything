@@ -10,6 +10,12 @@
     "jellyfin/jellyfin",
     "pop-os/cosmic-epoch"
   ],
+  "GithubNotificationPackages": [
+    {
+      "Repo": "google-gemini/gemini-cli",
+      "Npm": "@google/gemini-cli"
+    }
+  ],
   "NpmSkipPackages": [
     "@anthropic-ai/claude-code"
   ],
