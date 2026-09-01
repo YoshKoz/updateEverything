@@ -2524,7 +2524,7 @@ fn with(base: Task, opts: Opts) Task {
     return task;
 }
 
-fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
+fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     var pip_skip: std.ArrayList([]const u8) = .empty;
     pip_skip.appendSlice(gpa, config.pip_skip_packages) catch @panic("oom");
     for (config.pip_ignore_health_packages) |pkg| {
@@ -2686,7 +2686,12 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
         },
     }));
     add(&tasks, gpa, mk("uv", "python", &.{"python"}, "python", pyCmd(gpa, concat(gpa, &.{ close_blockers_py, uv_self_update_script }))));
-    add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "uv", &.{ "tool", "upgrade", "--all" }), .{ .skip = uv_tools_skip }));
+    // Must not overlap the `uv` task: that one has winget replace the uv shim, and a
+    // spawn landing in that window dies with FileNotFound.
+    add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "uv", &.{ "tool", "upgrade", "--all" }), .{
+        .depends_on = &.{"uv"},
+        .skip = uv_tools_skip,
+    }));
     add(&tasks, gpa, with(mk("uv-python", "python", &.{ "python", "uv" }, "python", pyCmd(gpa, uv_python_upgrade_script)), .{
         .requires = "uv",
         .skip = uv_tools_skip,
@@ -2908,14 +2913,46 @@ fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
         .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
     }));
 
+    return tasks.toOwnedSlice(gpa) catch @panic("oom");
+}
+
+/// Probing PATH is the only part of task construction that needs Io, so it lives
+/// here and `taskTable` stays pure and unit-testable.
+fn buildTasks(gpa: Allocator, io: Io, config: Config, cli: Cli) []Task {
+    const tasks = taskTable(gpa, config, cli);
     // Only mark missing if no explicit skip_reason is already set (e.g. disabled by flag)
-    for (tasks.items) |*task| {
+    for (tasks) |*task| {
         if (task.skip_reason == null and !commandExists(gpa, io, task.requires)) {
             task.skip_reason = fmtAlloc(gpa, "missing command: {s}", .{task.requires});
         }
     }
+    return tasks;
+}
 
-    return tasks.toOwnedSlice(gpa) catch @panic("oom");
+fn findTask(tasks: []const Task, id: []const u8) ?Task {
+    for (tasks) |task| {
+        if (std.mem.eql(u8, task.id, id)) return task;
+    }
+    return null;
+}
+
+fn dependsOn(task: Task, id: []const u8) bool {
+    for (task.depends_on) |dep| {
+        if (std.mem.eql(u8, dep, id)) return true;
+    }
+    return false;
+}
+
+test "uv-tools waits for the uv self-update" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const tasks = taskTable(arena.allocator(), .{}, .{});
+    const uv_tools = findTask(tasks, "uv-tools") orelse return error.TaskMissing;
+    // Without this the two race: winget replaces the uv shim while uv-tools spawns it.
+    try std.testing.expect(dependsOn(uv_tools, "uv"));
+    try std.testing.expect(findTask(tasks, "uv") != null);
 }
 
 // ─── Task filtering ──────────────────────────────────────────────────────────
@@ -3424,6 +3461,47 @@ fn containsCode(codes: []const i32, code: i32) bool {
     return false;
 }
 
+/// A dependency that was filtered out of this run never blocks; only a scheduled
+/// one that has not finished yet does.
+fn depsMet(runnable: *const std.StringHashMap(void), finished: *const std.StringHashMap(void), task: Task) bool {
+    for (task.depends_on) |dep| {
+        if (!runnable.contains(dep)) continue;
+        if (!finished.contains(dep)) return false;
+    }
+    return true;
+}
+
+test "depsMet blocks until dependency finished" {
+    const gpa = std.testing.allocator;
+    var runnable: std.StringHashMap(void) = .init(gpa);
+    defer runnable.deinit();
+    var finished: std.StringHashMap(void) = .init(gpa);
+    defer finished.deinit();
+
+    const uv_tools: Task = .{
+        .id = "uv-tools",
+        .category = "python",
+        .tags = &.{},
+        .command = "uv",
+        .args = &.{},
+        .requires = "uv",
+        .depends_on = &.{"uv"},
+    };
+
+    // `uv` is scheduled but still running: uv-tools must wait, otherwise it spawns
+    // while winget is mid-reinstall of the uv shim and dies with FileNotFound.
+    try runnable.put("uv", {});
+    try std.testing.expect(!depsMet(&runnable, &finished, uv_tools));
+
+    try finished.put("uv", {});
+    try std.testing.expect(depsMet(&runnable, &finished, uv_tools));
+
+    // `uv` filtered out of this run (--skip uv): nothing to wait for.
+    var empty: std.StringHashMap(void) = .init(gpa);
+    defer empty.deinit();
+    try std.testing.expect(depsMet(&empty, &empty, uv_tools));
+}
+
 /// Returns the pattern that marks this failure as permanent, or null to retry.
 fn matchNoRetry(patterns: []const []const u8, lines: []const []const u8) ?[]const u8 {
     for (patterns) |pattern| {
@@ -3518,11 +3596,7 @@ const Runner = struct {
     }
 
     fn dependenciesMet(self: *Runner, task: Task) bool {
-        for (task.depends_on) |dep| {
-            if (!self.runnable.contains(dep)) continue;
-            if (!self.finished.contains(dep)) return false;
-        }
-        return true;
+        return depsMet(&self.runnable, &self.finished, task);
     }
 
     fn runOne(self: *Runner, task: Task) void {
