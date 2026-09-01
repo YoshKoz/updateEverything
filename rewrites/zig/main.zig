@@ -3370,6 +3370,16 @@ const LineSink = struct {
     done: std.atomic.Value(bool) = .init(false),
 };
 
+fn lastProgressSegment(line: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, line, '\r') orelse return line;
+    return line[at + 1 ..];
+}
+
+test "lastProgressSegment keeps only the final carriage-return frame" {
+    try std.testing.expectEqualStrings("complete", lastProgressSegment("25%\r50%\rcomplete"));
+    try std.testing.expectEqualStrings("plain", lastProgressSegment("plain"));
+}
+
 fn readerThread(sink: *LineSink) void {
     var buf: [64 * 1024]u8 = undefined;
     var reader = sink.file.reader(sink.io, &buf);
@@ -3378,11 +3388,12 @@ fn readerThread(sink: *LineSink) void {
         const line = std.mem.trimEnd(u8, raw, "\r\n");
         const owned = sink.gpa.dupe(u8, line) catch @panic("oom");
         if (!sink.quiet) {
+            const visible = lastProgressSegment(owned);
             const tone = if (sink.is_err) col(A.yellow) else col(A.grey);
             if (sink.prefix) {
-                if (sink.is_err) pe(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, owned, col(A.reset) }) else p(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, owned, col(A.reset) });
+                if (sink.is_err) pe(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, visible, col(A.reset) }) else p(sink.io, "{s}[{s}]{s} {s}{s}{s}\n", .{ col(A.blue), sink.id, col(A.reset), tone, visible, col(A.reset) });
             } else {
-                if (sink.is_err) pe(sink.io, "  {s}{s}{s}\n", .{ tone, owned, col(A.reset) }) else p(sink.io, "  {s}{s}{s}\n", .{ tone, owned, col(A.reset) });
+                if (sink.is_err) pe(sink.io, "  {s}{s}{s}\n", .{ tone, visible, col(A.reset) }) else p(sink.io, "  {s}{s}{s}\n", .{ tone, visible, col(A.reset) });
             }
         }
         sink.mu.lockUncancelable(sink.io);
