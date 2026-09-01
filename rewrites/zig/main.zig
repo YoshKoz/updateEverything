@@ -1142,6 +1142,13 @@ const github_release_body =
     \\  }
     \\}
     \\
+    \\function Get-AssetDigest($asset) {
+    \\  $d = $asset.digest
+    \\  if ([string]::IsNullOrWhiteSpace($d)) { return $null }
+    \\  if ($d -notmatch '^(?i)sha256:([0-9a-f]{64})$') { return $null }
+    \\  return $matches[1].ToLowerInvariant()
+    \\}
+    \\
     \\function Test-UpToDate($l, $r) {
     \\  $lk = Get-VersionKey $l
     \\  $rk = Get-VersionKey $r
@@ -1185,6 +1192,21 @@ const github_release_body =
     \\$tmp = Join-Path $env:TEMP $dl.name
     \\Write-Host "downloading $($dl.name)"
     \\Invoke-WebRequest -Uri $dl.browser_download_url -OutFile $tmp -Headers $hdr
+    \\
+    \\# GitHub returns `digest` as "sha256:<hex>" for assets uploaded since 2025.
+    \\# Nothing is extracted until it matches; an absent digest is reported, not assumed.
+    \\$expected = Get-AssetDigest $dl
+    \\if ($expected) {
+    \\  $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+    \\  if ($actual -ne $expected) {
+    \\    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    \\    Write-Host "checksum mismatch for $($dl.name): expected $expected, got $actual"
+    \\    exit 1
+    \\  }
+    \\  Write-Host "sha256 verified: $($dl.name)"
+    \\} else {
+    \\  Write-Host "unverified download: $($dl.name) (no digest published by the release API)"
+    \\}
     \\if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     \\if ($preCmd.Trim()) { Write-Host "pre-update: $preCmd"; & ([scriptblock]::Create($preCmd)) 2>&1 | Out-String | Write-Host }
     \\$dirFull = (Resolve-Path $dir).Path.TrimEnd('\') + '\'
@@ -3020,6 +3042,24 @@ fn dependsOn(task: Task, id: []const u8) bool {
         if (std.mem.eql(u8, dep, id)) return true;
     }
     return false;
+}
+
+test "release install verifies the asset digest before extracting" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const tool: GithubTool = .{ .repo = "x/y", .install_dir = "C:\\Tools\\y", .asset_regex = "\\.zip$" };
+    const args = githubReleaseInnerArgs(arena.allocator(), tool, false);
+    const script = args[args.len - 1];
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "Get-FileHash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "checksum mismatch") != null);
+    // The hash check has to sit between the download and the install.
+    const dl_at = std.mem.indexOf(u8, script, "Invoke-WebRequest").?;
+    const hash_at = std.mem.indexOf(u8, script, "Get-FileHash").?;
+    const install_at = std.mem.indexOf(u8, script, "function Install-Payload").?;
+    try std.testing.expect(dl_at < hash_at and hash_at < install_at);
 }
 
 test "release install only kills processes when allowed" {
