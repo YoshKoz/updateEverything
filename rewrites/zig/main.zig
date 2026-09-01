@@ -855,6 +855,8 @@ const Task = struct {
     /// Substrings that mark a failure as permanent for this run. Retrying an
     /// upstream mirror mismatch or a paused service just burns the backoff.
     no_retry_patterns: []const []const u8 = &.{},
+    /// Index in the task table; the summary sorts on it.
+    order: usize = 0,
 
     fn skipIf(self: Task, condition: bool, reason: []const u8) Task {
         var task = self;
@@ -874,6 +876,7 @@ const TaskSummary = struct {
     command: []const u8,
     args: []const []const u8,
     output_tail: [][]const u8,
+    order: usize = 0,
 };
 
 // ─── Script/args builders ────────────────────────────────────────────────────
@@ -2644,9 +2647,13 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     const uv_tools_skip: ?[]const u8 = if (cli.skip_uv_tools) "disabled by --skip-uv-tools" else null;
 
     var tasks: std.ArrayList(Task) = .empty;
+    // Definition order is the summary's sort key: tasks finish in whatever order the
+    // workers drain them, which made two runs impossible to diff.
     const add = struct {
         fn f(list: *std.ArrayList(Task), a: Allocator, task: Task) void {
-            list.append(a, task) catch @panic("oom");
+            var ordered = task;
+            ordered.order = list.items.len;
+            list.append(a, ordered) catch @panic("oom");
         }
     }.f;
 
@@ -3397,6 +3404,7 @@ fn makeSummary(
         .command = task.command,
         .args = task.args,
         .output_tail = output_tail,
+        .order = task.order,
     };
 }
 
@@ -3861,7 +3869,9 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
     }
 
     results.appendSlice(gpa, runner.results.items) catch @panic("oom");
-    return results.toOwnedSlice(gpa) catch @panic("oom");
+    const all = results.toOwnedSlice(gpa) catch @panic("oom");
+    sortByTaskOrder(all);
+    return all;
 }
 
 // ─── Output ──────────────────────────────────────────────────────────────────
@@ -3873,6 +3883,39 @@ fn printTaskList(gpa: Allocator, io: Io, tasks: []const Task) void {
     for (tasks) |task| {
         p(io, "{s: <26} {s: <20} {s}\n", .{ task.id, task.category, task.skip_reason orelse "planned" });
     }
+}
+
+fn sortByTaskOrder(results: []TaskSummary) void {
+    std.mem.sort(TaskSummary, results, {}, struct {
+        fn lessThan(_: void, a: TaskSummary, b: TaskSummary) bool {
+            return a.order < b.order;
+        }
+    }.lessThan);
+}
+
+test "sortByTaskOrder restores definition order" {
+    const mkSummary = struct {
+        fn f(id: []const u8, order: usize) TaskSummary {
+            return .{
+                .id = id,
+                .category = "test",
+                .status = "Succeeded",
+                .duration_ms = 0,
+                .exit_code = 0,
+                .command = "x",
+                .args = &.{},
+                .output_tail = &.{},
+                .order = order,
+            };
+        }
+    }.f;
+
+    // Completion order: a long task defined first can land last.
+    var results = [_]TaskSummary{ mkSummary("npm", 2), mkSummary("winget-source", 0), mkSummary("bun", 1) };
+    sortByTaskOrder(&results);
+    try std.testing.expectEqualStrings("winget-source", results[0].id);
+    try std.testing.expectEqualStrings("bun", results[1].id);
+    try std.testing.expectEqualStrings("npm", results[2].id);
 }
 
 fn countStatus(results: []const TaskSummary, status: []const u8) usize {
