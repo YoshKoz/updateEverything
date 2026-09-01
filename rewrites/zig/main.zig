@@ -363,6 +363,9 @@ const Cli = struct {
     update_ollama_models: bool = false,
     update_powershell_help: bool = false,
     update_github_tools: bool = true,
+    /// gh-notify-releases reports by default; installing from a release notification
+    /// is opt-in because the repo->package mapping can only ever be a guess.
+    notify_apply: bool = false,
     bypass_protection: bool = false,
     winget_timeout_sec: u64 = 600,
     ollama_timeout_sec: u64 = 600,
@@ -425,6 +428,7 @@ const help_text =
     \\      --update-ollama-models
     \\      --update-powershell-help
     \\      --update-github-tools   [default: on]
+    \\      --notify-apply          install mapped packages found by gh-notify-releases [default: report only]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
     \\      --ollama-timeout-sec <OLLAMA_TIMEOUT_SEC>   [default: 600]
@@ -592,6 +596,8 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             cli.update_powershell_help = true;
         } else if (std.mem.eql(u8, name, "update-github-tools")) {
             cli.update_github_tools = true;
+        } else if (std.mem.eql(u8, name, "notify-apply")) {
+            cli.notify_apply = true;
         } else if (std.mem.eql(u8, name, "bypass-protection")) {
             cli.bypass_protection = true;
         } else if (std.mem.eql(u8, name, "winget-timeout-sec")) {
@@ -664,6 +670,15 @@ const Config = struct {
     log_retention_days: u32 = 14,
     github_tools: []const GithubTool = &.{},
     github_notification_ignore: []const []const u8 = &.{},
+    github_notification_packages: []const NotifyPackage = &.{},
+};
+
+/// Explicit repo -> package mapping for gh-notify-releases. Without an entry a
+/// release notification is only reported, never acted on.
+const NotifyPackage = struct {
+    repo: []const u8 = "",
+    npm: ?[]const u8 = null,
+    winget: ?[]const u8 = null,
 };
 
 fn jsonStringArray(gpa: Allocator, value: ?std.json.Value) []const []const u8 {
@@ -762,6 +777,20 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
         if (v == .object) config.cross_manager_fallback = jsonToString(gpa, v);
     }
     config.github_notification_ignore = jsonStringArray(gpa, obj.get("GithubNotificationIgnore"));
+    if (obj.get("GithubNotificationPackages")) |v| {
+        if (v == .array) {
+            var pkgs: std.ArrayList(NotifyPackage) = .empty;
+            for (v.array.items) |item| {
+                if (item != .object) continue;
+                pkgs.append(gpa, .{
+                    .repo = jsonString(gpa, item.object.get("Repo")) orelse "",
+                    .npm = jsonString(gpa, item.object.get("Npm")),
+                    .winget = jsonString(gpa, item.object.get("Winget")),
+                }) catch @panic("oom");
+            }
+            config.github_notification_packages = pkgs.toOwnedSlice(gpa) catch @panic("oom");
+        }
+    }
     if (obj.get("GithubTools")) |v| {
         if (v == .array) {
             var tools: std.ArrayList(GithubTool) = .empty;
@@ -1231,47 +1260,44 @@ const github_notify_body =
     \\  if (-not $seen.Contains($p[0])) { $seen[$p[0]] = $p[1] }
     \\}
     \\if ($seen.Count -eq 0) { Write-Host "no release notifications"; exit 0 }
-    \\$wl = (& winget list --disable-interactivity --accept-source-agreements 2>$null | Out-String).ToLowerInvariant()
-    \\$npmRaw = (& npm ls -g --depth=0 2>$null | Out-String)
-    \\$npm = $npmRaw.ToLowerInvariant()
-    \\# Pending winget upgrades, used to resolve a package Id for a repo name.
-    \\$upRaw = (& winget upgrade --include-unknown --disable-interactivity --accept-source-agreements 2>$null | Out-String)
     \\foreach ($repo in $seen.Keys) {
     \\  if ($repo -in $ignored) { continue }
     \\  $rel = $seen[$repo]
-    \\  $name = ($repo -split '/')[-1].ToLowerInvariant()
     \\  if ($managed -contains $repo) { Write-Host "managed   $repo  $rel  (GithubTools task)"; continue }
     \\  if ($known.Contains($repo)) { Write-Host "managed   $repo  $rel  ($($known[$repo]))"; continue }
-    \\  if ($npm.Contains("/$name@") -or $npm.Contains(" $name@")) {
-    \\    $pkg = $null
-    \\    foreach ($l in ($npmRaw -split "`n")) {
-    \\      if ($l -match '((?:@[^@\s/]+/)?[^@\s]+)@[^\s]+\s*$' -and $matches[1].ToLowerInvariant().EndsWith($name)) { $pkg = $matches[1]; break }
-    \\    }
-    \\    if ($pkg) {
-    \\      Write-Host "npm       $repo  $rel  -> npm i -g $pkg@latest"
-    \\      & npm install -g "$pkg@latest" 2>&1 | Out-String | Write-Host
-    \\    } else { Write-Host "npm       $repo  $rel  (package name not resolved)" }
+    \\  # Only an explicit mapping may drive an install. Matching a repo name against
+    \\  # `winget list` / `npm ls` output by substring upgraded the wrong package.
+    \\  if (-not $pkgMap.Contains($repo)) {
+    \\    Write-Host "UNMAPPED  $repo  $rel  https://github.com/$repo/releases"
     \\    continue
     \\  }
-    \\  if ($wl.Contains($name)) {
-    \\    $id = $null
-    \\    foreach ($l in ($upRaw -split "`n")) {
-    \\      if ($l.ToLowerInvariant().Contains($name) -and $l -match '\s([\w.\-]+\.[\w.\-]+)\s') { $id = $matches[1]; break }
-    \\    }
-    \\    if ($id) {
-    \\      Write-Host "winget    $repo  $rel  -> winget upgrade --id $id"
-    \\      & winget upgrade --id $id --exact --include-unknown --disable-interactivity --accept-package-agreements --accept-source-agreements 2>&1 | Out-String | Write-Host
-    \\    } else { Write-Host "winget    $repo  $rel  (no pending upgrade)" }
+    \\  $m = $pkgMap[$repo]
+    \\  if ($m.npm) {
+    \\    if (-not $apply) { Write-Host "npm       $repo  $rel  -> npm i -g $($m.npm)@latest  (report only; use --notify-apply)"; continue }
+    \\    Write-Host "npm       $repo  $rel  -> npm i -g $($m.npm)@latest"
+    \\    & npm install -g "$($m.npm)@latest" 2>&1 | Out-String | Write-Host
     \\    continue
     \\  }
-    \\  Write-Host "UNMANAGED $repo  $rel  https://github.com/$repo/releases"
+    \\  if ($m.winget) {
+    \\    if (-not $apply) { Write-Host "winget    $repo  $rel  -> winget upgrade --id $($m.winget)  (report only; use --notify-apply)"; continue }
+    \\    Write-Host "winget    $repo  $rel  -> winget upgrade --id $($m.winget)"
+    \\    & winget upgrade --id $m.winget --exact --include-unknown --disable-interactivity --accept-package-agreements --accept-source-agreements 2>&1 | Out-String | Write-Host
+    \\    continue
+    \\  }
+    \\  Write-Host "UNMAPPED  $repo  $rel  https://github.com/$repo/releases"
     \\}
     \\
 ;
 
 /// Scan GitHub release notifications (subscribed repos) and report which are
 /// covered by GithubTools, which winget tracks, and which are unmanaged.
-fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool, ignored: []const []const u8) []const []const u8 {
+fn githubNotifyArgs(
+    gpa: Allocator,
+    tools: []const GithubTool,
+    ignored: []const []const u8,
+    packages: []const NotifyPackage,
+    apply: bool,
+) []const []const u8 {
     var list: std.ArrayList(u8) = .empty;
     list.appendSlice(gpa, "$managed = @(") catch @panic("oom");
     for (tools, 0..) |tool, i| {
@@ -1283,6 +1309,20 @@ fn githubNotifyArgs(gpa: Allocator, tools: []const GithubTool, ignored: []const 
     list.appendSlice(gpa, ")\n$ignored = @(") catch @panic("oom");
     list.appendSlice(gpa, psList(gpa, ignored, ", ")) catch @panic("oom");
     list.appendSlice(gpa, ")\n") catch @panic("oom");
+    list.appendSlice(gpa, if (apply) "$apply = $True\n" else "$apply = $False\n") catch @panic("oom");
+    list.appendSlice(gpa, "$pkgMap = [ordered]@{}\n") catch @panic("oom");
+    for (packages) |pkg| {
+        if (pkg.repo.len == 0) continue;
+        list.appendSlice(gpa, concat(gpa, &.{
+            "$pkgMap['",
+            pkg.repo,
+            "'] = @{ npm = ",
+            if (pkg.npm) |v| concat(gpa, &.{ "'", v, "'" }) else "$null",
+            "; winget = ",
+            if (pkg.winget) |v| concat(gpa, &.{ "'", v, "'" }) else "$null",
+            " }\n",
+        })) catch @panic("oom");
+    }
     const script = concat(gpa, &.{
         "$ErrorActionPreference = 'Stop'\n",
         list.items,
@@ -2907,7 +2947,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
             .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
         }));
     }
-    add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools, config.github_notification_ignore)), .{
+    add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools, config.github_notification_ignore, config.github_notification_packages, cli.notify_apply)), .{
         .requires = "gh",
         .timeout_sec = 180,
         .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
@@ -2941,6 +2981,27 @@ fn dependsOn(task: Task, id: []const u8) bool {
         if (std.mem.eql(u8, dep, id)) return true;
     }
     return false;
+}
+
+test "gh-notify-releases reports without installing unless asked" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const packages = [_]NotifyPackage{.{ .repo = "google-gemini/gemini-cli", .npm = "@google/gemini-cli" }};
+
+    const off = githubNotifyArgs(a, &.{}, &.{}, &packages, false);
+    const off_script = off[off.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, off_script, "$apply = $False") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off_script, "$pkgMap['google-gemini/gemini-cli']") != null);
+
+    const on = githubNotifyArgs(a, &.{}, &.{}, &packages, true);
+    try std.testing.expect(std.mem.indexOf(u8, on[on.len - 1], "$apply = $True") != null);
+
+    // The substring guesswork that upgraded packages by repo-name match is gone.
+    try std.testing.expect(std.mem.indexOf(u8, off_script, "$wl.Contains($name)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, off_script, "$npm.Contains(") == null);
 }
 
 test "uv-tools waits for the uv self-update" {
