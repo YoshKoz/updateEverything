@@ -1501,7 +1501,17 @@ const winget_per_package_body =
     \\
     \\    if ($tolerated -contains $code) { $skipped += ("{0} ({1})" -f $id, $code) }
     \\    elseif ($manual -contains $code) { $needsManual += ("{0} ({1})" -f $id, $code) }
-    \\    else { $failed += ("{0} ({1})" -f $id, $code) }
+    \\    else {
+    \\        # Bootstrapper installers (electron/todesktop-style) sometimes fail an in-place
+    \\        # upgrade because they can't remove their own old files (generic exit code 2), but
+    \\        # a clean uninstall then install succeeds. Try that once before giving up.
+    \\        Write-Output ("{0}: upgrade returned {1}; retrying as uninstall+install" -f $id, $code)
+    \\        winget uninstall --id $id --exact --source winget --accept-source-agreements --disable-interactivity | Out-Null
+    \\        winget install --id $id --exact --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
+    \\        $code3 = $LASTEXITCODE
+    \\        if ($code3 -eq 0) { $forced += $id }
+    \\        else { $failed += ("{0} ({1}, reinstall {2})" -f $id, $code, $code3) }
+    \\    }
     \\}
     \\Write-Output ("upgraded ({0}): {1}" -f $ok.Count, ($ok -join ', '))
     \\Write-Output ("upgraded via forced install ({0}): {1}" -f $forced.Count, ($forced -join ', '))
@@ -2707,6 +2717,14 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .depends_on = &.{ "winget-pin-skip", "winget-git" },
     }));
     // A single per-package pass is authoritative; duplicate passes can replay stale entries.
+    // Elevated winget refuses to upgrade user-scope (zip/portable) packages, so a
+    // de-elevated second pass is the only way to reach them.
+    add(&tasks, gpa, with(mk("winget-userscope", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, wingetUserscopeScript(gpa, config.winget_skip_packages))), .{
+        .resource = "winget",
+        .timeout_sec = cli.winget_timeout_sec,
+        .requires = "winget",
+        .codes = &winget_ok_codes,
+    }));
     add(&tasks, gpa, with(mk("winget-pin-audit", "package-manager", &.{ "windows", "winget" }, "winget", &.{ "pin", "list" }), .{
         .codes = &winget_ok_codes,
     }));

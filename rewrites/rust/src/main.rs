@@ -465,7 +465,11 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                     break;
                 }
                 let delay = Duration::from_secs(3 * (1u64 << attempt.min(4)));
-                eprintln!("retry {attempt}/{retry_count} {} (waiting {}s)", task.id, delay.as_secs());
+                eprintln!(
+                    "retry {attempt}/{retry_count} {} (waiting {}s)",
+                    task.id,
+                    delay.as_secs()
+                );
                 thread::sleep(delay);
                 r = run_task_streaming(&task, cli.quiet, timeout, false, &HashMap::new());
             }
@@ -541,7 +545,11 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                             break;
                         }
                         let delay = Duration::from_secs(3 * (1u64 << attempt.min(4)));
-                        eprintln!("retry {attempt}/{retry_count} {} (waiting {}s)", task.id, delay.as_secs());
+                        eprintln!(
+                            "retry {attempt}/{retry_count} {} (waiting {}s)",
+                            task.id,
+                            delay.as_secs()
+                        );
                         thread::sleep(delay);
                         r = run_task_streaming(&task, quiet, timeout, true, &locks);
                     }
@@ -783,7 +791,13 @@ fn run_task_streaming(
         Some(c) if task.acceptable_exit_codes.contains(&c) => Some(0),
         other => other,
     };
-    make_summary(task, &status, duration_ms, reported_code, cap_output(all_lines, 300))
+    make_summary(
+        task,
+        &status,
+        duration_ms,
+        reported_code,
+        cap_output(all_lines, 300),
+    )
 }
 
 #[cfg(unix)]
@@ -3392,7 +3406,11 @@ fn print_summary(summary: &RunSummary) {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
         let secs = r.duration_ms as f64 / 1000.0;
-        let exit_color = if exit == "0" || exit == "-" { DIM } else { YELLOW };
+        let exit_color = if exit == "0" || exit == "-" {
+            DIM
+        } else {
+            YELLOW
+        };
         println!(
             "{:<26} {} {} {}",
             r.id,
@@ -3413,7 +3431,11 @@ fn print_summary(summary: &RunSummary) {
     let bad = |n: usize| if n > 0 { RED } else { DIM };
     println!(
         "{} total={total}  succeeded={}  failed={}  timed-out={}  skipped={}  dry={dry}  duration={}",
-        marker("■", "done ", if failed + timed_out > 0 { RED } else { GREEN }),
+        marker(
+            "■",
+            "done ",
+            if failed + timed_out > 0 { RED } else { GREEN }
+        ),
         paint(&succeeded.to_string(), GREEN),
         paint(&failed.to_string(), bad(failed)),
         paint(&timed_out.to_string(), bad(timed_out)),
@@ -3431,7 +3453,11 @@ fn command_exists(name: &str) -> bool {
 fn resolve_command_path(name: &str) -> Option<PathBuf> {
     if Path::new(name).components().count() > 1 {
         let p = Path::new(name);
-        return if p.exists() { Some(p.to_path_buf()) } else { None };
+        return if p.exists() {
+            Some(p.to_path_buf())
+        } else {
+            None
+        };
     }
 
     let path = env::var_os("PATH")?;
@@ -3444,7 +3470,14 @@ fn resolve_command_path(name: &str) -> Option<PathBuf> {
                     .collect::<Vec<_>>()
             })
             .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string(), ".ps1".to_string()])
+            .unwrap_or_else(|| {
+                vec![
+                    ".exe".to_string(),
+                    ".cmd".to_string(),
+                    ".bat".to_string(),
+                    ".ps1".to_string(),
+                ]
+            })
     } else {
         vec!["".to_string()]
     };
@@ -3480,7 +3513,8 @@ fn resolve_command_path(name: &str) -> Option<PathBuf> {
 /// Built once per process; `resolve_command_path` matches the old probe order by
 /// preferring the earliest PATH entry and, within it, the PATHEXT order.
 fn path_index(path: &std::ffi::OsStr) -> &'static HashMap<String, (usize, PathBuf)> {
-    static INDEX: std::sync::OnceLock<HashMap<String, (usize, PathBuf)>> = std::sync::OnceLock::new();
+    static INDEX: std::sync::OnceLock<HashMap<String, (usize, PathBuf)>> =
+        std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
         let mut map: HashMap<String, (usize, PathBuf)> = HashMap::new();
         for (position, dir) in env::split_paths(path).enumerate() {
@@ -3528,8 +3562,14 @@ fn new_task_command(program: &str) -> Command {
                 "powershell"
             };
             let mut c = Command::new(shell);
-            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-                .arg(path);
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(path);
             c
         }
         _ => Command::new(path),
@@ -3936,7 +3976,10 @@ fn print_update_summary(results: &[TaskSummary]) {
                             .trim()
                             .to_string();
                         let next = lines.get(i + 1).map_or("", |s| s.as_str());
-                        if !next.contains("Not applicable:") && !next.contains("FAILED:") && !pkg.is_empty() {
+                        if !next.contains("Not applicable:")
+                            && !next.contains("FAILED:")
+                            && !pkg.is_empty()
+                        {
                             // Only add if not already captured from table
                             if changes.iter().all(|c| !c.starts_with(pkg.as_str())) {
                                 changes.push(pkg);
@@ -3953,7 +3996,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                         && line.contains("->")
                     {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
@@ -3964,9 +4009,20 @@ fn print_update_summary(results: &[TaskSummary]) {
                         if !line.contains("upgraded 0/") {
                             changes.push(line.trim().to_string());
                         }
-                    } else if line.contains(" to ") && looks_like_version(line.split(" to ").next().unwrap_or("").split_whitespace().last().unwrap_or("")) {
+                    } else if line.contains(" to ")
+                        && looks_like_version(
+                            line.split(" to ")
+                                .next()
+                                .unwrap_or("")
+                                .split_whitespace()
+                                .last()
+                                .unwrap_or(""),
+                        )
+                    {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
@@ -3977,7 +4033,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                         let t = line.trim();
                         if t.len() < 120 && !t.starts_with("Package") {
                             changes.push(t.to_string());
-                            if changes.len() >= 10 { break; }
+                            if changes.len() >= 10 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -4003,7 +4061,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                                 .trim();
                             if !pkgs.is_empty() {
                                 changes.push(pkgs.to_string());
-                                if changes.len() >= 5 { break; }
+                                if changes.len() >= 5 {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -4011,7 +4071,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                     for line in lines {
                         if line.contains("Updated") && line.contains("->") {
                             changes.push(line.trim().to_string());
-                            if changes.len() >= 10 { break; }
+                            if changes.len() >= 10 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -4047,15 +4109,20 @@ fn print_update_summary(results: &[TaskSummary]) {
                         && line.chars().any(|c| c.is_ascii_digit())
                     {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
             "gh-extensions" => {
                 for line in lines {
-                    if line.contains("upgraded") || (line.contains("Updated") && line.contains("→")) {
+                    if line.contains("upgraded") || (line.contains("Updated") && line.contains("→"))
+                    {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
@@ -4067,7 +4134,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                         && line.chars().any(|c| c.is_ascii_digit())
                     {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
@@ -4077,7 +4146,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                         && line.chars().any(|c| c.is_ascii_digit())
                     {
                         changes.push(line.trim().to_string());
-                        if changes.len() >= 10 { break; }
+                        if changes.len() >= 10 {
+                            break;
+                        }
                     }
                 }
             }
@@ -4108,7 +4179,9 @@ fn print_update_summary(results: &[TaskSummary]) {
                         if t.len() < 120 && !t.is_empty() {
                             changes.push(t.to_string());
                             count += 1;
-                            if count >= 5 { break; }
+                            if count >= 5 {
+                                break;
+                            }
                         }
                     }
                 }

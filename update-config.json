@@ -1,6 +1,7 @@
 {
   "WingetSkipPackages": [
-    "charmbracelet.crush"
+    "charmbracelet.crush",
+    "Microsoft.Sysinternals.ProcessMonitor"
   ],
   "SkipManagers": [],
   "PipSkipPackages": [
@@ -8,12 +9,21 @@
   ],
   "GithubNotificationIgnore": [
     "jellyfin/jellyfin",
-    "pop-os/cosmic-epoch"
+    "pop-os/cosmic-epoch",
+    "dotnet/efcore"
   ],
   "GithubNotificationPackages": [
     {
       "Repo": "google-gemini/gemini-cli",
       "Npm": "@google/gemini-cli"
+    },
+    {
+      "Repo": "microsoft/PowerToys",
+      "Winget": "Microsoft.PowerToys"
+    },
+    {
+      "Repo": "openai/codex",
+      "Winget": "OpenAI.Codex"
     }
   ],
   "NpmSkipPackages": [
