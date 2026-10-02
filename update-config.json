@@ -1,7 +1,10 @@
 {
   "WingetSkipPackages": [
     "charmbracelet.crush",
-    "Microsoft.Sysinternals.ProcessMonitor"
+    "Microsoft.Sysinternals.ProcessMonitor",
+    "SDCC.SDCC",
+    "TheStellaTeam.Stella",
+    "VB-Audio.Voicemeeter.Banana"
   ],
   "SkipManagers": [],
   "PipSkipPackages": [
@@ -43,6 +46,7 @@
     },
     {
       "Repo": "ggml-org/llama.cpp",
+      "Disabled": true,
       "InstallDir": "C:\\Tools\\llama.cpp",
       "AssetRegex": "^llama-.*-bin-win-cuda.*x64\\.zip$",
       "VersionCmd": "& .\\llama-cli.exe --version",

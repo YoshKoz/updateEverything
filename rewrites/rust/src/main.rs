@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long, default_value_t = 1800)]
     task_timeout_sec: u64,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     jobs: usize,
 
     #[arg(long)]
@@ -149,9 +149,9 @@ struct Cli {
     #[arg(long)]
     update_powershell_help: bool,
 
-    /// Download latest GitHub-release binaries for tools in config.GithubTools (opt-in)
+    /// Skip GitHub-release binary updates for tools in config.GithubTools
     #[arg(long)]
-    update_github_tools: bool,
+    skip_github_tools: bool,
 
     /// Include apps protected by package managers in upgrades
     #[arg(long)]
@@ -235,6 +235,9 @@ struct Config {
 struct GithubTool {
     /// "owner/name", e.g. "ggml-org/llama.cpp" (also used for task id + marker)
     repo: String,
+    /// Keep the entry but never run it
+    #[serde(default)]
+    disabled: bool,
     /// Install directory to extract/copy into
     install_dir: String,
     /// Regex matched against release asset names to pick the download
@@ -344,6 +347,7 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| repo_root.join("update-config.json"));
     let config = load_config(&config_path)?;
+    warn_if_exe_stale(&repo_root);
 
     // Prevent concurrent runs (non-fatal: if lock fails we still continue)
     let _lock = ProcessLock::acquire(&state_dir);
@@ -393,6 +397,12 @@ fn main() -> Result<()> {
 
     if !cli.dry_run {
         print_update_summary(&summary.results);
+        if summary.results.iter().any(|r| r.id == "winget" && r.status != "Skipped") {
+            let left = winget_outdated();
+            if !left.is_empty() {
+                println!("still outdated in winget ({}): {}", left.len(), left.join(", "));
+            }
+        }
     }
 
     if cli.ci {
@@ -406,6 +416,46 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn warn_if_exe_stale(repo_root: &Path) {
+    let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    let (Ok(exe), src) = (env::current_exe(), repo_root.join("rewrites/rust/src/main.rs")) else {
+        return;
+    };
+    if let (Some(e), Some(s)) = (mtime(&exe), mtime(&src)) {
+        if s > e {
+            eprintln!(
+                "warn: {} is older than {}; rebuild with `cargo build --release` in rewrites/rust",
+                exe.display(),
+                src.display()
+            );
+        }
+    }
+}
+
+fn winget_outdated() -> Vec<String> {
+    let Ok(out) = Command::new("winget")
+        .args(["upgrade", "--include-unknown", "--disable-interactivity"])
+        .output()
+    else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(h) = lines.iter().position(|l| l.starts_with("Name") && l.contains("Id")) else {
+        return vec![];
+    };
+    let (Some(id_at), Some(ver_at)) = (lines[h].find("Id"), lines[h].find("Version")) else {
+        return vec![];
+    };
+    lines[h + 1..]
+        .iter()
+        .skip_while(|l| l.starts_with("---"))
+        .take_while(|l| !l.trim().is_empty() && !l.starts_with("The following") && !l.contains(" upgrades available"))
+        .filter(|l| l.len() > ver_at)
+        .map(|l| l[id_at..ver_at].trim().to_string())
+        .collect()
 }
 
 fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec<TaskSummary> {
@@ -422,7 +472,7 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                         paint(reason, GREY)
                     );
                 }
-                results.push(make_summary(task, "Skipped", 0, None, vec![]));
+                results.push(make_summary(task, "Skipped", 0, None, vec![reason.clone()]));
             } else {
                 println!(
                     "{} {:<22} {}",
@@ -452,7 +502,7 @@ fn run_tasks(tasks: Vec<Task>, cli: &Cli, jobs: usize, timeout: Duration) -> Vec
                 paint(reason, GREY)
             );
         }
-        results.push(make_summary(task, "Skipped", 0, None, vec![]));
+        results.push(make_summary(task, "Skipped", 0, None, vec![reason.to_string()]));
     }
 
     let retry_count = cli.retry_count;
@@ -923,7 +973,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             "package-manager",
             &["windows", "winget"],
             "cmd",
-            &["/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & exit 0"],
+            &["/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & taskkill /F /IM Discord.exe 2>nul & exit 0"],
         )
         .with_resource("winget"),
         // Git upgrades abort while any Git-shipped exe is running; Claude Code's
@@ -1501,7 +1551,7 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
         Task::new_vec("gitleaks", "security", &["security"], "python",
             github_version_check_args("gitleaks", &["version"], "gitleaks/gitleaks"))
             .with_requires("gitleaks"),
-        Task::new("trivy", "security", &["security"], "trivy", &["update"])
+        Task::new("trivy", "security", &["security"], "trivy", &["image", "--download-db-only", "--quiet"])
             .with_timeout(300)
             .with_resource("trivy"),
         // ── Static site ──────────────────────────────────────────────────────
@@ -1582,9 +1632,10 @@ fn build_tasks(config: &Config, cli: &Cli) -> Vec<Task> {
             )
             .with_resource("github-tools")
             .with_timeout(900)
+            .with_skip_if(tool.disabled, "disabled in update-config.json")
             .with_skip_if(
-                !cli.update_github_tools,
-                "opt-in: use --update-github-tools",
+                cli.skip_github_tools,
+                "disabled by --skip-github-tools",
             ),
         );
     }
@@ -2414,7 +2465,7 @@ if shutil.which("winget"):
         print("oh-my-posh checked via winget id JanDeDobbeleer.OhMyPosh.")
         sys.exit(0)
 # Standalone upgrade
-r2 = subprocess.run(["oh-my-posh", "upgrade"], capture_output=True, text=True)
+r2 = subprocess.run(["oh-my-posh", "upgrade", "--force"], capture_output=True, text=True)
 import re
 out = re.sub(r'\x1b\][^\a]*(\a|\x1b\\)', '', r2.stdout + r2.stderr).strip()
 if out:
@@ -2863,7 +2914,7 @@ try:
     ) as resp:
         data = json.loads(resp.read())
     latest = data["tag_name"].lstrip("v").strip()
-    current = "7.0.0"
+    current = "7.0.0-mega"
     print(f"Current: {current} | Latest: {latest}")
     if latest and latest != current:
         print(f"Update available: {current} → {latest}")
@@ -3420,6 +3471,22 @@ fn print_summary(summary: &RunSummary) {
         );
     }
     println!();
+
+    let mut missing: Vec<&str> = Vec::new();
+    let mut other_skips: Vec<String> = Vec::new();
+    for r in summary.results.iter().filter(|r| r.status == "Skipped") {
+        let reason = r.output_tail.first().map(String::as_str).unwrap_or("");
+        match reason.strip_prefix("missing command: ") {
+            Some(_) => missing.push(&r.id),
+            None => other_skips.push(format!("{} ({})", r.id, reason)),
+        }
+    }
+    if !missing.is_empty() {
+        println!("skipped, tool not installed: {}", missing.join(", "));
+    }
+    if !other_skips.is_empty() {
+        println!("skipped, other: {}", other_skips.join(", "));
+    }
 
     let total = summary.results.len();
     let succeeded = counts.get("Succeeded").copied().unwrap_or_default();
