@@ -1,4 +1,4 @@
-﻿#requires -version 7.0
+#requires -version 7.0
 <#
 .SYNOPSIS
     Updates common Windows 11 package managers, developer tools, runtimes, WSL distros, Defender, and maintenance tasks.
@@ -129,6 +129,14 @@ try
 } catch
 {
     Write-Verbose "Console encoding setup skipped: $($_.Exception.Message)"
+}
+
+# Snapshot the caller's parameters. Inside a function $PSBoundParameters holds that function's
+# own (empty) set, so the elevated re-launch below must read this snapshot instead -- otherwise
+# every switch (-DryRun, -Only, -Skip*, -FastMode, ...) was silently dropped on the elevated run.
+$script:InvocationParameters = @{}
+foreach ($entry in $PSBoundParameters.GetEnumerator())
+{ $script:InvocationParameters[$entry.Key] = $entry.Value
 }
 
 $script:Version = '7.0.0-mega'
@@ -1822,7 +1830,7 @@ fi
         { Write-Output "Configured pip package skip list: $($skipSet -join ', ')"
         }
 
-        $outdatedJson = (Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'pip', 'list', '--outdated', '--format=json') | Out-String).Trim()
+        $outdatedJson = (Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'pip', 'list', '--outdated', '--format=json') -StdoutOnly | Out-String).Trim()
         if ([string]::IsNullOrWhiteSpace($outdatedJson))
         { Write-Output 'No outdated pip packages found.'; return
         }
@@ -1928,7 +1936,10 @@ fi
                 $managedPathPattern = '\\(Python\d+\\Scripts|pipx\\venvs|Microsoft\\WinGet\\Packages|scoop\\apps|chocolatey\\lib|WindowsApps)\\'
                 $managedMessagePattern = '(standalone installation|managed install|installed through another package manager|self-update is only available|cannot be self-updated)'
 
-                $uvExe = 'uv'
+                # Resolve uv to a real path up front. The lock-holder recovery below derives the
+                # install directory with Split-Path -Parent, which yields '' for a bare command
+                # name; Join-Path then throws and the task fails before it can retry.
+                $uvExe = if ($uvPath) { $uvPath } else { 'uv' }
                 if ($uvPath -and $uvPath -match $managedPathPattern)
                 {
                     $standaloneCandidates = @(
@@ -1950,7 +1961,23 @@ fi
                     }
                 }
 
-                $result = Invoke-UpdateProcess -FilePath $uvExe -ArgumentList @('self', 'update') -SuccessExitCodes @(0, 1) -PassThru
+                try
+                {
+                    $result = Invoke-UpdateProcess -FilePath $uvExe -ArgumentList @('self', 'update') -SuccessExitCodes @(0, 1) -PassThru
+                } catch
+                {
+                    # uv cannot replace a binary it does not own -- a bundled/standalone install
+                    # held open by a running tool fails the rename. That is an environment
+                    # condition, not an updater defect: uv's tools and Pythons are still updated
+                    # by the uv-tools and uv-python tasks. Report it instead of failing the task.
+                    if ($_.Exception.Message -match 'Access is denied|being used by another process|failed to rename file')
+                    {
+                        Set-TaskStatus -Status 'Warn' -Reason 'uv self-update could not replace its own binary (owned by another installer, or held open). Update uv through that installer.'
+                        Write-Output $_.Exception.Message
+                        return
+                    }
+                    throw
+                }
                 $outText = (@($result.Output) | Out-String).Trim()
 
                 if ($outText -match $managedMessagePattern)
@@ -1967,7 +1994,17 @@ fi
                 if ($result.ExitCode -ne 0 -and $outText -match 'being used by another process')
                 {
                     $binDir = Split-Path -Parent $uvExe
-                    $targets = @('uv.exe', 'uvx.exe') | ForEach-Object { Join-Path $binDir $_ }
+                    if ([string]::IsNullOrWhiteSpace($binDir))
+                    {
+                        # $uvExe was a bare command name; resolve it before deriving the directory.
+                        $resolvedUv = Get-ToolCommandPath -Name 'uv'
+                        if ($resolvedUv)
+                        { $binDir = Split-Path -Parent $resolvedUv
+                        }
+                    }
+                    $targets = @('uv.exe', 'uvx.exe') |
+                        ForEach-Object { if ($binDir) { Join-Path $binDir $_ } } |
+                        Where-Object { $_ }
                     $holders = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $targets -contains $_.Path })
                     if ($holders.Count -gt 0)
                     {
@@ -2680,7 +2717,7 @@ fi
                     $versionOut = Invoke-UpdateProcess -FilePath 'trivy' -ArgumentList @('--version') -Retries 0
                     Write-Output ("Current trivy: {0}" -f ($versionOut | Select-Object -First 1 | Out-String).Trim())
                     Write-Output 'Upgrading trivy...'
-                    Invoke-UpdateProcess -FilePath 'trivy' -ArgumentList @('update') -Retries 1 -TimeoutSec 300
+                    Invoke-UpdateProcess -FilePath 'trivy' -ArgumentList @('image', '--download-db-only', '--quiet') -Retries 1 -TimeoutSec 300
                 } catch { Write-Output "trivy update skipped: $($_.Exception.Message)" }
             } -Tags @('security') -Resources @('trivy'))) | Out-Null
 
@@ -3313,7 +3350,8 @@ function Start-UpdateTaskJob
                 [int]$TimeoutSec = 0,
                 [int[]]$SuccessExitCodes = @(0),
                 [int]$Retries = 0,
-                [switch]$PassThru
+                [switch]$PassThru,
+                [switch]$StdoutOnly
             )
 
             $effectiveTimeoutSec = if ($TimeoutSec -gt 0)
@@ -3414,7 +3452,12 @@ function Start-UpdateTaskJob
                         $stderr = $stderrTask.GetAwaiter().GetResult()
                         $lastOutput = @()
                         $lastOutput += ConvertTo-OutputLines $stdout
-                        $lastOutput += ConvertTo-OutputLines $stderr
+                        # -StdoutOnly keeps stderr out of the payload for machine-readable output
+                        # (e.g. `pip list --format=json`), where one warning line on stderr
+                        # otherwise corrupts the parse. Failures still include stderr.
+                        if (-not $StdoutOnly -or -not ($SuccessExitCodes -contains $lastExitCode))
+                        { $lastOutput += ConvertTo-OutputLines $stderr
+                        }
                     }
                 } catch
                 {
@@ -3471,7 +3514,7 @@ function Start-UpdateTaskJob
         function Set-TaskStatus
         {
             param(
-                [ValidateSet('Succeeded', 'Warn', 'Partial', 'Failed')]
+                [ValidateSet('Succeeded', 'Warn', 'Partial', 'Skipped', 'Failed')]
                 [string]$Status,
                 [string]$Reason
             )
@@ -4064,7 +4107,7 @@ function Get-RunNotes
 
         if ($result.Id -eq 'trivy' -and $result.Status -in @('Failed', 'TimedOut'))
         {
-            Add-RunNote -Level Warning -Message "trivy: run 'trivy update' manually, or update via winget/scoop."
+            Add-RunNote -Level Warning -Message "trivy: run 'trivy image --download-db-only' manually, or update via winget/scoop."
         }
 
         if ($result.Id -eq 'self-update' -and $result.Status -eq 'Succeeded' -and $outputText -match 'Update available')
@@ -4166,7 +4209,7 @@ function Invoke-SelfElevation
     }
 
     $forwarded = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in $PSBoundParameters.GetEnumerator())
+    foreach ($entry in $script:InvocationParameters.GetEnumerator())
     {
         if ($entry.Key -eq 'AutoElevate')
         { continue

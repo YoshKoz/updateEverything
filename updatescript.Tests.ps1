@@ -467,7 +467,7 @@ Describe 'Split-SkippedTasksForDisplay' {
     }
 }
 
-# ── Initialize-RunStorage / Write-Log / Save-RunSummary ───────────────────────
+# ── Initialize-RunStorage / Write-UpdateLog / Save-RunSummary ──────────────────
 
 Describe 'Initialize-RunStorage' {
     It 'creates writable state and log directories' {
@@ -477,10 +477,10 @@ Describe 'Initialize-RunStorage' {
     }
 }
 
-Describe 'Write-Log' {
+Describe 'Write-UpdateLog' {
     It 'writes log lines with INFO level tag' {
         Initialize-RunStorage
-        Write-Log -Message 'test message' -Level Info
+        Write-UpdateLog -Message 'test message' -Level Info
         $content = Get-Content -LiteralPath $script:LogPath -Raw
         $content | Should -Match 'test message'
         $content | Should -Match '\[INFO\]'
@@ -488,7 +488,7 @@ Describe 'Write-Log' {
 
     It 'writes WARNING level tag' {
         Initialize-RunStorage
-        Write-Log -Message 'warn message' -Level Warning
+        Write-UpdateLog -Message 'warn message' -Level Warning
         $content = Get-Content -LiteralPath $script:LogPath -Raw
         $content | Should -Match '\[WARNING\]'
     }
