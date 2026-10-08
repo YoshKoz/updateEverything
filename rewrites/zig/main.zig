@@ -656,6 +656,8 @@ const GithubTool = struct {
     /// pwsh snippets run before extract / after marker write (e.g. stop/start a service).
     pre_update: ?[]const u8 = null,
     post_update: ?[]const u8 = null,
+    /// Keep the entry in config but never run it.
+    disabled: bool = false,
 };
 
 const Config = struct {
@@ -826,6 +828,7 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
                     .allow_process_kill = jsonBool(o.get("AllowProcessKill"), false),
                     .pre_update = jsonString(gpa, o.get("PreUpdate")),
                     .post_update = jsonString(gpa, o.get("PostUpdate")),
+                    .disabled = jsonBool(o.get("Disabled"), false),
                 }) catch @panic("oom");
             }
             config.github_tools = tools.toOwnedSlice(gpa) catch @panic("oom");
@@ -1728,6 +1731,27 @@ fn pipHealthArgs(gpa: Allocator, ignore_packages: []const []const u8) []const []
     return pyCmd(gpa, concat(gpa, &.{ pip_health_pre, pyList(gpa, ignore_packages, true), pip_health_post }));
 }
 
+const uv_tools_script =
+    \\
+    \\import os, subprocess, sys
+    \\tool_dir = subprocess.run(["uv", "tool", "dir"], capture_output=True, text=True).stdout.strip()
+    \\listing = subprocess.run(["uv", "tool", "list"], capture_output=True, text=True).stdout
+    \\tools = [l.split()[0] for l in listing.splitlines() if l.strip() and not l.startswith(("-", " "))]
+    \\if not tools:
+    \\    print("uv: no tools installed")
+    \\    sys.exit(0)
+    \\procs = running_paths()
+    \\busy = [t for t in tools if tool_dir and in_use(os.path.join(tool_dir, t), procs)]
+    \\if busy:
+    \\    print("deferred (in use by a running process): " + ", ".join(busy))
+    \\todo = [t for t in tools if t not in busy]
+    \\if not todo:
+    \\    sys.exit(0)
+    \\r = subprocess.run(["uv", "tool", "upgrade"] + todo)
+    \\sys.exit(r.returncode)
+    \\
+;
+
 const uv_self_update_script =
     \\
     \\import os, shutil, subprocess, sys, time
@@ -1850,6 +1874,26 @@ const uv_python_upgrade_script =
     \\
 ;
 
+/// Package updates replace files under running servers (MCP over stdio), which
+/// then die mid-session. Callers defer any package a live process runs from.
+const in_use_py =
+    \\
+    \\import shutil as _sh2, subprocess as _sp2
+    \\
+    \\def running_paths():
+    \\    ps = _sh2.which("pwsh") or "powershell"
+    \\    cmd = ("Get-CimInstance Win32_Process | ForEach-Object {"
+    \\           " [string]$_.ExecutablePath + ' ' + [string]$_.CommandLine }")
+    \\    r = _sp2.run([ps, "-NoProfile", "-NonInteractive", "-Command", cmd],
+    \\                 capture_output=True, text=True, errors="ignore")
+    \\    return [l.replace("/", "\\").lower() for l in (r.stdout or "").splitlines() if l.strip()]
+    \\
+    \\def in_use(prefix, lines):
+    \\    pre = prefix.replace("/", "\\").lower().rstrip("\\") + "\\"
+    \\    return any(pre in l for l in lines)
+    \\
+;
+
 const npm_upgrade_pre =
     \\
     \\import json, os, shutil, subprocess, sys
@@ -1887,6 +1931,13 @@ const npm_upgrade_post =
     \\if not pkgs:
     \\    print("npm: all global packages up to date")
     \\    sys.exit(0)
+    \\root = subprocess.run([npm, "root", "-g"], capture_output=True, text=True).stdout.strip()
+    \\if root:
+    \\    procs = running_paths()
+    \\    busy = [p for p in pkgs if in_use(os.path.join(root, p), procs)]
+    \\    if busy:
+    \\        print("deferred (in use by a running process): " + ", ".join(busy))
+    \\        pkgs = [p for p in pkgs if p not in busy]
     \\failed = []
     \\for p in pkgs:
     \\    rc = subprocess.run([npm, "install", "-g", p]).returncode
@@ -1898,7 +1949,7 @@ const npm_upgrade_post =
 ;
 
 fn npmUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8) []const []const u8 {
-    return pyCmd(gpa, concat(gpa, &.{ npm_upgrade_pre, pyList(gpa, skip_packages, false), npm_upgrade_post }));
+    return pyCmd(gpa, concat(gpa, &.{ in_use_py, npm_upgrade_pre, pyList(gpa, skip_packages, false), npm_upgrade_post }));
 }
 
 const oh_my_posh_script =
@@ -1923,13 +1974,19 @@ const oh_my_posh_script =
     \\            print(out)
     \\        print("oh-my-posh checked via winget id JanDeDobbeleer.OhMyPosh.")
     \\        sys.exit(0)
-    \\# Standalone upgrade
-    \\r2 = subprocess.run(["oh-my-posh", "upgrade"], capture_output=True, text=True)
     \\import re
-    \\out = re.sub(r'\x1b\][^\a]*(\a|\x1b\\)', '', r2.stdout + r2.stderr).strip()
+    \\def upgrade(*extra):
+    \\    r = subprocess.run(["oh-my-posh", "upgrade", *extra], capture_output=True, text=True, errors="ignore")
+    \\    out = re.sub(r'\x1b\][^\a]*(\a|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]', '', r.stdout + r.stderr)
+    \\    lines = [l.strip() for l in out.splitlines() if l.strip() and "Downloading" not in l]
+    \\    return r.returncode, "\n".join(lines)
+    \\# --force on every run reinstalls the same version; only force past the major-bump guard.
+    \\rc, out = upgrade()
+    \\if "major upgrade available" in out:
+    \\    rc, out = upgrade("--force")
     \\if out:
     \\    print(out)
-    \\sys.exit(r2.returncode)
+    \\sys.exit(rc)
     \\
 ;
 
@@ -2732,7 +2789,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     }));
     // Kill portable-app processes that hold their own exe before winget upgrade
     add(&tasks, gpa, with(mk("winget-pre", "package-manager", &.{ "windows", "winget" }, "cmd", &.{
-        "/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & exit 0",
+        "/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & taskkill /F /IM Discord.exe 2>nul & exit 0",
     }), .{ .resource = "winget" }));
     add(&tasks, gpa, with(mk("winget-git", "package-manager", &.{ "windows", "winget", "git" }, "pwsh", pwshCmd(gpa, winget_git_script)), .{
         .resource = "winget",
@@ -2873,7 +2930,8 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, mk("uv", "python", &.{"python"}, "python", pyCmd(gpa, concat(gpa, &.{ close_blockers_py, uv_self_update_script }))));
     // Must not overlap the `uv` task: that one has winget replace the uv shim, and a
     // spawn landing in that window dies with FileNotFound.
-    add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "uv", &.{ "tool", "upgrade", "--all" }), .{
+    add(&tasks, gpa, with(mk("uv-tools", "python", &.{"python"}, "python", pyCmd(gpa, concat(gpa, &.{ in_use_py, uv_tools_script }))), .{
+        .requires = "uv",
         .depends_on = &.{"uv"},
         .skip = uv_tools_skip,
     }));
@@ -3089,7 +3147,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         add(&tasks, gpa, with(mk(id, "github-tools", &.{ "github", "tools" }, "pwsh", githubReleaseArgs(gpa, tool, cli.force_kill)), .{
             .resource = "github-tools",
             .timeout_sec = 900,
-            .skip = if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
+            .skip = if (tool.disabled) "disabled in update-config.json" else if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
         }));
     }
     add(&tasks, gpa, with(mk("gh-notify-releases", "github-tools", &.{ "github", "tools", "report" }, "pwsh", githubNotifyArgs(gpa, config.github_tools, config.github_notification_ignore, config.github_notification_packages, cli.notify_apply)), .{
@@ -3773,12 +3831,56 @@ fn matchNoRetry(patterns: []const []const u8, lines: []const []const u8) ?[]cons
     return null;
 }
 
+/// Failures that no retry can fix: the command line itself is wrong.
+const global_no_retry = [_][]const u8{
+    "unknown command",
+    "is not recognized as",
+    "unrecognized arguments",
+    "No such command",
+};
+
 fn sameOutput(a: []const []const u8, b: []const []const u8) bool {
     if (a.len == 0 or a.len != b.len) return false;
     for (a, b) |x, y| {
-        if (!std.mem.eql(u8, x, y)) return false;
+        if (!sameIgnoringTimestamps(x, y)) return false;
     }
     return true;
+}
+
+/// Tools stamp each log line (`2026-10-08T12:56:04+02:00`), so two otherwise
+/// identical failures never compared equal and were retried to the limit.
+fn sameIgnoringTimestamps(x: []const u8, y: []const u8) bool {
+    var ix = std.mem.tokenizeAny(u8, x, " \t");
+    var iy = std.mem.tokenizeAny(u8, y, " \t");
+    while (true) {
+        const tx = nextNonTimestamp(&ix);
+        const ty = nextNonTimestamp(&iy);
+        if (tx == null or ty == null) return tx == null and ty == null;
+        if (!std.mem.eql(u8, tx.?, ty.?)) return false;
+    }
+}
+
+fn nextNonTimestamp(it: *std.mem.TokenIterator(u8, .any)) ?[]const u8 {
+    while (it.next()) |tok| {
+        if (!isTimestamp(tok)) return tok;
+    }
+    return null;
+}
+
+fn isTimestamp(tok: []const u8) bool {
+    var digits: usize = 0;
+    for (tok) |ch| {
+        if (std.ascii.isDigit(ch)) {
+            digits += 1;
+        } else if (std.mem.indexOfScalar(u8, ":-.+TZ/", ch) == null) return false;
+    }
+    return digits >= 6 and std.mem.indexOfScalar(u8, tok, ':') != null;
+}
+
+fn oneLine(gpa: Allocator, line: []const u8) [][]const u8 {
+    const out = gpa.alloc([]const u8, 1) catch @panic("oom");
+    out[0] = line;
+    return out;
 }
 
 test "matchNoRetry" {
@@ -3797,6 +3899,12 @@ test "sameOutput" {
     try std.testing.expect(!sameOutput(&a, &c));
     // No output is not evidence of a repeated failure.
     try std.testing.expect(!sameOutput(&.{}, &.{}));
+    const t1 = [_][]const u8{"2026-10-08T12:56:04+02:00\tFATAL\tFatal error\tunknown command"};
+    const t2 = [_][]const u8{"2026-10-08T12:56:12+02:00\tFATAL\tFatal error\tunknown command"};
+    try std.testing.expect(sameOutput(&t1, &t2));
+    const d1 = [_][]const u8{"downloaded 10 of 20"};
+    const d2 = [_][]const u8{"downloaded 12 of 20"};
+    try std.testing.expect(!sameOutput(&d1, &d2));
 }
 
 const Runner = struct {
@@ -3865,7 +3973,7 @@ const Runner = struct {
         var attempt: u32 = 1;
         while (attempt <= self.retry_count) : (attempt += 1) {
             if (!std.mem.eql(u8, result.status, "Failed") and !std.mem.eql(u8, result.status, "TimedOut")) break;
-            if (matchNoRetry(task.no_retry_patterns, result.output_tail)) |hit| {
+            if (matchNoRetry(task.no_retry_patterns, result.output_tail) orelse matchNoRetry(&global_no_retry, result.output_tail)) |hit| {
                 pe(self.io, "{s}{s} noretry{s} {s} {s}(permanent: {s}){s}\n", .{ col(A.yellow), G.skip, col(A.reset), task.id, col(A.grey), hit, col(A.reset) });
                 break;
             }
@@ -3905,7 +4013,7 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
         for (tasks) |task| {
             if (task.skip_reason) |reason| {
                 if (!cli.quiet) p(io, "{s}{s} skip{s} {s: <22} {s}{s}{s}\n", .{ col(A.grey), G.skip, col(A.reset), task.id, col(A.grey), reason, col(A.reset) });
-                results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, &.{})) catch @panic("oom");
+                results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, oneLine(gpa, reason))) catch @panic("oom");
             } else {
                 p(io, "{s}{s} dry {s} {s: <22} {s}{s} {s}{s}\n", .{ col(A.cyan), G.dry, col(A.reset), task.id, col(A.grey), task.command, shellJoinBrief(gpa, task.args), col(A.reset) });
                 results.append(gpa, makeSummary(gpa, task, "DryRun", 0, null, &.{})) catch @panic("oom");
@@ -3918,7 +4026,7 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
     for (tasks) |task| {
         if (task.skip_reason) |reason| {
             if (!cli.quiet) p(io, "{s}{s} skip{s} {s: <22} {s}{s}{s}\n", .{ col(A.grey), G.skip, col(A.reset), task.id, col(A.grey), reason, col(A.reset) });
-            results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, &.{})) catch @panic("oom");
+            results.append(gpa, makeSummary(gpa, task, "Skipped", 0, null, oneLine(gpa, reason))) catch @panic("oom");
         } else {
             to_run.append(gpa, task) catch @panic("oom");
         }
@@ -4030,6 +4138,20 @@ fn printSummary(gpa: Allocator, io: Io, results: []const TaskSummary, total_dura
         p(io, "{s}{s}{s}  {s: <26} {s}{s: <12}{s} {s: <8} {s}\n", .{ statusColor(r.status), statusGlyph(r.status), col(A.reset), r.id, statusColor(r.status), r.status, col(A.reset), secs, exit });
     }
     p(io, "\n", .{});
+
+    var missing: std.ArrayList([]const u8) = .empty;
+    var other: std.ArrayList([]const u8) = .empty;
+    for (results) |r| {
+        if (!std.mem.eql(u8, r.status, "Skipped")) continue;
+        const reason = if (r.output_tail.len > 0) r.output_tail[0] else "";
+        if (std.mem.startsWith(u8, reason, "missing command: ")) {
+            missing.append(gpa, r.id) catch @panic("oom");
+        } else {
+            other.append(gpa, fmtAlloc(gpa, "{s} ({s})", .{ r.id, reason })) catch @panic("oom");
+        }
+    }
+    if (missing.items.len > 0) p(io, "{s}skipped, tool not installed: {s}{s}\n", .{ col(A.grey), std.mem.join(gpa, ", ", missing.items) catch @panic("oom"), col(A.reset) });
+    if (other.items.len > 0) p(io, "{s}skipped, other: {s}{s}\n", .{ col(A.grey), std.mem.join(gpa, ", ", other.items) catch @panic("oom"), col(A.reset) });
 
     const failed = countStatus(results, "Failed");
     const timed_out = countStatus(results, "TimedOut");
@@ -4598,6 +4720,55 @@ fn scheduleTask(gpa: Allocator, io: Io, exe: []const u8, schedule_time: ?[]const
     p(io, "  exe: {s}\n", .{exe});
 }
 
+fn warnIfExeStale(gpa: Allocator, io: Io, repo_root: []const u8) void {
+    const exe = std.process.executablePathAlloc(io, gpa) catch return;
+    const src = joinPath(gpa, &.{ repo_root, "rewrites", "zig", "main.zig" });
+    const cwd = Io.Dir.cwd();
+    const e = cwd.statFile(io, exe, .{}) catch return;
+    const s = cwd.statFile(io, src, .{}) catch return;
+    if (s.mtime.compare(.gt, e.mtime)) {
+        pe(io, "{s}warn:{s} {s} is older than {s}; rebuild with `zig build` in rewrites/zig\n", .{ col(A.yellow), col(A.reset), exe, src });
+    }
+}
+
+/// Ids winget still lists as upgradable after the run; parsed from the fixed-width table.
+fn wingetOutdated(gpa: Allocator, io: Io) []const []const u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "winget", "upgrade", "--include-unknown", "--disable-interactivity" },
+    }) catch return &.{};
+    var ids: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, result.stdout, '\n');
+    var id_at: ?usize = null;
+    var ver_at: usize = 0;
+    while (it.next()) |raw| {
+        const line = lastProgressSegment(std.mem.trimEnd(u8, raw, "\r"));
+        if (id_at == null) {
+            if (std.mem.startsWith(u8, line, "Name")) {
+                id_at = std.mem.indexOf(u8, line, "Id");
+                ver_at = std.mem.indexOf(u8, line, "Version") orelse 0;
+                if (ver_at == 0) id_at = null;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "---")) continue;
+        if (std.mem.trim(u8, line, " ").len == 0 or std.mem.startsWith(u8, line, "The following") or
+            std.mem.indexOf(u8, line, " upgrades available") != null) break;
+        if (line.len <= ver_at) continue;
+        const id = std.mem.trim(u8, line[id_at.?..ver_at], " ");
+        if (id.len != 0) ids.append(gpa, id) catch @panic("oom");
+    }
+    return ids.items;
+}
+
+fn printLeftovers(gpa: Allocator, io: Io, results: []const TaskSummary) void {
+    for (results) |r| {
+        if (std.mem.eql(u8, r.id, "winget") and !std.mem.eql(u8, r.status, "Skipped")) break;
+    } else return;
+    const left = wingetOutdated(gpa, io);
+    if (left.len == 0) return;
+    p(io, "{s}still outdated in winget ({d}):{s} {s}\n", .{ col(A.yellow), left.len, col(A.reset), std.mem.join(gpa, ", ", left) catch @panic("oom") });
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
@@ -4638,6 +4809,7 @@ pub fn main(init: std.process.Init) !void {
     const state_dir = getStateDir(gpa, cli);
     const config_path = cli.config orelse joinPath(gpa, &.{ repo_root, "update-config.json" });
     const config = loadConfig(gpa, io, config_path);
+    warnIfExeStale(gpa, io, repo_root);
 
     // Prevent concurrent runs (non-fatal: if the lock fails we still continue)
     const lock_path = acquireLock(gpa, io, state_dir);
@@ -4672,7 +4844,10 @@ pub fn main(init: std.process.Init) !void {
 
     printSummary(gpa, io, results, duration_ms);
 
-    if (!cli.dry_run) printUpdateSummary(gpa, io, results);
+    if (!cli.dry_run) {
+        printUpdateSummary(gpa, io, results);
+        printLeftovers(gpa, io, results);
+    }
 
     if (cli.ci) {
         for (results) |r| {
