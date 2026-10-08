@@ -366,6 +366,9 @@ const Cli = struct {
     /// gh-notify-releases reports by default; installing from a release notification
     /// is opt-in because the repo->package mapping can only ever be a guess.
     notify_apply: bool = false,
+    allow_major: bool = false,
+    pip_apply: bool = false,
+    allow_nightly: bool = false,
     /// Let a GitHub-release install stop processes that block it, for every tool.
     force_kill: bool = false,
     bypass_protection: bool = false,
@@ -431,6 +434,9 @@ const help_text =
     \\      --update-powershell-help
     \\      --update-github-tools   [default: on]
     \\      --notify-apply          install mapped packages found by gh-notify-releases [default: report only]
+    \\      --allow-major           let oh-my-posh cross a major version [default: report only]
+    \\      --pip-apply             upgrade global pip packages [default: report only]
+    \\      --allow-nightly         install rolling-tag / CI-artifact GitHub tools [default: report only]
     \\      --force-kill            stop processes blocking a GitHub-release install [default: off]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
@@ -601,6 +607,12 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             cli.update_github_tools = true;
         } else if (std.mem.eql(u8, name, "notify-apply")) {
             cli.notify_apply = true;
+        } else if (std.mem.eql(u8, name, "allow-major")) {
+            cli.allow_major = true;
+        } else if (std.mem.eql(u8, name, "pip-apply")) {
+            cli.pip_apply = true;
+        } else if (std.mem.eql(u8, name, "allow-nightly")) {
+            cli.allow_nightly = true;
         } else if (std.mem.eql(u8, name, "force-kill")) {
             cli.force_kill = true;
         } else if (std.mem.eql(u8, name, "bypass-protection")) {
@@ -1058,6 +1070,8 @@ const gitlab_artifact_body =
     \\$local = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { $null }
     \\Write-Host "$repo  local=$local  latest=$latest"
     \\if ($local -eq $latest) { Write-Host 'up to date'; exit 0 }
+    \\if ($reportOnly) { Write-Host "update available: $local -> $latest  (report only; use --allow-nightly)"; exit 0 }
+
     \\
     \\$enc = [uri]::EscapeDataString($job)
     \\$url = "https://gitlab.com/api/v4/projects/$proj/jobs/artifacts/$ref/download?job=$enc"
@@ -1191,6 +1205,8 @@ const github_release_body =
     \\if (Test-UpToDate $local $latest) {
     \\  Write-Host "up to date"; exit 0
     \\}
+    \\if ($reportOnly) { Write-Host "update available: $local -> $latest  (report only; use --allow-nightly)"; exit 0 }
+
     \\
     \\$dl = $rel.assets | Where-Object { $_.name -match $assetRe } | Select-Object -First 1
     \\if (-not $dl) { Write-Host "no asset matched /$assetRe/"; exit 1 }
@@ -1301,11 +1317,25 @@ fn githubReleaseInnerArgs(gpa: Allocator, tool: GithubTool, force_kill: bool) []
 }
 
 /// Dispatch to the right provider builder for a managed tool.
-fn githubReleaseArgs(gpa: Allocator, tool: GithubTool, force_kill: bool) []const []const u8 {
+fn githubReleaseArgs(gpa: Allocator, tool: GithubTool, force_kill: bool, allow_nightly: bool) []const []const u8 {
     const provider = tool.provider orelse "github";
-    if (std.mem.eql(u8, provider, "gitlab")) return gitlabReleaseArgs(gpa, tool);
-    if (std.mem.eql(u8, provider, "gitlab-artifact")) return gitlabArtifactArgs(gpa, tool);
-    return githubReleaseInnerArgs(gpa, tool, force_kill);
+    const args = if (std.mem.eql(u8, provider, "gitlab"))
+        gitlabReleaseArgs(gpa, tool)
+    else if (std.mem.eql(u8, provider, "gitlab-artifact"))
+        gitlabArtifactArgs(gpa, tool)
+    else
+        githubReleaseInnerArgs(gpa, tool, force_kill);
+    const report_only = isNightly(tool) and !allow_nightly;
+    const out = gpa.dupe([]const u8, args) catch @panic("oom");
+    out[out.len - 1] = concat(gpa, &.{ if (report_only) "$reportOnly = $true\n" else "$reportOnly = $false\n", args[args.len - 1] });
+    return out;
+}
+
+/// Rolling tags and CI artifacts are untested builds; they are only reported by default.
+fn isNightly(tool: GithubTool) bool {
+    if (tool.tag != null) return true;
+    const provider = tool.provider orelse "github";
+    return std.mem.eql(u8, provider, "gitlab-artifact");
 }
 
 const github_notify_body =
@@ -1647,6 +1677,13 @@ const pip_upgrade_post =
     \\if not pkgs:
     \\    print("All pip packages up to date")
     \\    sys.exit(0)
+    \\# Upgrading every global package breaks pinned combinations; default is to report.
+    \\if not PIP_APPLY:
+    \\    for p in json.loads(r.stdout or "[]"):
+    \\        if p["name"].lower() not in skip:
+    \\            print(f"outdated {p['name']} {p['version']} -> {p['latest_version']}")
+    \\    print(f"pip: {len(pkgs)} outdated (report only; use --pip-apply)")
+    \\    sys.exit(0)
     \\failed = []
     \\# One pip process per package costs ~3s of interpreter+resolver startup each.
     \\# Upgrade them in a single resolve, and only fall back to the per-package loop
@@ -1670,9 +1707,10 @@ const pip_upgrade_post =
     \\
 ;
 
-fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8, state_dir: []const u8) []const []const u8 {
+fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8, state_dir: []const u8, apply: bool) []const []const u8 {
     const head = replaceAll(gpa, pip_upgrade_pre, "STATE_DIR_PLACEHOLDER", replaceAll(gpa, state_dir, "\"", ""));
-    return pyCmd(gpa, concat(gpa, &.{ head, pyList(gpa, skip_packages, true), pip_upgrade_post }));
+    const post = replaceAll(gpa, pip_upgrade_post, "PIP_APPLY", if (apply) "True" else "False");
+    return pyCmd(gpa, concat(gpa, &.{ head, pyList(gpa, skip_packages, true), post }));
 }
 
 const python_venvs_script =
@@ -1980,10 +2018,13 @@ const oh_my_posh_script =
     \\    out = re.sub(r'\x1b\][^\a]*(\a|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]', '', r.stdout + r.stderr)
     \\    lines = [l.strip() for l in out.splitlines() if l.strip() and "Downloading" not in l]
     \\    return r.returncode, "\n".join(lines)
-    \\# --force on every run reinstalls the same version; only force past the major-bump guard.
+    \\# A major bump can break prompt themes, so it only goes through with --allow-major.
     \\rc, out = upgrade()
     \\if "major upgrade available" in out:
-    \\    rc, out = upgrade("--force")
+    \\    if ALLOW_MAJOR:
+    \\        rc, out = upgrade("--force")
+    \\    else:
+    \\        out += "\n(report only; use --allow-major)"
     \\if out:
     \\    print(out)
     \\sys.exit(rc)
@@ -2911,7 +2952,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .skip = node_skip,
     }));
     // ── Python ───────────────────────────────────────────────────────────────
-    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli))));
+    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli), cli.pip_apply)));
     add(&tasks, gpa, mk("python-venvs", "python", &.{ "python", "venv" }, "python", pyCmd(gpa, python_venvs_script)));
     add(&tasks, gpa, with(mk("pip-health", "python", &.{ "python", "health" }, "python", pipHealthArgs(gpa, config.pip_ignore_health_packages)), .{
         .skip = if (cli.skip_pip_health) "disabled by --skip-pip-health" else null,
@@ -3033,7 +3074,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .requires = "yt-dlp",
     }));
     // ── Shell tools ──────────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("oh-my-posh", "shell", &.{"shell"}, "python", pyCmd(gpa, oh_my_posh_script)), .{
+    add(&tasks, gpa, with(mk("oh-my-posh", "shell", &.{"shell"}, "python", pyCmd(gpa, replaceAll(gpa, oh_my_posh_script, "ALLOW_MAJOR", if (cli.allow_major) "True" else "False"))), .{
         .requires = "oh-my-posh",
     }));
     add(&tasks, gpa, with(mk("starship", "shell", &.{"shell"}, "python", pyCmd(gpa, starship_script)), .{
@@ -3144,7 +3185,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
             break :blk it.first();
         };
         const id = concat(gpa, &.{ "gh-", name });
-        add(&tasks, gpa, with(mk(id, "github-tools", &.{ "github", "tools" }, "pwsh", githubReleaseArgs(gpa, tool, cli.force_kill)), .{
+        add(&tasks, gpa, with(mk(id, "github-tools", &.{ "github", "tools" }, "pwsh", githubReleaseArgs(gpa, tool, cli.force_kill, cli.allow_nightly)), .{
             .resource = "github-tools",
             .timeout_sec = 900,
             .skip = if (tool.disabled) "disabled in update-config.json" else if (!cli.update_github_tools) "opt-in: use --update-github-tools" else null,
