@@ -46,3 +46,11 @@ rewrites/zig/.zig-cache/
 
 # Rust
 target/
+
+# Local tooling / audit working files (not part of the project)
+claude-work/
+.idea/
+.MyOllamaEnhancer/
+.clinerules
+*.code-workspace
+AUDIT-*.md

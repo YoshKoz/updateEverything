@@ -158,6 +158,35 @@ The scheduled task runs with `-SkipReboot -SkipWSL -SkipWindowsUpdate -Quiet` so
 | `fix_installer.ps1` | Repairs broken Windows Installer (MSI) source cache entries |
 | `force_reinstall.ps1` | Force-reinstalls a winget package when normal upgrade fails |
 
+## Native runner (Zig)
+
+`rewrites/zig/` is a single-binary port of the script that runs tasks in parallel with per-resource
+locks (winget, WSL, ...), retries transient failures, and prints a "What's Changed" summary.
+It reads the same `update-config.json`.
+
+```powershell
+cd rewrites\zig
+zig build -Doptimize=ReleaseSafe
+.\zig-out\bin\updateeverything-zig.exe --jobs 8
+.\zig-out\bin\updateeverything-zig.exe --list-tasks
+```
+
+Updates that tend to break things are reported, not installed, unless you opt in:
+
+| Flag | Opts in to |
+|------|------------|
+| `--pip-apply` | Upgrading global pip packages |
+| `--allow-major` | Oh My Posh major-version upgrades |
+| `--allow-nightly` | Rolling-tag and CI-artifact builds in `GithubTools` |
+| `--notify-apply` | Installing packages mapped from GitHub release notifications |
+
+**GitHub releases.** `GithubTools` entries download release assets straight from GitHub/GitLab
+(sha256-verified when GitHub publishes a digest). The `gh-notify-releases` task reads your GitHub
+release notifications and reports, per watched repo, which task keeps it current
+(`GithubNotificationPackages` with `Npm`, `Winget` or `Covered`) and which are unmapped.
+`GithubNotificationIgnore` silences repos you don't run on Windows.
+
+The Rust and Go ports under `rewrites/` are frozen and no longer receive fixes.
 ## License
 
 MIT. See [LICENSE](LICENSE).
