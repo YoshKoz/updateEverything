@@ -13,7 +13,15 @@
   "GithubNotificationIgnore": [
     "jellyfin/jellyfin",
     "pop-os/cosmic-epoch",
-    "dotnet/efcore"
+    "dotnet/efcore",
+    "NVIDIA-RTX/Streamline",
+    "NVIDIA/DLSS",
+    "coreos/rpm-ostree",
+    "ChrisTitusTech/winutil",
+    "ast-grep/ast-grep",
+    "sharkdp/hyperfine",
+    "twpayne/chezmoi",
+    "mozilla/sccache"
   ],
   "GithubNotificationPackages": [
     {
@@ -27,6 +35,42 @@
     {
       "Repo": "openai/codex",
       "Winget": "OpenAI.Codex"
+    },
+    {
+      "Repo": "junegunn/fzf",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "jesseduffield/lazygit",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "nushell/nushell",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "godotengine/godot",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "OpenRCT2/OpenRCT2",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "official-stockfish/Stockfish",
+      "Covered": "winget task"
+    },
+    {
+      "Repo": "microsoft/WSL",
+      "Covered": "wsl task"
+    },
+    {
+      "Repo": "cli/cli",
+      "Covered": "gh task"
+    },
+    {
+      "Repo": "Flow-Launcher/Flow.Launcher",
+      "Covered": "self-updating"
     }
   ],
   "NpmSkipPackages": [

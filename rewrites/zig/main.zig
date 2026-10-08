@@ -700,6 +700,8 @@ const NotifyPackage = struct {
     repo: []const u8 = "",
     npm: ?[]const u8 = null,
     winget: ?[]const u8 = null,
+    /// Name of the task or mechanism that already updates it; reported, never installed here.
+    covered: ?[]const u8 = null,
 };
 
 fn jsonStringArray(gpa: Allocator, value: ?std.json.Value) []const []const u8 {
@@ -812,6 +814,7 @@ fn loadConfig(gpa: Allocator, io: Io, path: []const u8) Config {
                     .repo = jsonString(gpa, item.object.get("Repo")) orelse "",
                     .npm = jsonString(gpa, item.object.get("Npm")),
                     .winget = jsonString(gpa, item.object.get("Winget")),
+                    .covered = jsonString(gpa, item.object.get("Covered")),
                 }) catch @panic("oom");
             }
             config.github_notification_packages = pkgs.toOwnedSlice(gpa) catch @panic("oom");
@@ -1340,7 +1343,7 @@ fn isNightly(tool: GithubTool) bool {
 
 const github_notify_body =
     \\
-    \\$raw = & gh api 'notifications?all=true&per_page=100' --jq '.[] | select(.subject.type=="Release") | .repository.full_name + "\t" + (.subject.title // "")' 2>&1
+    \\$raw = & gh api 'notifications?all=true&per_page=100' --paginate --jq '.[] | select(.subject.type=="Release") | .repository.full_name + "\t" + (.subject.title // "")' 2>&1
     \\if ($LASTEXITCODE -ne 0) {
     \\  if ("$raw" -match '(?i)(requires authentication|http 401|bad credentials)') {
     \\    Write-Host "SKIPPED: GitHub CLI is not authenticated"
@@ -1369,6 +1372,7 @@ const github_notify_body =
     \\    continue
     \\  }
     \\  $m = $pkgMap[$repo]
+    \\  if ($m.covered) { Write-Host "managed   $repo  $rel  ($($m.covered))"; continue }
     \\  if ($m.npm) {
     \\    if (-not $apply) { Write-Host "npm       $repo  $rel  -> npm i -g $($m.npm)@latest  (report only; use --notify-apply)"; continue }
     \\    Write-Host "npm       $repo  $rel  -> npm i -g $($m.npm)@latest"
@@ -1417,6 +1421,8 @@ fn githubNotifyArgs(
             if (pkg.npm) |v| concat(gpa, &.{ "'", v, "'" }) else "$null",
             "; winget = ",
             if (pkg.winget) |v| concat(gpa, &.{ "'", v, "'" }) else "$null",
+            "; covered = ",
+            if (pkg.covered) |v| concat(gpa, &.{ "'", replaceAll(gpa, v, "'", "''"), "'" }) else "$null",
             " }\n",
         })) catch @panic("oom");
     }
