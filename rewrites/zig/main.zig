@@ -1738,17 +1738,49 @@ const uv_self_update_script =
     \\    print("SKIPPED: uv is pip-managed; update handled by pip task.")
     \\    sys.exit(0)
     \\
-    \\def update():
-    \\    r = subprocess.run(["uv", "self", "update"], capture_output=True, text=True)
+    \\def update(exe="uv"):
+    \\    r = subprocess.run([exe, "self", "update"], capture_output=True, text=True)
     \\    return r, (r.stdout or "") + (r.stderr or "")
+    \\
+    \\bindir = os.path.dirname(uv)
+    \\names = ["uv.exe", "uvx.exe", "uvw.exe"]
+    \\for n in names:
+    \\    try:
+    \\        os.remove(os.path.join(bindir, n[:-4] + ".ue-old.exe"))
+    \\    except OSError:
+    \\        pass
+    \\
+    \\def rename_aside():
+    \\    moved = []
+    \\    for n in names:
+    \\        src = os.path.join(bindir, n)
+    \\        if os.path.exists(src):
+    \\            try:
+    \\                os.replace(src, src[:-4] + ".ue-old.exe")
+    \\                moved.append(src)
+    \\            except OSError:
+    \\                pass
+    \\    return moved
     \\
     \\r, out = update()
     \\print(out.strip())
     \\# `uv self update` replaces uvx.exe alongside uv.exe. Anything hosting a uvx
     \\# tool (commonly an MCP server) holds that file open and the installer fails.
-    \\# Close the holders by exact path and retry; whatever spawned them restarts them.
+    \\# Windows allows renaming a running exe, so move the locked files aside instead of
+    \\# killing live MCP servers; the .ue-old copies are removed on the next run.
     \\if r.returncode != 0 and "being used by another process" in out:
-    \\    closed = close_locking_processes(os.path.dirname(uv), ["uv.exe", "uvx.exe"])
+    \\    moved = rename_aside()
+    \\    if moved:
+    \\        print("renamed aside: " + ", ".join(os.path.basename(m) for m in moved))
+    \\        exe = os.path.join(bindir, "uv.ue-old.exe")
+    \\        r, out = update(exe if os.path.exists(exe) else "uv")
+    \\        print(out.strip())
+    \\        if r.returncode != 0:
+    \\            for m in moved:
+    \\                if not os.path.exists(m):
+    \\                    os.replace(m[:-4] + ".ue-old.exe", m)
+    \\if r.returncode != 0 and "being used by another process" in out:
+    \\    closed = close_locking_processes(bindir, names)
     \\    if closed:
     \\        time.sleep(2)
     \\        r, out = update()
@@ -2344,7 +2376,8 @@ const self_update_script =
     \\    latest = data["tag_name"].lstrip("v").strip()
     \\    current = "7.0.0"
     \\    print(f"Current: {current} | Latest: {latest}")
-    \\    if latest and latest != current:
+    \\    # Release tags carry a build-flavour suffix (7.0.0-mega); only the numeric part is a version.
+    \\    if latest and latest.split("-")[0] != current:
     \\        print(f"Update available: {current} → {latest}")
     \\        print(f"Download from: https://github.com/YoshKoz/updateEverything/releases/tag/v{latest}")
     \\    else:
@@ -2726,6 +2759,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .codes = &winget_ok_codes,
     }));
     add(&tasks, gpa, with(mk("winget-pin-audit", "package-manager", &.{ "windows", "winget" }, "winget", &.{ "pin", "list" }), .{
+        .resource = "winget",
         .codes = &winget_ok_codes,
     }));
     add(&tasks, gpa, with(mk("cross-manager", "package-manager", &.{ "windows", "winget", "scoop", "choco" }, "python", crossManagerArgs(gpa, config.cross_manager_fallback)), .{
@@ -3003,7 +3037,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, with(mk("gitleaks", "security", &.{"security"}, "python", githubVersionCheckArgs(gpa, "gitleaks", &.{"version"}, "gitleaks/gitleaks")), .{
         .requires = "gitleaks",
     }));
-    add(&tasks, gpa, with(mk("trivy", "security", &.{"security"}, "trivy", &.{"update"}), .{
+    add(&tasks, gpa, with(mk("trivy", "security", &.{"security"}, "trivy", &.{ "image", "--download-db-only", "--quiet" }), .{
         .timeout_sec = 300,
         .resource = "trivy",
     }));
