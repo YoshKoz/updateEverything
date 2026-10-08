@@ -5,8 +5,10 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 ## What this is
 
 `updateEverything` updates every package manager and dev toolchain on a Windows machine in one run.
-The shipping product is **one PowerShell script** (`updatescript.ps1`, ~4070 lines). Two experimental
-rewrites under `rewrites/` (`rust/`, `go/`) re-implement a subset each; neither is a replacement.
+The reference implementation is **one PowerShell script** (`updatescript.ps1`). The runner actually
+in use is the **Zig rewrite** (`rewrites/zig/main.zig`): the `Update-Everything` scheduled task runs
+`rewrites/zig/zig-out/bin/updateeverything-zig.exe`. The Rust (`rewrites/rust/`) and Go (`rewrites/go/`)
+rewrites are **frozen** — do not port new fixes to them.
 
 ## Commands
 
@@ -99,8 +101,9 @@ parameter names carry over.
 - PSScriptAnalyzer suppresses `PSAvoidUsingWriteHost`, `PSUseShouldProcessForStateChangingFunctions`,
   `PSUseApprovedVerbs`, empty-catch, etc. (see `PSScriptAnalyzerSettings.psd1`) — `Write-Host`,
   non-approved verbs, and intentional empty catches are accepted by design.
-- When parity matters, a change to an updater in `updatescript.ps1` should be reflected in the Rust
-  runner's corresponding `*_args`/`build_tasks` code (recent commits track "Rust parity").
+- A fix to an updater goes into the Zig runner (`taskTable` and the `*Args`/`*_script` helpers in
+  `rewrites/zig/main.zig`), mirrored in `updatescript.ps1` when parity matters. Rebuild with
+  `zig build -Doptimize=ReleaseSafe`; the exe warns at startup when it is older than `main.zig`.
 - Keep PS1 file encoding stable (commits have fought encoding regressions).
 - Helper scripts (`fix_installer.ps1`, `force_reinstall.ps1`, `bitwarden_cleanup.ps1`,
   `github-release-watcher.ps1`) are standalone, not part of the main flow.
