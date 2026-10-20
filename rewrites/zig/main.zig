@@ -1679,14 +1679,36 @@ const pip_upgrade_post =
     \\    json.dump(current, fh, indent=1)
     \\subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=False)
     \\r = subprocess.run([sys.executable, "-m", "pip", "list", "--outdated", "--format=json"], capture_output=True, text=True)
-    \\pkgs = [p["name"] for p in json.loads(r.stdout or "[]") if p["name"].lower() not in skip]
+    \\from importlib import metadata
+    \\from pip._vendor.packaging.requirements import Requirement
+    \\from pip._vendor.packaging.utils import canonicalize_name
+    \\# pip install -U ignores upper bounds declared by other installed packages, so an
+    \\# upgrade past one (huggingface-hub 2 under diffusers) silently breaks the dependent.
+    \\bounds = {}
+    \\for dist in metadata.distributions():
+    \\    for spec in dist.requires or []:
+    \\        try:
+    \\            req = Requirement(spec)
+    \\        except Exception:
+    \\            continue
+    \\        if req.specifier and not (req.marker and not req.marker.evaluate({"extra": ""})):
+    \\            bounds.setdefault(canonicalize_name(req.name), []).append((dist.metadata["Name"], req))
+    \\outdated = [p for p in json.loads(r.stdout or "[]") if p["name"].lower() not in skip]
+    \\pkgs = []
+    \\for p in outdated:
+    \\    blocker = next((f"{who} requires {req}" for who, req in bounds.get(canonicalize_name(p["name"]), [])
+    \\                    if not req.specifier.contains(p["latest_version"], prereleases=True)), None)
+    \\    if blocker:
+    \\        print(f"held {p['name']} {p['version']} (latest {p['latest_version']}): {blocker}")
+    \\    else:
+    \\        pkgs.append(p["name"])
     \\if not pkgs:
     \\    print("All pip packages up to date")
     \\    sys.exit(0)
     \\# Upgrading every global package breaks pinned combinations; default is to report.
     \\if not PIP_APPLY:
-    \\    for p in json.loads(r.stdout or "[]"):
-    \\        if p["name"].lower() not in skip:
+    \\    for p in outdated:
+    \\        if p["name"] in pkgs:
     \\            print(f"outdated {p['name']} {p['version']} -> {p['latest_version']}")
     \\    print(f"pip: {len(pkgs)} outdated (report only; use --pip-apply)")
     \\    sys.exit(0)
