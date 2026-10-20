@@ -534,11 +534,38 @@ Describe 'Save-RunSummary' {
         $json = Get-Content -LiteralPath $script:JsonSummaryPath -Raw | ConvertFrom-Json
         ($json.Notes | Where-Object { $_.Message -eq 'test note' }).Count | Should -Be 1
     }
+
+    It 'removes the checkpoint only after saving a completed summary' {
+        Initialize-RunStorage
+        $task = New-UpdateTask -Name 'checkpoint-complete' -Category 'test' -Script {}
+        $result = New-TaskResult -Task $task -Status 'Succeeded'
+        Save-RunCheckpoint -Results @($result)
+        $checkpoint = Join-Path $script:StateDir 'in-progress.json'
+        Test-Path -LiteralPath $checkpoint | Should -BeTrue
+        Save-RunSummary -Results @($result) -Skipped @() -Planned @($task) | Out-Null
+        Test-Path -LiteralPath $checkpoint | Should -BeFalse
+    }
 }
 
 # ── Invoke-TaskQueue ──────────────────────────────────────────────────────────
 
 Describe 'Invoke-TaskQueue' {
+    It 'checkpoints completed tasks without replacing the completed summary' {
+        Initialize-RunStorage
+        $checkpoint = Join-Path $script:StateDir 'in-progress.json'
+        if (Test-Path -LiteralPath $checkpoint) { Remove-Item -LiteralPath $checkpoint -Force }
+        Set-Content -LiteralPath $script:DefaultJsonSummaryPath -Value '{"RunId":"previous","Results":[]}'
+        $task = New-UpdateTask -Name 'checkpoint-test' -Category 'test' -Script { Write-Output 'completed' } -TimeoutSec 30
+        $results = Invoke-TaskQueue -Tasks @($task) -Throttle 1 -Confirm:$false
+        $results[0].Status | Should -Be 'Succeeded'
+        Test-Path -LiteralPath $checkpoint | Should -BeTrue
+        if (Test-Path -LiteralPath $checkpoint) {
+            $saved = Get-Content -LiteralPath $checkpoint -Raw | ConvertFrom-Json
+            $saved.Results[0].Id | Should -Be 'checkpoint-test'
+            $saved.Completed | Should -BeFalse
+        }
+        (Get-Content -LiteralPath $script:DefaultJsonSummaryPath -Raw).Trim() | Should -Be '{"RunId":"previous","Results":[]}'
+    }
     It 'runs a simple task and returns Succeeded' {
         $task = New-UpdateTask -Name 'self-test' -Category 'diagnostics' -Script { Write-Output 'ok' } -TimeoutSec 30
         $task | Add-Member -NotePropertyName Arguments -NotePropertyValue @{} -Force
@@ -590,6 +617,37 @@ Describe 'Invoke-TaskQueue' {
     }
 }
 
+Describe 'Confirm-WingetScan' {
+    It 'rejects unrecognized output rather than treating it as no upgrades' {
+        { Confirm-WingetScan -Output @('unexpected format') } | Should -Throw '*unrecognized upgrade output*'
+    }
+
+    It 'accepts a recognized empty result with pin information' {
+        { Confirm-WingetScan -Output @('No installed package found matching input criteria.', '2 package(s) have pins that prevent upgrade.') } | Should -Not -Throw
+    }
+}
+
+Describe 'Confirm-WuaResult' {
+    It 'rejects partial installation and reports actual installed count' {
+        $result = [pscustomobject]@{ ResultCode = 3; RebootRequired = $false }
+        $result | Add-Member ScriptMethod GetUpdateResult { param($index) [pscustomobject]@{ ResultCode = 4; HResult = -1 } }
+        $updates = [pscustomobject]@{ Count = 1 }
+        $updates | Add-Member ScriptMethod Item { param($index) [pscustomobject]@{ Title = 'Test update' } }
+        $output = @()
+        try { Confirm-WuaResult -Result $result -Updates $updates -Phase install | ForEach-Object { $output += $_ } } catch { $errorMessage = $_.Exception.Message }
+        $errorMessage | Should -Match 'incomplete'
+        ($output -join "`n") | Should -Match '0/1'
+    }
+
+    It 'accepts successful per-update results' {
+        $result = [pscustomobject]@{ ResultCode = 2; RebootRequired = $false }
+        $result | Add-Member ScriptMethod GetUpdateResult { param($index) [pscustomobject]@{ ResultCode = 2; HResult = 0 } }
+        $updates = [pscustomobject]@{ Count = 1 }
+        $updates | Add-Member ScriptMethod Item { param($index) [pscustomobject]@{ Title = 'Test update' } }
+        { Confirm-WuaResult -Result $result -Updates $updates -Phase install } | Should -Not -Throw
+    }
+}
+
 # ── Show-WhatChanged ──────────────────────────────────────────────────────────
 
 Describe 'Show-WhatChanged' {
@@ -622,14 +680,16 @@ Describe 'Show-WhatChanged' {
 
 Describe 'Script integration' {
     It 'runs SelfTest cleanly' {
-        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-SelfTest', '-NoElevate')
+        $stateDir = Join-Path $script:TestRoot 'selftest-state'
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-SelfTest', '-NoElevate', '-StateDir', $stateDir)
         $result.ExitCode | Should -Be 0
         $result.Output | Should -Match 'All runnable tasks completed'
         $result.Output | Should -Not -Match 'WARNING:'
     }
 
     It 'exits 0 and reports no tasks when -Only filter matches nothing' {
-        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-DryRun', '-NoElevate', '-Only', 'definitely-not-a-real-update-task')
+        $stateDir = Join-Path $script:TestRoot 'empty-filter-state'
+        $result = & $script:InvokeTestPwsh -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath, '-DryRun', '-NoElevate', '-Only', 'definitely-not-a-real-update-task', '-StateDir', $stateDir)
         $result.ExitCode | Should -Be 0
         $result.Output | Should -Match 'No runnable update tasks were found'
     }

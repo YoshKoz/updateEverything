@@ -11,6 +11,7 @@ const version = "0.2.0";
 extern "kernel32" fn GetExitCodeProcess(hProcess: windows.HANDLE, lpExitCode: *u32) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn TerminateProcess(hProcess: windows.HANDLE, uExitCode: c_uint) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: windows.BOOL, dwProcessId: u32) callconv(.winapi) ?windows.HANDLE;
 
 const SystemTime = extern struct {
     year: u16,
@@ -269,7 +270,7 @@ fn shellJoin(gpa: Allocator, args: []const []const u8) []const u8 {
 fn shellJoinBrief(gpa: Allocator, args: []const []const u8) []const u8 {
     var brief: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
-        if (std.mem.indexOfScalar(u8, arg, '\n') != null) {
+        if (std.mem.indexOfScalar(u8, arg, '\n') != null or arg.len > 240) {
             var count: usize = 0;
             var it = std.mem.splitScalar(u8, arg, '\n');
             while (it.next()) |line| {
@@ -437,7 +438,7 @@ const help_text =
     \\      --allow-major           let oh-my-posh cross a major version [default: report only]
     \\      --pip-apply             upgrade global pip packages [default: report only]
     \\      --allow-nightly         install rolling-tag / CI-artifact GitHub tools [default: report only]
-    \\      --force-kill            stop processes blocking a GitHub-release install [default: off]
+    \\      --force-kill            stop processes blocking winget/GitHub installs [default: off]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
     \\      --ollama-timeout-sec <OLLAMA_TIMEOUT_SEC>   [default: 600]
@@ -1453,12 +1454,18 @@ fn wingetPinSkipScript(gpa: Allocator, skip_packages: []const []const u8) []cons
 const winget_per_package_body =
     \\)
     \\$raw = winget upgrade --include-unknown --disable-interactivity 2>&1 | Out-String
+    \\$scanCode = $LASTEXITCODE
+    \\if ($scanCode -ne 0 -and $scanCode -notin @(-1978335189, -1978335212)) { Write-Output $raw.Trim(); Write-Output "winget: scan failed (exit $scanCode)"; exit 1 }
     \\$lines = $raw -split "`r?`n"
     \\$hdr = $null
     \\for ($i = 0; $i -lt $lines.Count; $i++) {
     \\    if ($lines[$i] -match '^Name\s+Id\s+Version') { $hdr = $i; break }
     \\}
-    \\if ($null -eq $hdr) { Write-Output 'winget: no upgrade table found'; exit 0 }
+    \\if ($null -eq $hdr) {
+    \\    Write-Output $raw.Trim()
+    \\    if ($raw -match 'No installed package found matching input criteria|No applicable upgrade found|No available upgrade found') { Write-Output 'SKIPPED: winget: no eligible upgrades; pinned packages remain excluded'; exit 0 }
+    \\    Write-Output 'winget: unrecognized upgrade output; cannot determine available upgrades'; exit 1
+    \\}
     \\$idStart = $lines[$hdr].IndexOf('Id')
     \\$verStart = $lines[$hdr].IndexOf('Version')
     \\$pkgs = @()
@@ -1477,8 +1484,11 @@ const winget_per_package_body =
     \\        $pkgs += [pscustomobject]@{ Id = $id; Name = $name }
     \\    }
     \\}
-    \\$pkgs = $pkgs | Sort-Object Id -Unique
+    \\$pkgs = @($pkgs | Sort-Object Id -Unique)
     \\Write-Output ("winget: {0} package(s) to upgrade" -f $pkgs.Count)
+    \\if ($pkgs.Count -eq 0) { Write-Output 'SKIPPED: winget: no eligible packages after filtering'; exit 0 }
+    \\$running = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    \\$deferred = @()
     \\
     \\# Registry install path for a display name, used to satisfy installers that demand
     \\# --location. Returns $null when the name matches zero or several entries.
@@ -1510,6 +1520,18 @@ const winget_per_package_body =
     \\$ok = @(); $forced = @(); $skipped = @(); $needsManual = @(); $failed = @()
     \\foreach ($pkg in $pkgs) {
     \\    $id = $pkg.Id
+    \\    $loc = Get-InstalledLocation $pkg.Name
+    \\    $busy = @($running | Where-Object {
+    \\        $path = [string]$_.ExecutablePath
+    \\        ($loc -and $path.StartsWith($loc.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+    \\        ([IO.Path]::GetFileNameWithoutExtension([string]$_.Name) -eq $pkg.Name) -or
+    \\        ($id -eq 'OpenAI.Codex' -and [string]$_.Name -match '^codex.*\.exe$')
+    \\    })
+    \\    if ($busy.Count -gt 0) {
+    \\        if (-not $forceKill) { Write-Output "deferred (in use): $id"; $deferred += $id; continue }
+    \\        Write-Output "stopping busy processes (--force-kill): $id"
+    \\        $busy | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+    \\    }
     \\    winget upgrade --id $id --exact --source winget --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
     \\    $code = $LASTEXITCODE
     \\    if ($code -eq 0) { $ok += $id; continue }
@@ -1557,6 +1579,7 @@ const winget_per_package_body =
     \\Write-Output ("not applicable ({0}): {1}" -f $skipped.Count, ($skipped -join ', '))
     \\Write-Output ("needs manual action ({0}): {1}" -f $needsManual.Count, ($needsManual -join ', '))
     \\Write-Output ("failed ({0}): {1}" -f $failed.Count, ($failed -join ', '))
+    \\if ($deferred.Count -eq $pkgs.Count) { Write-Output 'SKIPPED: winget: all eligible packages are in use' }
     \\if ($deferFailures) { exit 0 }
     \\if ($failed.Count -gt 0) { exit 1 }
     \\exit 0
@@ -1573,10 +1596,6 @@ const winget_per_package_body =
 fn wingetPerPackageScript(gpa: Allocator, skip_packages: []const []const u8, defer_failures: bool) []const u8 {
     const defer_line = if (defer_failures) @as([]const u8, "$deferFailures = $True\n") else @as([]const u8, "$deferFailures = $False\n");
     return concat(gpa, &.{ defer_line, "\n$skip = @(", psList(gpa, skip_packages, ", "), winget_per_package_body });
-}
-
-fn wingetUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8) []const []const u8 {
-    return pwshCmd(gpa, wingetPerPackageScript(gpa, skip_packages, false));
 }
 
 const store_apps_body =
@@ -2000,6 +2019,14 @@ const npm_upgrade_post =
     \\root = subprocess.run([npm, "root", "-g"], capture_output=True, text=True).stdout.strip()
     \\if root:
     \\    procs = running_paths()
+    \\    # ExecutablePath is usually node.exe for globally installed Node CLIs.
+    \\    # Include command lines so package entry points are recognized as in use.
+    \\    ps = shutil.which("pwsh") or shutil.which("powershell")
+    \\    if ps:
+    \\        query = "Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }"
+    \\        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", query],
+    \\                           capture_output=True, text=True, errors="ignore")
+    \\        procs.extend(l.lower() for l in (r.stdout or "").splitlines() if l.strip())
     \\    busy = [p for p in pkgs if in_use(os.path.join(root, p), procs)]
     \\    if busy:
     \\        print("deferred (in use by a running process): " + ", ".join(busy))
@@ -2070,9 +2097,9 @@ const vscode_extensions_script =
     \\# Capture, don't inherit: code leaves helper processes holding the parent's
     \\# stdout pipe, so the runner would wait on EOF forever.
     \\try:
-    \\    r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore", timeout=300)
+    \\    r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore", timeout=600)
     \\except subprocess.TimeoutExpired:
-    \\    print("code --update-extensions timed out after 300s")
+    \\    print("code --update-extensions timed out after 600s")
     \\    sys.exit(1)
     \\out = (r2.stdout or "").strip()
     \\if not out:
@@ -2591,19 +2618,45 @@ const winget_userscope_post =
 
 /// Elevated winget refuses to upgrade user-scope (zip/portable) packages, so
 /// re-run the same per-package loop de-elevated via `runas /trustlevel:0x20000`.
-fn wingetUserscopeScript(gpa: Allocator, skip_packages: []const []const u8) []const u8 {
-    return concat(gpa, &.{ winget_userscope_pre, wingetPerPackageScript(gpa, skip_packages, true), winget_userscope_post });
+fn wingetUserscopeScript(gpa: Allocator, skip_packages: []const []const u8, force_kill: bool) []const u8 {
+    return concat(gpa, &.{ winget_userscope_pre, if (force_kill) "$forceKill = $True\n" else "$forceKill = $False\n", wingetPerPackageScript(gpa, skip_packages, true), winget_userscope_post });
 }
 
-const windows_update_script = "$s=New-Object -ComObject Microsoft.Update.Session;" ++
-    "$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Software'\");" ++
-    "if($r.Updates.Count-eq 0){Write-Output 'Windows: no updates available.';return};" ++
-    "Write-Output \"Found $($r.Updates.Count) update(s). Downloading...\";" ++
-    "$d=New-Object -ComObject Microsoft.Update.Downloader;" ++
-    "$d.Updates=$r.Updates;$d.Download();" ++
-    "$i=New-Object -ComObject Microsoft.Update.Installer;" ++
-    "$i.Updates=$r.Updates;$ir=$i.Install();" ++
-    "Write-Output \"Windows Update: $($r.Updates.Count) update(s) installed. Reboot required: $($ir.RebootRequired)\"";
+const windows_update_script =
+    \\$ErrorActionPreference = 'Stop'
+    \\Write-Output 'Windows Update: searching for software updates...'
+    \\$s = New-Object -ComObject Microsoft.Update.Session
+    \\$s.ClientApplicationID = 'Update-Everything'
+    \\# wuauserv is trigger-start; a search that lands while it is shutting down fails with 0x8024001E.
+    \\for ($try = 1; ; $try++) {
+    \\    try { $r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Software'"); break }
+    \\    catch { if ($try -ge 3 -or $_.Exception.Message -notmatch '8024001E') { throw }; Start-Sleep 10 }
+    \\}
+    \\if ($r.ResultCode -ne 2) { throw "Windows Update search failed or incomplete: $($r.ResultCode)" }
+    \\if ($r.Updates.Count -eq 0) { Write-Output 'SKIPPED: Windows Update: no updates available'; return }
+    \\for ($n = 0; $n -lt $r.Updates.Count; $n++) {
+    \\    $update = $r.Updates.Item($n)
+    \\    Write-Output "Selected update: $($update.Title)"
+    \\    if (-not $update.EulaAccepted) { $update.AcceptEula() }
+    \\}
+    \\Write-Output "Windows Update: downloading $($r.Updates.Count) update(s)..."
+    \\$d = $s.CreateUpdateDownloader(); $d.Updates = $r.Updates; $dr = $d.Download()
+    \\for ($n = 0; $n -lt $r.Updates.Count; $n++) {
+    \\    $item = $dr.GetUpdateResult($n)
+    \\    if ($item.ResultCode -ne 2) { throw "Windows Update download failed: $($r.Updates.Item($n).Title), result $($item.ResultCode), HRESULT $($item.HResult)" }
+    \\}
+    \\if ($dr.ResultCode -ne 2) { throw "Windows Update download incomplete: $($dr.ResultCode)" }
+    \\Write-Output "Windows Update: installing $($r.Updates.Count) update(s)..."
+    \\$i = $s.CreateUpdateInstaller(); $i.Updates = $r.Updates; $ir = $i.Install()
+    \\$installed = 0
+    \\for ($n = 0; $n -lt $r.Updates.Count; $n++) {
+    \\    $item = $ir.GetUpdateResult($n)
+    \\    if ($item.ResultCode -eq 2) { $installed++ }
+    \\    else { Write-Output "Windows Update failed: $($r.Updates.Item($n).Title), result $($item.ResultCode), HRESULT $($item.HResult)" }
+    \\}
+    \\Write-Output "Windows Update: $installed/$($r.Updates.Count) update(s) installed. Reboot required: $($ir.RebootRequired)"
+    \\if ($ir.ResultCode -ne 2 -or $installed -ne $r.Updates.Count) { throw 'Windows Update installation failed or incomplete' }
+;
 
 const defender_script = "$mode = try { (Get-MpComputerStatus -ErrorAction Stop).AMRunningMode } catch { $null }; " ++
     "if ($mode -and $mode -ne 'Normal') { Write-Output \"Defender signature update skipped: AMRunningMode='$mode' (third-party AV active, Defender passive).\"; return }; " ++
@@ -2856,10 +2909,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .resource = "winget",
         .timeout_sec = 300,
     }));
-    // Kill portable-app processes that hold their own exe before winget upgrade
-    add(&tasks, gpa, with(mk("winget-pre", "package-manager", &.{ "windows", "winget" }, "cmd", &.{
-        "/c", "taskkill /F /IM codex-x86_64-pc-windows-msvc.exe 2>nul & taskkill /F /IM Discord.exe 2>nul & exit 0",
-    }), .{ .resource = "winget" }));
     add(&tasks, gpa, with(mk("winget-git", "package-manager", &.{ "windows", "winget", "git" }, "pwsh", pwshCmd(gpa, winget_git_script)), .{
         .resource = "winget",
         .timeout_sec = 900,
@@ -2869,7 +2918,8 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .resource = "winget",
         .timeout_sec = 300,
     }));
-    add(&tasks, gpa, with(mk("winget", "package-manager", &.{ "windows", "winget" }, "pwsh", wingetUpgradeArgs(gpa, config.winget_skip_packages)), .{
+    const force_kill_line = if (cli.force_kill) "$forceKill = $True\n" else "$forceKill = $False\n";
+    add(&tasks, gpa, with(mk("winget", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, concat(gpa, &.{ force_kill_line, wingetPerPackageScript(gpa, config.winget_skip_packages, false) }))), .{
         .resource = "winget",
         .timeout_sec = cli.winget_timeout_sec,
         .codes = &winget_ok_codes,
@@ -2878,7 +2928,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     // A single per-package pass is authoritative; duplicate passes can replay stale entries.
     // Elevated winget refuses to upgrade user-scope (zip/portable) packages, so a
     // de-elevated second pass is the only way to reach them.
-    add(&tasks, gpa, with(mk("winget-userscope", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, wingetUserscopeScript(gpa, config.winget_skip_packages))), .{
+    add(&tasks, gpa, with(mk("winget-userscope", "package-manager", &.{ "windows", "winget" }, "pwsh", pwshCmd(gpa, wingetUserscopeScript(gpa, config.winget_skip_packages, cli.force_kill))), .{
         .resource = "winget",
         .timeout_sec = cli.winget_timeout_sec,
         .requires = "winget",
@@ -3078,9 +3128,9 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     // ── Editor ───────────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("vscode-extensions", "editor", &.{"vscode"}, "python", pyCmd(gpa, vscode_extensions_script)), .{
         .requires = "code",
-        // The inner python already caps at 300s; this is the outer backstop so a
+        // The inner python already caps at 600s; this is the outer backstop so a
         // wedged `code` helper cannot hold the whole run for the 1800s default.
-        .timeout_sec = 360,
+        .timeout_sec = 900,
         .skip = if (cli.skip_vscode_extensions) "disabled by --skip-vscode-extensions" else null,
     }));
     // ── Dev tools ────────────────────────────────────────────────────────────
@@ -3993,6 +4043,15 @@ const Runner = struct {
     retry_count: u32,
     prefix_output: bool,
     taken: std.ArrayList(bool) = .empty,
+    checkpoint_path: []const u8,
+    started_at: []const u8,
+    started_ms: i64,
+
+    fn checkpoint(self: *Runner) void {
+        writeSummaryJson(self.gpa, self.io, self.checkpoint_path, self.started_at, @intCast(nowMs(self.io) - self.started_ms), false, self.results.items) catch |err| {
+            pe(self.io, "warn: could not save in-progress summary {s}: {t}\n", .{ self.checkpoint_path, err });
+        };
+    }
 
     /// Take the first queued task whose scheduled dependencies have all finished.
     /// Returns null when the queue is drained.
@@ -4063,6 +4122,7 @@ const Runner = struct {
         }
         self.results_mu.lockUncancelable(self.io);
         self.results.append(self.gpa, result) catch @panic("oom");
+        self.checkpoint();
         self.results_mu.unlock(self.io);
         self.queue_mu.lockUncancelable(self.io);
         if (task.resource.len != 0) _ = self.resource_busy.remove(task.resource);
@@ -4113,7 +4173,12 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
         .timeout_ms = timeout_ms,
         .retry_count = cli.retry_count,
         .prefix_output = jobs > 1,
+        .checkpoint_path = joinPath(gpa, &.{ getStateDir(gpa, cli), "in-progress.json" }),
+        .started_at = nowString(gpa),
+        .started_ms = nowMs(io),
     };
+    runner.results.appendSlice(gpa, results.items) catch @panic("oom");
+    runner.checkpoint();
     for (to_run.items) |task| {
         runner.taken.append(gpa, false) catch @panic("oom");
         runner.runnable.put(task.id, {}) catch @panic("oom");
@@ -4136,8 +4201,7 @@ fn runTasks(gpa: Allocator, io: Io, tasks: []const Task, cli: Cli, jobs: usize, 
         for (threads.items) |thread| thread.join();
     }
 
-    results.appendSlice(gpa, runner.results.items) catch @panic("oom");
-    const all = results.toOwnedSlice(gpa) catch @panic("oom");
+    const all = runner.results.toOwnedSlice(gpa) catch @panic("oom");
     sortByTaskOrder(all);
     return all;
 }
@@ -4292,7 +4356,10 @@ fn writeSummaryJson(
     if (std.fs.path.dirname(path)) |parent| {
         Io.Dir.cwd().createDirPath(io, parent) catch {};
     }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+    const temp_path = concat(gpa, &.{ path, ".tmp" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_path, .data = buf.items });
+    errdefer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try Io.Dir.cwd().rename(temp_path, Io.Dir.cwd(), path, io);
 }
 
 // ─── What's Changed summary ──────────────────────────────────────────────────
@@ -4726,6 +4793,11 @@ fn nowUnixMs(io: Io) i64 {
 
 /// Single-instance guard. Atomic exclusive create so two instances racing to
 /// start can't both observe "no lock" and both write their own PID.
+fn lockPid(text: []const u8) u32 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    return std.fmt.parseInt(u32, std.mem.trim(u8, lines.next() orelse "", " \t\r"), 10) catch 0;
+}
+
 fn acquireLock(gpa: Allocator, io: Io, state_dir: []const u8) ?[]const u8 {
     const path = joinPath(gpa, &.{ state_dir, "update-everything.lock" });
     Io.Dir.cwd().createDirPath(io, state_dir) catch {};
@@ -4741,7 +4813,7 @@ fn acquireLock(gpa: Allocator, io: Io, state_dir: []const u8) ?[]const u8 {
         } else |err| switch (err) {
             error.PathAlreadyExists => {
                 const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64)) catch "";
-                const pid = std.fmt.parseInt(u32, std.mem.trim(u8, text, " \t\r\n"), 10) catch 0;
+                const pid = lockPid(text);
                 if (pid != 0 and isPidRunning(gpa, io, pid)) {
                     pe(io, "warn: another instance is already running (PID {d}); exiting\n", .{pid});
                     std.process.exit(5);
@@ -4751,24 +4823,222 @@ fn acquireLock(gpa: Allocator, io: Io, state_dir: []const u8) ?[]const u8 {
             },
             // Can't create the lock file at all (e.g. permissions); run without
             // single-instance protection.
-            else => return null,
+            else => {
+                pe(io, "warn: could not acquire single-instance lock {s}: {t}; continuing without protection\n", .{ path, err });
+                return null;
+            },
         }
     }
     return null;
 }
 
 fn isPidRunning(gpa: Allocator, io: Io, pid: u32) bool {
-    const filter = fmtAlloc(gpa, "PID eq {d}", .{pid});
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "tasklist", "/FI", filter, "/NH", "/FO", "CSV" },
-    }) catch return false;
-    // tasklist CSV: header + one row per match; if only header, no match
-    var it = std.mem.splitScalar(u8, result.stdout, '\n');
-    _ = it.next();
-    while (it.next()) |line| {
-        if (std.mem.trim(u8, line, " \t\r").len != 0) return true;
+    _ = gpa;
+    _ = io;
+    if (pid == 0) return false;
+    const handle = OpenProcess(0x1000, .FALSE, pid) orelse {
+        // Access denied is not evidence that a protected process has exited.
+        return windows.GetLastError() == .ACCESS_DENIED;
+    };
+    defer windows.CloseHandle(handle);
+    var code: u32 = 0;
+    return GetExitCodeProcess(handle, &code) == .FALSE or code == still_active;
+}
+
+test "single-instance check recognizes the current process" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect(isPidRunning(arena.allocator(), std.testing.io, GetCurrentProcessId()));
+    try std.testing.expect(!isPidRunning(arena.allocator(), std.testing.io, 0));
+}
+
+test "lock PID parsing accepts the PowerShell run-id line" {
+    try std.testing.expectEqual(@as(u32, 1234), lockPid("1234\r\nrun-id\r\n"));
+    try std.testing.expectEqual(@as(u32, 1234), lockPid("1234"));
+    try std.testing.expectEqual(@as(u32, 0), lockPid("invalid"));
+}
+
+test "long single-line scripts do not bury the task echo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const script = try std.mem.concat(arena.allocator(), u8, &.{ "Write-Output '", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "'" });
+    const brief = shellJoinBrief(arena.allocator(), &.{ "-Command", script });
+    try std.testing.expect(brief.len < 100);
+    try std.testing.expect(std.mem.indexOf(u8, brief, "-Command") != null);
+}
+
+fn testPowerShell(gpa: Allocator, script: []const u8) !std.process.RunResult {
+    return std.process.run(gpa, std.testing.io, .{ .argv = &.{ "pwsh", "-NoProfile", "-NonInteractive", "-Command", script } });
+}
+
+test "PowerShell task wrapper stops after a nonterminating error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const argv = try std.mem.concat(gpa, []const u8, &.{ &.{"pwsh"}, pwshCmd(gpa, "Write-Error 'Access is denied.'; Write-Output 'incorrect success'") });
+    const result = try std.process.run(gpa, std.testing.io, .{ .argv = argv });
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "incorrect success") == null);
+}
+
+test "WSL enumeration errors are never used as distro names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixture =
+        \\function wsl { $global:LASTEXITCODE=-1; 'Access is denied.'; 'Error code: Wsl/E_ACCESSDENIED' }
+        \\
+    ;
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, wsl_distros_script }));
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Updating WSL distro:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "WSL enumeration failed") != null);
+}
+
+test "user-scope winget fails before launch or wait when scratch creation fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixture =
+        \\function New-Item { Write-Error 'Access is denied: scratch creation failed' }
+        \\function Set-Content { Write-Error 'incorrect script write after failure' }
+        \\function runas { Write-Output 'incorrect launch after failure' }
+        \\function Start-Sleep { throw 'incorrect wait after failure' }
+        \\
+    ;
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, wingetUserscopeScript(gpa, &.{}, false) }));
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "incorrect launch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "incorrect wait") == null);
+}
+
+test "winget pin failures are not reported as pinned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const result = try testPowerShell(gpa, concat(gpa, &.{ "function winget { $global:LASTEXITCODE=5; 'Access is denied.' }\n", wingetPinSkipScript(gpa, &.{"Example.App"}) }));
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "pinned:") == null);
+}
+
+test "AppX enumeration and registration failures propagate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixtures = [_][]const u8{
+        "function Get-AppxPackage { Write-Error 'Access is denied.' }\n",
+        "function Get-AppxPackage { [pscustomobject]@{Name='Microsoft.WindowsCalculator'; SignatureKind='Store'; IsFramework=$false; InstallLocation='C:\\Apps'} }; function Get-AppxPackageManifest { 'manifest' }; function Add-AppxPackage { Write-Error 'registration denied' }\n",
+    };
+    for (fixtures) |fixture| {
+        const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, appx_repair_script }));
+        try std.testing.expect(result.term == .exited and result.term.exited != 0);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "1 package(s) re-registered") == null);
     }
-    return false;
+}
+
+test "module update failures propagate instead of returning success" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixture = "function Get-PSResource { [pscustomobject]@{Name='Example'} }; function Update-PSResource { throw 'Access is denied.' }\n";
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, powershell_modules_script }));
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+}
+
+test "permission failures are permanent despite changing temporary filenames" {
+    for ([_][]const u8{ "Access is denied. (os error 5) at path tmp123", "Permission denied @ rb_sysopen tmp456", "npm error code EPERM", "spawn failed: AccessDenied", "hermes: install state is not writable by this user" }) |line| {
+        try std.testing.expect(matchNoRetry(&global_no_retry, &.{line}) != null);
+    }
+    try std.testing.expect(matchNoRetry(&global_no_retry, &.{"network connection timed out"}) == null);
+}
+
+test "winget scan distinguishes no upgrades from command and parse failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const cases = [_]struct { fixture: []const u8, succeeds: bool, marker: []const u8 }{
+        .{ .fixture = "function winget { $global:LASTEXITCODE=0; 'No installed package found matching input criteria.'; '2 package(s) have pins that prevent upgrade.' }\n", .succeeds = true, .marker = "SKIPPED:" },
+        .{ .fixture = "function winget { $global:LASTEXITCODE=17; 'source unavailable' }\n", .succeeds = false, .marker = "source unavailable" },
+        .{ .fixture = "function winget { $global:LASTEXITCODE=0; 'unexpected format' }\n", .succeeds = false, .marker = "unexpected format" },
+    };
+    for (cases) |case| {
+        const result = try testPowerShell(gpa, concat(gpa, &.{ case.fixture, wingetPerPackageScript(gpa, &.{}, false) }));
+        try std.testing.expectEqual(case.succeeds, result.term == .exited and result.term.exited == 0);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, case.marker) != null);
+    }
+}
+
+test "winget defers a running app instead of updating or terminating it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixture =
+        \\function Get-CimInstance { [pscustomobject]@{ ProcessId=123; Name='Discord.exe'; ExecutablePath='C:\Apps\Discord\Discord.exe'; CommandLine='Discord.exe' } }
+        \\function Stop-Process { throw 'must not terminate a busy app' }
+        \\function winget {
+        \\    if ($args -contains '--id') { throw 'must not upgrade a busy app' }
+        \\    $global:LASTEXITCODE=0
+        \\    'Name     Id               Version Available Source'
+        \\    '-------------------------------------------------'
+        \\    'Discord  Discord.Discord  1.0     2.0       winget'
+        \\}
+        \\
+    ;
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, wingetPerPackageScript(gpa, &.{}, false) }));
+    try std.testing.expect(result.term == .exited and result.term.exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deferred (in use)") != null);
+}
+
+test "Windows Update reports phases and rejects partial installation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const fixture =
+        \\$updates = [pscustomobject]@{ Count=1 }
+        \\$updates | Add-Member ScriptMethod Item { param($i) [pscustomobject]@{ Title='Test update'; EulaAccepted=$true } }
+        \\$searchResult = [pscustomobject]@{ ResultCode=2; Updates=$updates }
+        \\$searcher = [pscustomobject]@{}
+        \\$searcher | Add-Member ScriptMethod Search { param($query) $searchResult }
+        \\$downloadResult = [pscustomobject]@{ ResultCode=2 }
+        \\$downloadResult | Add-Member ScriptMethod GetUpdateResult { param($i) [pscustomobject]@{ ResultCode=2; HResult=0 } }
+        \\$downloader = [pscustomobject]@{ Updates=$null }
+        \\$downloader | Add-Member ScriptMethod Download { $downloadResult }
+        \\$installResult = [pscustomobject]@{ ResultCode=3; RebootRequired=$false }
+        \\$installResult | Add-Member ScriptMethod GetUpdateResult { param($i) [pscustomobject]@{ ResultCode=4; HResult=-1 } }
+        \\$installer = [pscustomobject]@{ Updates=$null }
+        \\$installer | Add-Member ScriptMethod Install { $installResult }
+        \\$session = [pscustomobject]@{ ClientApplicationID='' }
+        \\$session | Add-Member ScriptMethod CreateUpdateSearcher { $searcher }
+        \\$session | Add-Member ScriptMethod CreateUpdateDownloader { $downloader }
+        \\$session | Add-Member ScriptMethod CreateUpdateInstaller { $installer }
+        \\function New-Object { param($ComObject) $session }
+        \\
+    ;
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, windows_update_script }));
+    try std.testing.expect(result.term == .exited and result.term.exited != 0);
+    for ([_][]const u8{ "searching", "downloading", "installing", "0/1" }) |marker| {
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, marker) != null);
+    }
+}
+
+test "runner checkpoints completed tasks without overwriting the last run" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    initPathCache(gpa);
+    buildPathIndex(gpa, io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = joinPath(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const last = joinPath(gpa, &.{ root, "last-run.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = last, .data = "previous completed run" });
+    const tasks = [_]Task{mk("checkpoint-test", "test", &.{}, "pwsh", &.{ "-NoProfile", "-Command", "Write-Output 'completed'" })};
+    const results = runTasks(gpa, io, &tasks, .{ .state_dir = root, .quiet = true, .retry_count = 0 }, 1, 10_000);
+    try std.testing.expectEqualStrings("Succeeded", results[0].status);
+    const saved = Io.Dir.cwd().readFileAlloc(io, joinPath(gpa, &.{ root, "in-progress.json" }), gpa, .limited(1024 * 1024)) catch "";
+    try std.testing.expect(std.mem.indexOf(u8, saved, "checkpoint-test") != null);
+    try std.testing.expectEqualStrings("previous completed run", try Io.Dir.cwd().readFileAlloc(io, last, gpa, .limited(1024)));
 }
 
 fn scheduleTask(gpa: Allocator, io: Io, exe: []const u8, schedule_time: ?[]const u8) void {
@@ -4857,14 +5127,6 @@ pub fn main(init: std.process.Init) !void {
         out.enableAnsiEscapeCodes(io) catch {};
         break :blk out.supportsAnsiEscapeCodes(io) catch false;
     };
-    if (cli.log_file) |path| {
-        // .read needed: length() stats the handle, which fails on a write-only handle.
-        if (Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true })) |f| {
-            log_file = f;
-            log_pos = f.length(io) catch 0;
-        } else |err| pe(io, "warn: could not open --log-file {s}: {t}\n", .{ path, err });
-    }
-
     // Handle --schedule before anything else
     if (cli.schedule) {
         const exe = try std.process.executablePathAlloc(io, gpa);
@@ -4876,6 +5138,20 @@ pub fn main(init: std.process.Init) !void {
     const started_at = nowString(gpa);
     const repo_root = findRepoRoot(gpa, io);
     const state_dir = getStateDir(gpa, cli);
+    const logs_dir = joinPath(gpa, &.{ state_dir, "logs" });
+    const log_path = cli.log_file orelse joinPath(gpa, &.{ logs_dir, fmtAlloc(gpa, "update-everything-{d}-{d}.log", .{ nowUnixMs(io), GetCurrentProcessId() }) });
+    if (std.fs.path.dirname(log_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch |err| {
+        pe(io, "warn: could not create log directory {s}: {t}\n", .{ parent, err });
+    };
+    if (Io.Dir.cwd().createFile(io, log_path, .{ .truncate = false, .read = true })) |f| {
+        log_file = f;
+        log_pos = f.length(io) catch 0;
+    } else |err| pe(io, "warn: could not open log {s}: {t}\n", .{ log_path, err });
+    defer {
+        if (log_file) |f| f.close(io);
+        log_file = null;
+    }
+    p(io, "log {s}\n", .{log_path});
     const config_path = cli.config orelse joinPath(gpa, &.{ repo_root, "update-config.json" });
     const config = loadConfig(gpa, io, config_path);
     warnIfExeStale(gpa, io, repo_root);
@@ -4900,9 +5176,11 @@ pub fn main(init: std.process.Init) !void {
     // Auto-save last-run.json to the state dir (enables --since-hours next run)
     if (!cli.dry_run) {
         const auto_path = joinPath(gpa, &.{ state_dir, "last-run.json" });
-        writeSummaryJson(gpa, io, auto_path, started_at, duration_ms, cli.dry_run, results) catch |err| {
+        if (writeSummaryJson(gpa, io, auto_path, started_at, duration_ms, cli.dry_run, results)) |_| {
+            Io.Dir.cwd().deleteFile(io, joinPath(gpa, &.{ state_dir, "in-progress.json" })) catch {};
+        } else |err| {
             pe(io, "warn: could not save {s}: {t}\n", .{ auto_path, err });
-        };
+        }
     }
 
     // Also save to the explicit --json-summary path if given

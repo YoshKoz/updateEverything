@@ -450,7 +450,7 @@ function Enter-ProcessLock
         $script:LockPath = $lockPath
     } catch
     {
-        Write-Verbose "Could not acquire process lock: $($_.Exception.Message)"
+        Write-Warning "Could not acquire process lock; continuing without single-instance protection: $($_.Exception.Message)"
     }
 }
 
@@ -954,6 +954,37 @@ function ConvertFrom-WingetUpgradeOutput
     return @($packages)
 }
 
+function Confirm-WingetScan
+{
+    param([string[]]$Output)
+    $text = $Output -join "`n"
+    if ($text -notmatch '(?m)^Name\s+Id\s+Version' -and $text -notmatch 'No installed package found matching input criteria|No applicable upgrade found|No available upgrade found')
+    { throw "winget: unrecognized upgrade output; cannot determine available upgrades. $text"
+    }
+}
+
+function Confirm-WuaResult
+{
+    param($Result, $Updates, [ValidateSet('download', 'install')][string]$Phase)
+    $succeeded = 0
+    for ($i = 0; $i -lt $Updates.Count; $i++)
+    {
+        $item = $Result.GetUpdateResult($i)
+        if ($item.ResultCode -eq 2)
+        { $succeeded++
+        } else
+        { Write-Output "Windows Update $Phase failed: $($Updates.Item($i).Title), result $($item.ResultCode), HRESULT $($item.HResult)"
+        }
+    }
+    Write-Output "Windows Update ${Phase}: $succeeded/$($Updates.Count) update(s) succeeded"
+    if ($Phase -eq 'install')
+    { Write-Output "Reboot required: $($Result.RebootRequired)"
+    }
+    if ($Result.ResultCode -ne 2 -or $succeeded -ne $Updates.Count)
+    { throw "Windows Update $Phase failed or incomplete"
+    }
+}
+
 function Get-UpdateTasks
 {
     $wingetSkip = ConvertTo-StringArray $script:Config.WingetSkipPackages
@@ -1040,6 +1071,7 @@ function Get-UpdateTasks
 
         Write-Output 'Scanning for available winget upgrades from the winget source...'
         $listOutput = @(Invoke-UpdateProcess -FilePath 'winget' -ArgumentList @('upgrade', '--source', 'winget', '--include-unknown', '--include-pinned', '--accept-source-agreements', '--disable-interactivity') -SuccessExitCodes @(0, -1978335189))
+        Confirm-WingetScan -Output $listOutput
         $candidates = @(ConvertFrom-WingetUpgradeOutput -Output $listOutput)
 
         $toUpgrade = [System.Collections.Generic.List[object]]::new()
@@ -1066,7 +1098,9 @@ function Get-UpdateTasks
 
         if (($toUpgrade.Count + $toSkipIds.Count + $toProtectIds.Count + $currentUnknownIds.Count + $unchangedUnknownIds.Count) -eq 0)
         {
-            Write-Output 'No winget upgrades available.'
+            Write-Output ($listOutput -join "`n")
+            Set-TaskStatus -Status 'Skipped' -Reason 'No eligible winget upgrades'
+            Write-Output 'No eligible winget upgrades available.'
             return
         }
 
@@ -1483,11 +1517,15 @@ function Get-UpdateTasks
                 $session = New-Object -ComObject Microsoft.Update.Session
                 $session.ClientApplicationID = 'Update-Everything'
                 $searcher = $session.CreateUpdateSearcher()
+                Write-Output 'Windows Update: searching for software updates...'
                 $result = Invoke-WuaOperation -Name 'Windows Update search' -Operation {
                     $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
                 }
 
                 $count = [int]$result.Updates.Count
+                if ($result.ResultCode -ne 2)
+                { throw "Windows Update search failed or incomplete: $($result.ResultCode)"
+                }
                 Write-Output "Windows Update available updates: $count"
                 if ($count -eq 0)
                 { return
@@ -1506,19 +1544,17 @@ function Get-UpdateTasks
 
                 $downloader = $session.CreateUpdateDownloader()
                 $downloader.Updates = $updates
+                Write-Output "Windows Update: downloading $count update(s)..."
                 $downloadResult = Invoke-WuaOperation -Name 'Windows Update download' -Operation { $downloader.Download() }
                 Write-Output "Windows Update download result code: $($downloadResult.ResultCode)"
-                if ($downloadResult.ResultCode -notin @(2, 3))
-                { throw "Windows Update download result code was $($downloadResult.ResultCode)"
-                }
+                Confirm-WuaResult -Result $downloadResult -Updates $updates -Phase download
 
                 $installer = $session.CreateUpdateInstaller()
                 $installer.Updates = $updates
+                Write-Output "Windows Update: installing $count update(s)..."
                 $installResult = Invoke-WuaOperation -Name 'Windows Update install' -Operation { $installer.Install() }
                 Write-Output "Windows Update install result code: $($installResult.ResultCode); reboot required: $($installResult.RebootRequired)"
-                if ($installResult.ResultCode -notin @(2, 3))
-                { throw "Windows Update install result code was $($installResult.ResultCode)"
-                }
+                Confirm-WuaResult -Result $installResult -Updates $updates -Phase install
             } -Tags @('windows') -Resources @('windows-update'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'defender' -Category 'system' -Disabled:$SkipDefender -DisabledReason 'disabled by -SkipDefender' -Script {
@@ -1724,6 +1760,8 @@ fi
 
         $root = (Invoke-UpdateProcess -FilePath 'npm' -ArgumentList @('root', '-g') | Select-Object -First 1)
         Remove-StaleNpmTempFolders -Root $root
+        $runningCommandLines = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty CommandLine)
 
         $listRaw = (Invoke-UpdateProcess -FilePath 'npm' -ArgumentList @('ls', '-g', '--depth=0', '--json') -SuccessExitCodes @(0, 1) | Out-String).Trim()
         if (-not $listRaw)
@@ -1752,6 +1790,13 @@ fi
             }
             if ($name -notmatch $validNamePattern)
             { Write-Output "Skipping invalid npm package name: $name"; continue
+            }
+
+            $packagePath = Join-Path $root ($name -replace '/', '\')
+            if ($runningCommandLines | Where-Object {
+                    $_ -and $_.IndexOf($packagePath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                })
+            { Write-Output "Deferring npm package in use by a running process: $name"; continue
             }
 
             if ($name -ieq '@openai/codex')
@@ -3151,7 +3196,7 @@ function Start-UpdateTaskJob
     }
     $taskTimeoutSec = [int]$Task.TimeoutSec
     $helperFunctionDefinitions = @()
-    foreach ($functionName in @('ConvertFrom-WingetUpgradeOutput'))
+    foreach ($functionName in @('ConvertFrom-WingetUpgradeOutput', 'Confirm-WingetScan', 'Confirm-WuaResult'))
     {
         $functionCommand = Get-Command -Name $functionName -CommandType Function -ErrorAction SilentlyContinue
         if ($functionCommand)
@@ -3601,6 +3646,29 @@ function Test-ResourcesAvailable
     return $true
 }
 
+function Save-RunCheckpoint
+{
+    param([object[]]$Results = @())
+    if ($script:IsSimulation) { return }
+    $path = Join-Path $script:StateDir 'in-progress.json'
+    $summary = [ordered]@{
+        Version = $script:Version
+        RunId = $script:RunId
+        StartedAt = $script:StartTime.ToString('o')
+        UpdatedAt = (Get-Date).ToString('o')
+        Completed = $false
+        LogPath = $script:LogPath
+        Results = @($Results)
+    }
+    try
+    {
+        $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$path.tmp" -Encoding utf8 -WhatIf:$false -ErrorAction Stop
+        Move-Item -LiteralPath "$path.tmp" -Destination $path -Force -WhatIf:$false -ErrorAction Stop
+    } catch
+    { Write-Warning "Could not save in-progress summary: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-TaskQueue
 {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -3616,6 +3684,7 @@ function Invoke-TaskQueue
 
     $running = @()
     $results = [System.Collections.Generic.List[object]]::new()
+    Save-RunCheckpoint -Results @()
 
     while ($queue.Count -gt 0 -or $running.Count -gt 0)
     {
@@ -3639,6 +3708,7 @@ function Invoke-TaskQueue
             if (-not $PSCmdlet.ShouldProcess($task.Name, 'Run update task'))
             {
                 $results.Add((New-TaskResult -Task $task -Status 'Skipped' -Reason 'ShouldProcess declined')) | Out-Null
+                Save-RunCheckpoint -Results @($results)
                 continue
             }
 
@@ -3659,6 +3729,7 @@ function Invoke-TaskQueue
                 Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
                 $result = New-TaskResult -Task $task -Status 'TimedOut' -ExitCode 124 -DurationSeconds $task.TimeoutSec -Attempts $item.Attempt -Reason "timeout after $($task.TimeoutSec)s"
                 $results.Add($result) | Out-Null
+                Save-RunCheckpoint -Results @($results)
                 Write-Status ("[{0}] timed out after {1}s" -f $task.Name, $task.TimeoutSec) -Level Warning
                 $running = @($running | Where-Object { $_.Job.Id -ne $job.Id })
                 continue
@@ -3703,6 +3774,7 @@ function Invoke-TaskQueue
             }
 
             $results.Add($result) | Out-Null
+            Save-RunCheckpoint -Results @($results)
             if ($result.Status -eq 'Succeeded')
             { Write-Status ("[{0}] ok ({1:N1}s)" -f $task.Name, $result.DurationSeconds) -Level Success
             } else
@@ -3788,6 +3860,13 @@ function Save-RunSummary
         }
         Set-Content -LiteralPath $script:JsonSummaryPath -Value $json -Encoding utf8 -WhatIf:$false -ErrorAction Stop
         $summaryWritten = $true
+        if (-not $script:IsSimulation)
+        {
+            $checkpoint = Join-Path $script:StateDir 'in-progress.json'
+            if (Test-Path -LiteralPath $checkpoint)
+            { Remove-Item -LiteralPath $checkpoint -Force -WhatIf:$false -ErrorAction Stop
+            }
+        }
     } catch
     {
         Write-Status "Could not write JSON summary: $($_.Exception.Message)" -Level Warning

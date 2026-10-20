@@ -97,8 +97,8 @@
       "VersionRegex": "build (\\d+)",
       "VersionScheme": "build",
       "TagRegex": "^b\\d+$",
-      "PreUpdate": "Stop-ScheduledTask -TaskName llama-server -ErrorAction SilentlyContinue",
-      "PostUpdate": "Start-ScheduledTask -TaskName llama-server"
+      "PreUpdate": "Stop-Service -Name LlamaServer -Force -ErrorAction SilentlyContinue",
+      "PostUpdate": "Start-Service -Name LlamaServer -ErrorAction SilentlyContinue"
     },
     {
       "Repo": "neovim/neovim",
