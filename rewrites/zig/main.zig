@@ -938,7 +938,8 @@ fn pwshCmd(gpa: Allocator, script: []const u8) []const []const u8 {
     args[0] = "-NoProfile";
     args[1] = "-NonInteractive";
     args[2] = "-Command";
-    args[3] = script;
+    // Without Stop a Write-Error falls through and the task still exits 0.
+    args[3] = concat(gpa, &.{ "$ErrorActionPreference='Stop'\n", script });
     return args;
 }
 
@@ -1439,9 +1440,11 @@ const winget_pin_skip_body =
     \\
     \\if (-not $pkgs) { Write-Output 'No winget skip-packages to pin.'; exit 0 }
     \\foreach ($p in $pkgs) {
-    \\    winget pin add --id $p --exact --source winget --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+    \\    $out = winget pin add --id $p --exact --source winget --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+    \\    if ($LASTEXITCODE -ne 0) { Write-Output ("pin failed: {0} ({1}): {2}" -f $p, $LASTEXITCODE, $out.Trim()); $failed = $true; continue }
     \\    Write-Output ("pinned: {0}" -f $p)
     \\}
+    \\if ($failed) { exit 1 }
     \\exit 0
 ;
 
@@ -2581,6 +2584,7 @@ const winget_git_script =
 const winget_userscope_pre =
     \\
     \\if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Output 'Not elevated: user-scope packages already covered by main winget pass.'; exit 0 }
+    \\$ErrorActionPreference = 'Stop'
     \\$dir = Join-Path $env:TEMP ('ue-userscope-' + [guid]::NewGuid().ToString('N'))
     \\New-Item -ItemType Directory -Path $dir -Force | Out-Null
     \\$ps1File = Join-Path $dir 'run.ps1'
@@ -2681,7 +2685,13 @@ const wsl_distros_script =
     \\$prev=[Console]::OutputEncoding
     \\[Console]::OutputEncoding=[System.Text.Encoding]::Unicode
     \\$raw=wsl -l -q 2>$null
+    \\$listRc=$LASTEXITCODE
     \\[Console]::OutputEncoding=$prev
+    \\if($listRc -ne 0){
+    \\  $msg=(@($raw|ForEach-Object{($_ -replace "`0",'').Trim()}|Where-Object{$_}) -join ' ')
+    \\  if($msg -match 'no installed distributions|DEFAULT_DISTRO_NOT_FOUND'){Write-Output 'No WSL distros found.';return}
+    \\  Write-Output "WSL enumeration failed (exit $listRc): $msg";exit 1
+    \\}
     \\$benign='(wsl2\.localhostForwarding setting has no effect|wsl: An internal error occurred\.|CreateInstance/CreateVm/ConfigureNetworking/0x8007054f|wsl: Failed to configure network|wsl: Failed to start the systemd user session)'
     \\$distros=@($raw|ForEach-Object{($_ -replace "`0",'').Trim()}|Where-Object{$_ -and $_ -notmatch 'docker-desktop' -and $_ -notmatch $benign}|Sort-Object -Unique)
     \\if($distros.Count -eq 0){Write-Output 'No WSL distros found.';return}
@@ -2768,7 +2778,7 @@ const powershell_modules_script = "if(Get-Command Update-PSResource -EA Silently
     "foreach($m in ($mods|Sort-Object Name -Unique)){" ++
     "try{Update-PSResource -Name $m.Name -AcceptLicense -TrustRepository -EA Stop|Out-String|Write-Output}" ++
     "catch{Write-Output \"Not updated: $($m.Name) — $($_.Exception.Message)\";$failed+=$m.Name}};" ++
-    "if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\"}" ++
+    "if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\";exit 1}" ++
     "}elseif(Get-Command Update-Module -EA SilentlyContinue){" ++
     "$mods=@(Get-InstalledModule -EA SilentlyContinue);" ++
     "if($mods.Count-eq 0){Write-Output 'No installed PowerShellGet modules found.';return};" ++
@@ -2776,7 +2786,7 @@ const powershell_modules_script = "if(Get-Command Update-PSResource -EA Silently
     "foreach($m in $mods){" ++
     "try{Update-Module -Name $m.Name -Force -EA Stop}" ++
     "catch{Write-Output \"Not updated: $($m.Name) — $($_.Exception.Message)\";$failed+=$m.Name}};" ++
-    "if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\"}" ++
+    "if($failed){Write-Output \"Left unchanged: $($failed -join ', ')\";exit 1}" ++
     "}else{Write-Output 'No PowerShell module updater found.'}";
 
 fn windowsFeaturesScript(gpa: Allocator, features: []const []const u8) []const u8 {
@@ -2793,18 +2803,22 @@ fn windowsFeaturesScript(gpa: Allocator, features: []const []const u8) []const u
 
 const appx_repair_script = "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){" ++
     "Write-Output 'AppX repair skipped: requires elevation (Get-AppxPackage -AllUsers needs admin).';return};" ++
-    "$pkgs=@(Get-AppxPackage -AllUsers -EA SilentlyContinue|" ++
+    "$ErrorActionPreference='Stop';" ++
+    "$pkgs=@(Get-AppxPackage -AllUsers|" ++
     "Where-Object{$_.SignatureKind-eq 'Store'-and-not $_.IsFramework-and" ++
     "$_.Name-match '(Microsoft\\.WindowsStore|Microsoft\\.Store|Microsoft\\.WindowsCalculator|" ++
     "Microsoft\\.Windows\\.Photos|Microsoft\\.Windows\\.Camera|Microsoft\\.People|" ++
     "Microsoft\\.MSPaint|Microsoft\\.ScreenSketch|Microsoft\\.WindowsNotepad|" ++
     "Microsoft\\.WindowsTerminal)'});" ++
-    "$repaired=0;" ++
+    "$repaired=0;$failed=0;" ++
     "foreach($p in $pkgs){" ++
     "try{$m=Get-AppxPackageManifest -Package $p -EA SilentlyContinue;" ++
-    "if($m){Add-AppxPackage -Register -DisableDevelopmentMode -EA SilentlyContinue \"$($p.InstallLocation)\\AppxManifest.xml\" *>$null;$repaired++}}" ++
-    "catch{Write-Output \"AppX repair failed for $($p.Name): $($_.Exception.Message)\"}};" ++
-    "Write-Output \"AppX re-registration: $repaired package(s) re-registered.\"";
+    "if($m){Add-AppxPackage -Register -DisableDevelopmentMode \"$($p.InstallLocation)\\AppxManifest.xml\";$repaired++}}" ++
+    // 0x80073D02: the app is open (Terminal runs this task); re-registration can wait for next run.
+    "catch{if($_.Exception.Message -match '0x80073D02'){Write-Output \"AppX repair skipped for $($p.Name): app in use\"}" ++
+    "else{Write-Output \"AppX repair failed for $($p.Name): $($_.Exception.Message)\";$failed++}}};" ++
+    "Write-Output \"AppX re-registration: $repaired package(s) re-registered.\";" ++
+    "if($failed){exit 1}";
 
 const mise_script = "import shutil, subprocess, sys\n" ++
     "p = (shutil.which(\"mise\") or \"\").replace(\"\\\\\", \"/\").lower()\n" ++
@@ -3956,6 +3970,12 @@ const global_no_retry = [_][]const u8{
     "is not recognized as",
     "unrecognized arguments",
     "No such command",
+    // Permission failures recur on retry; temp filenames in the line differ each time.
+    "Access is denied",
+    "Permission denied",
+    "EPERM",
+    "AccessDenied",
+    "is not writable by this user",
 };
 
 fn sameOutput(a: []const []const u8, b: []const []const u8) bool {
