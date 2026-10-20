@@ -42,6 +42,7 @@ rewrites/go/stderr.txt
 rewrites/zig/updateeverything-zig.exe
 rewrites/zig/updateeverything-zig.pdb
 rewrites/zig/zig-out/
+rewrites/zig/zig-out-verify/
 rewrites/zig/.zig-cache/
 
 # Rust
