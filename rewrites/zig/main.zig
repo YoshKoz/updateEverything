@@ -2135,59 +2135,6 @@ const yt_dlp_script =
     \\
 ;
 
-const gcloud_script =
-    \\
-    \\import shutil, subprocess, sys
-    \\p = (shutil.which("gcloud") or "").replace("\\", "/").lower()
-    \\if any(x in p for x in ["scoop/apps", "chocolatey/lib", "microsoft/winget"]):
-    \\    print("gcloud is managed by a package manager; skipping self-update.")
-    \\    sys.exit(0)
-    \\r = subprocess.run(["gcloud", "components", "update", "--quiet"])
-    \\sys.exit(r.returncode)
-    \\
-;
-
-const aws_script =
-    \\
-    \\import shutil, subprocess, sys
-    \\p = (shutil.which("aws") or "").replace("\\", "/").lower()
-    \\if any(x in p for x in ["scoop/apps", "chocolatey/lib", "microsoft/winget", "python", "scripts"]):
-    \\    r = subprocess.run(["aws", "--version"], capture_output=True, text=True)
-    \\    print(f"AWS CLI is managed ({r.stdout.strip()}); updating via package manager.")
-    \\    sys.exit(0)
-    \\print("Updating AWS CLI via pip...")
-    \\r = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "awscli"])
-    \\sys.exit(r.returncode)
-    \\
-;
-
-const terraform_script =
-    \\
-    \\import shutil, subprocess, sys
-    \\p = (shutil.which("terraform") or "").replace("\\", "/").lower()
-    \\if any(x in p for x in ["scoop/apps", "chocolatey/lib", "microsoft/winget", "tfenv"]):
-    \\    print("Terraform is managed by a package manager; skipping.")
-    \\    sys.exit(0)
-    \\try:
-    \\    r = subprocess.run(["terraform", "--version"], capture_output=True, text=True)
-    \\    lines = r.stdout.strip().splitlines()
-    \\    cur = lines[0] if lines else "unknown"
-    \\    print(f"Current Terraform: {cur}")
-    \\    import urllib.request, json as _json
-    \\    with urllib.request.urlopen("https://api.github.com/repos/hashicorp/terraform/releases/latest", timeout=15) as resp:
-    \\        data = _json.loads(resp.read())
-    \\    latest = data["tag_name"].lstrip("v")
-    \\    print(f"Latest Terraform: {latest}")
-    \\    if cur and latest and latest in cur:
-    \\        print("Terraform is current.")
-    \\    else:
-    \\        print(f"New version available: {latest}. Update via winget/scoop or download from https://releases.hashicorp.com/terraform/{latest}/")
-    \\except Exception as e:
-    \\    print(f"terraform check skipped: {e}")
-    \\sys.exit(0)
-    \\
-;
-
 const kubectl_script =
     \\
     \\import shutil, subprocess, sys
@@ -2266,33 +2213,6 @@ fn githubVersionCheckArgs(gpa: Allocator, bin: []const u8, ver_args: []const []c
         "sys.exit(0)\n",
     });
     return pyCmd(gpa, script);
-}
-
-const vcpkg_body =
-    \\]
-    \\print("Updating vcpkg baseline...")
-    \\r1 = subprocess.run(["vcpkg", "update"])
-    \\print("Upgrading vcpkg packages...")
-    \\r2 = subprocess.run(["vcpkg", "upgrade", "--no-dry-run"])
-    \\sys.exit(max(r1.returncode, r2.returncode))
-    \\
-;
-
-fn vcpkgUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8) []const []const u8 {
-    return pyCmd(gpa, concat(gpa, &.{ "\nimport subprocess, sys\nskip = [", pyList(gpa, skip_packages, false), vcpkg_body }));
-}
-
-const conda_body =
-    \\]
-    \\print("Updating conda base environment...")
-    \\r1 = subprocess.run(["conda", "update", "-n", "base", "conda", "-y"])
-    \\r2 = subprocess.run(["conda", "update", "--all", "-y"])
-    \\sys.exit(max(r1.returncode, r2.returncode))
-    \\
-;
-
-fn condaUpgradeArgs(gpa: Allocator, skip_envs: []const []const u8) []const []const u8 {
-    return pyCmd(gpa, concat(gpa, &.{ "\nimport subprocess, sys\nskip = [", pyList(gpa, skip_envs, false), conda_body }));
 }
 
 const ollama_body =
@@ -2416,15 +2336,6 @@ const codex_script =
     \\sys.exit(rc)
     \\
 ;
-
-fn advisoryScript(gpa: Allocator, bin: []const u8, msg: []const u8) []const []const u8 {
-    const script = concat(gpa, &.{
-        "import shutil, sys\np = shutil.which(\"", bin,                  "\")\nif p:\n    print(f\"",
-        bin,                                       ": {p}\")\nprint(\"", msg,
-        "\")\nsys.exit(0)\n",
-    });
-    return pyCmd(gpa, script);
-}
 
 const cleanup_body =
     \\
@@ -2824,18 +2735,6 @@ const appx_repair_script = "if(-not ([Security.Principal.WindowsPrincipal][Secur
     "Write-Output \"AppX re-registration: $repaired package(s) re-registered.\";" ++
     "if($failed){exit 1}";
 
-const mise_script = "import shutil, subprocess, sys\n" ++
-    "p = (shutil.which(\"mise\") or \"\").replace(\"\\\\\", \"/\").lower()\n" ++
-    "if \"winget\" in p or \"/microsoft/\" in p or \"/scoop/\" in p or \"/homebrew/\" in p:\n" ++
-    "    print(\"mise is package-manager-managed; update handled by winget/scoop task\")\n" ++
-    "    sys.exit(0)\n" ++
-    "exe = shutil.which(\"mise\")\n" ++
-    "if not exe:\n" ++
-    "    print(\"mise not found on PATH; nothing to upgrade\")\n" ++
-    "    sys.exit(0)\n" ++
-    "r = subprocess.run([exe, \"self-upgrade\"])\n" ++
-    "sys.exit(r.returncode)";
-
 const chocolatey_pre = "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Write-Output 'Chocolatey skipped: requires elevation (run elevated to upgrade choco packages).';exit 0}; & choco upgrade all -y --no-progress";
 
 /// choco requires elevation; when not elevated it prints a warning and blocks
@@ -2906,8 +2805,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
 
     const node_skip: ?[]const u8 = if (cli.skip_node) "disabled by --skip-node" else null;
     const rust_skip: ?[]const u8 = if (cli.skip_rust) "disabled by --skip-rust" else null;
-    const cloud_skip: ?[]const u8 = if (cli.skip_cloud_tools) "disabled by --skip-cloud-tools" else null;
-    const infra_skip: ?[]const u8 = if (cli.skip_infra_tools) "disabled by --skip-infra-tools" else null;
     const k8s_skip: ?[]const u8 = if (cli.skip_k8s_tools) "disabled by --skip-k8s-tools" else null;
     const uv_tools_skip: ?[]const u8 = if (cli.skip_uv_tools) "disabled by --skip-uv-tools" else null;
 
@@ -3035,18 +2932,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, with(mk("yarn", "javascript", &.{"node"}, "yarn", &.{ "global", "upgrade" }), .{ .skip = node_skip }));
     add(&tasks, gpa, with(mk("bun", "javascript", &.{"node"}, "bun", &.{"upgrade"}), .{ .skip = node_skip }));
     add(&tasks, gpa, with(mk("deno", "javascript", &.{"node"}, "deno", &.{"upgrade"}), .{ .skip = node_skip }));
-    add(&tasks, gpa, with(mk("volta", "javascript", &.{"node"}, "python", advisoryScript(gpa, "volta", "Volta does not provide a stable non-interactive self-update. Install/update via winget/scoop/chocolatey for automatic coverage.")), .{
-        .requires = "volta",
-        .skip = node_skip,
-    }));
-    add(&tasks, gpa, with(mk("fnm", "javascript", &.{"node"}, "python", advisoryScript(gpa, "fnm", "fnm does not provide a self-update command. Install/update via winget/scoop/chocolatey for automatic coverage.")), .{
-        .requires = "fnm",
-        .skip = node_skip,
-    }));
-    add(&tasks, gpa, with(mk("nvm", "javascript", &.{"node"}, "python", advisoryScript(gpa, "nvm", "nvm (for Windows): update via winget upgrade --id CoreyButler.NVMforWindows")), .{
-        .requires = "nvm",
-        .skip = node_skip,
-    }));
     // ── Python ───────────────────────────────────────────────────────────────
     add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli), cli.pip_apply)));
     add(&tasks, gpa, mk("python-venvs", "python", &.{ "python", "venv" }, "python", pyCmd(gpa, python_venvs_script)));
@@ -3080,11 +2965,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .requires = "poetry",
         .skip = if (cli.skip_poetry) "disabled by --skip-poetry" else null,
     }));
-    add(&tasks, gpa, with(mk("conda", "python", &.{"python"}, "python", condaUpgradeArgs(gpa, config.conda_skip_envs)), .{
-        .requires = "conda",
-        .resource = "conda",
-        .skip = if (cli.skip_conda) "disabled by --skip-conda" else null,
-    }));
     // ── Rust ─────────────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("rustup", "systems-language", &.{"rust"}, "rustup", &.{"update"}), .{
         .resource = "rust",
@@ -3107,12 +2987,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, with(mk("ruby-gems", "runtime", &.{"ruby"}, "gem", &.{"update"}), .{
         .skip = if (cli.skip_ruby) "disabled by --skip-ruby" else null,
     }));
-    // ── Flutter ──────────────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("flutter", "systems-language", &.{"flutter"}, "flutter", &.{"upgrade"}), .{
-        .skip = if (cli.skip_flutter) "disabled by --skip-flutter" else null,
-    }));
-    // ── Julia ────────────────────────────────────────────────────────────────
-    add(&tasks, gpa, mk("juliaup", "systems-language", &.{"julia"}, "juliaup", &.{"update"}));
     add(&tasks, gpa, with(mk("gh", "dev-tools", &.{ "github", "dev-tools" }, "python", pyCmd(gpa, gh_upgrade_script)), .{
         .requires = "gh",
         .resource = "winget",
@@ -3157,14 +3031,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .skip = if (cli.skip_git_lfs) "disabled by --skip-git-lfs" else null,
     }));
     add(&tasks, gpa, mk("gh-extensions", "dev-tools", &.{"github"}, "gh", &.{ "extension", "upgrade", "--all" }));
-    add(&tasks, gpa, with(mk("devcontainer", "dev-tools", &.{"dev"}, "python", githubVersionCheckArgs(gpa, "devcontainer", &.{"--version"}, "devcontainers/cli")), .{
-        .requires = "devcontainer",
-    }));
-    // ── Version managers ─────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("mise", "version-manager", &.{"mise"}, "python", pyCmd(gpa, mise_script)), .{
-        .requires = "mise",
-    }));
-    add(&tasks, gpa, mk("mise-upgrade", "version-manager", &.{"mise"}, "mise", &.{"upgrade"}));
     // ── Media tools ──────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("yt-dlp", "media-tools", &.{"media"}, "python", pyCmd(gpa, yt_dlp_script)), .{
         .requires = "yt-dlp",
@@ -3177,55 +3043,10 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .requires = "starship",
         .skip = if (cli.skip_starship) "disabled by --skip-starship" else null,
     }));
-    add(&tasks, gpa, with(mk("zoxide", "shell", &.{"shell"}, "python", advisoryScript(gpa, "zoxide", "zoxide: update via your package manager (winget/scoop/choco/brew).")), .{
-        .requires = "zoxide",
-    }));
-    add(&tasks, gpa, mk("tldr", "dev-tools", &.{"dev-tools"}, "tldr", &.{"--update"}));
-    // ── Cloud tools ──────────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("gcloud", "cloud", &.{"cloud"}, "python", pyCmd(gpa, gcloud_script)), .{
-        .resource = "gcloud",
-        .timeout_sec = 600,
-        .requires = "gcloud",
-        .skip = cloud_skip,
-    }));
-    add(&tasks, gpa, with(mk("az", "cloud", &.{"cloud"}, "az", &.{ "upgrade", "--all", "-y" }), .{
-        .resource = "az",
-        .timeout_sec = 600,
-        .skip = cloud_skip,
-    }));
-    add(&tasks, gpa, with(mk("aws", "cloud", &.{"cloud"}, "python", pyCmd(gpa, aws_script)), .{
-        .requires = "aws",
-        .resource = "aws",
-        .skip = cloud_skip,
-    }));
-    // ── Infrastructure tools ─────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("terraform", "infrastructure", &.{"infrastructure"}, "python", pyCmd(gpa, terraform_script)), .{
-        .resource = "terraform",
-        .requires = "terraform",
-        .skip = infra_skip,
-    }));
-    add(&tasks, gpa, with(mk("pulumi", "infrastructure", &.{"infrastructure"}, "pulumi", &.{"upgrade"}), .{
-        .timeout_sec = 600,
-        .resource = "pulumi",
-        .skip = infra_skip,
-    }));
-    add(&tasks, gpa, with(mk("opentofu", "infrastructure", &.{"infrastructure"}, "python", githubVersionCheckArgs(gpa, "tofu", &.{"--version"}, "opentofu/opentofu")), .{
-        .requires = "tofu",
-        .skip = infra_skip,
-    }));
-    add(&tasks, gpa, with(mk("packer", "infrastructure", &.{"infrastructure"}, "python", githubVersionCheckArgs(gpa, "packer", &.{"--version"}, "hashicorp/packer")), .{
-        .requires = "packer",
-        .skip = infra_skip,
-    }));
     // ── Kubernetes tools ─────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("kubectl", "infrastructure", &.{"kubernetes"}, "python", pyCmd(gpa, kubectl_script)), .{
         .resource = "kubectl",
         .requires = "kubectl",
-        .skip = k8s_skip,
-    }));
-    add(&tasks, gpa, with(mk("helm", "infrastructure", &.{"kubernetes"}, "helm", &.{ "repo", "update" }), .{
-        .timeout_sec = 120,
-        .resource = "helm",
         .skip = k8s_skip,
     }));
     // ── Security tools ───────────────────────────────────────────────────────
@@ -3235,17 +3056,6 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, with(mk("trivy", "security", &.{"security"}, "trivy", &.{ "image", "--download-db-only", "--quiet" }), .{
         .timeout_sec = 300,
         .resource = "trivy",
-    }));
-    // ── Static site ──────────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("hugo", "dev-tools", &.{"static-site"}, "python", githubVersionCheckArgs(gpa, "hugo", &.{"version"}, "gohugoio/hugo")), .{
-        .requires = "hugo",
-        .skip = if (cli.skip_hugo) "disabled by --skip-hugo" else null,
-    }));
-    // ── Package managers (C++) ───────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("vcpkg", "package-manager", &.{"cpp"}, "python", vcpkgUpgradeArgs(gpa, config.vcpkg_skip_packages)), .{
-        .resource = "vcpkg",
-        .requires = "vcpkg",
-        .skip = if (cli.skip_vcpkg) "disabled by --skip-vcpkg" else null,
     }));
     // ── AI tools ─────────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("claude", "ai-tools", &.{ "ai", "claude" }, "python", pyCmd(gpa, claude_script)), .{
@@ -3403,14 +3213,10 @@ const fast_skip_ids = [_][]const u8{
     "chocolatey",       "wsl-distros",       "npm",                "pnpm",            "yarn",
     "bun",              "deno",              "rustup",             "cargo",           "go",
     "pip",              "pip-health",        "pipx",               "uv",              "uv-tools",
-    "poetry",           "composer",          "ruby-gems",          "flutter",         "juliaup",
-    "oh-my-posh",       "yt-dlp",            "volta",              "fnm",             "dotnet-tools",
-    "dotnet-workloads", "vscode-extensions", "powershell-modules", "powershell-help", "uv-python",
-    "ollama-models",    "vcpkg",             "conda",              "gcloud",          "az",
-    "aws",              "terraform",         "pulumi",             "kubectl",         "helm",
-    "hugo",             "opentofu",          "starship",           "zoxide",          "gitleaks",
-    "trivy",            "packer",            "nvm",                "devcontainer",    "cross-manager",
-    "mise-upgrade",     "tldr",
+    "poetry",           "composer",          "ruby-gems",          "oh-my-posh",      "yt-dlp",
+    "dotnet-tools",     "dotnet-workloads",  "vscode-extensions",  "powershell-modules", "powershell-help",
+    "uv-python",        "ollama-models",     "kubectl",            "starship",        "gitleaks",
+    "trivy",            "cross-manager",
 };
 
 // Matches PS1 UltraFastSkip
@@ -3420,13 +3226,11 @@ const ultra_skip_ids = [_][]const u8{
 };
 
 const minimal_profile_skip = [_][]const u8{
-    "vcpkg", "conda",    "gcloud",   "az",       "aws",   "terraform", "pulumi", "kubectl",      "helm",
-    "hugo",  "opentofu", "starship", "gitleaks", "trivy", "packer",    "nvm",    "devcontainer",
+    "kubectl", "starship", "gitleaks", "trivy",
 };
 
 const gaming_profile_skip = [_][]const u8{
-    "vcpkg", "conda",    "gcloud",   "az",    "aws",    "terraform", "pulumi",       "kubectl",            "helm",
-    "hugo",  "opentofu", "gitleaks", "trivy", "packer", "nvm",       "devcontainer", "powershell-modules",
+    "kubectl", "gitleaks", "trivy", "powershell-modules",
 };
 
 fn matchesAny(gpa: Allocator, task: Task, values: *const StringSet) bool {
@@ -4630,13 +4434,6 @@ fn changesFor(gpa: Allocator, r: TaskSummary) [][]const u8 {
                 const body = if (std.mem.startsWith(u8, trimmed, "- ")) trimmed[2..] else trimmed;
                 changes.append(gpa, fmtAlloc(gpa, "  {s}", .{body})) catch @panic("oom");
                 pkg_count += 1;
-            }
-        }
-    } else if (std.mem.eql(u8, r.id, "mise") or std.mem.eql(u8, r.id, "mise-upgrade")) {
-        for (lines) |line| {
-            if ((std.mem.indexOf(u8, line, "→") != null or std.mem.indexOf(u8, line, "->") != null) and hasDigit(line)) {
-                changes.append(gpa, std.mem.trim(u8, line, " \t")) catch @panic("oom");
-                if (changes.items.len >= 10) break;
             }
         }
     } else if (std.mem.eql(u8, r.id, "gh-extensions")) {
