@@ -2091,25 +2091,29 @@ const oh_my_posh_script =
 
 const vscode_extensions_script =
     \\
-    \\import shutil, subprocess, sys
+    \\import shutil, subprocess, sys, tempfile
     \\if not shutil.which("code"):
     \\    print("code not in PATH")
     \\    sys.exit(0)
     \\# The CLI manages extensions without a running editor; requiring Code.exe
     \\# only left otherwise-updatable extensions behind.
-    \\# Capture, don't inherit: code leaves helper processes holding the parent's
-    \\# stdout pipe, so the runner would wait on EOF forever.
-    \\try:
-    \\    r2 = subprocess.run(["code", "--update-extensions"], capture_output=True, text=True, errors="ignore", timeout=600)
-    \\except subprocess.TimeoutExpired:
-    \\    print("code --update-extensions timed out after 600s")
-    \\    sys.exit(1)
-    \\out = (r2.stdout or "").strip()
+    \\# Output goes to a temp file, not a pipe: code leaves helper processes holding
+    \\# inherited pipe handles, so a pipe read never reached EOF and hung the task.
+    \\with tempfile.TemporaryFile() as f:
+    \\    p = subprocess.Popen(["code", "--update-extensions"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+    \\    try:
+    \\        rc = p.wait(timeout=180)
+    \\    except subprocess.TimeoutExpired:
+    \\        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+    \\        print("code --update-extensions timed out after 180s")
+    \\        sys.exit(1)
+    \\    f.seek(0)
+    \\    out = f.read().decode("utf-8", "ignore").strip()
     \\if not out:
     \\    print("SKIPPED: code --update-extensions produced no output; nothing verified")
-    \\    sys.exit(r2.returncode)
+    \\    sys.exit(rc)
     \\print(out)
-    \\sys.exit(r2.returncode)
+    \\sys.exit(rc)
     \\
 ;
 
