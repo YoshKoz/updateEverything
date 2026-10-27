@@ -369,6 +369,7 @@ const Cli = struct {
     notify_apply: bool = false,
     allow_major: bool = false,
     pip_apply: bool = false,
+    pip_force: bool = false,
     allow_nightly: bool = false,
     /// Let a GitHub-release install stop processes that block it, for every tool.
     force_kill: bool = false,
@@ -437,6 +438,7 @@ const help_text =
     \\      --notify-apply          install mapped packages found by gh-notify-releases [default: report only]
     \\      --allow-major           let oh-my-posh cross a major version [default: report only]
     \\      --pip-apply             upgrade global pip packages [default: report only]
+    \\      --pip-force             like --pip-apply, ignoring new-conflict guard and dependents' version caps
     \\      --allow-nightly         install rolling-tag / CI-artifact GitHub tools [default: report only]
     \\      --force-kill            stop processes blocking winget/GitHub installs [default: off]
     \\      --bypass-protection
@@ -612,6 +614,8 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             cli.allow_major = true;
         } else if (std.mem.eql(u8, name, "pip-apply")) {
             cli.pip_apply = true;
+        } else if (std.mem.eql(u8, name, "pip-force")) {
+            cli.pip_force = true;
         } else if (std.mem.eql(u8, name, "allow-nightly")) {
             cli.allow_nightly = true;
         } else if (std.mem.eql(u8, name, "force-kill")) {
@@ -1683,7 +1687,7 @@ const pip_upgrade_post =
     \\except (OSError, ValueError):
     \\    known = set()
     \\new_conflicts = [l for l in current if l not in known]
-    \\if health.returncode != 0 and new_conflicts:
+    \\if health.returncode != 0 and new_conflicts and not PIP_FORCE:
     \\    print("SKIPPED: new pip dependency conflicts detected; upgrades deferred to preserve this shared environment")
     \\    for line in new_conflicts:
     \\        print("  " + line)
@@ -1718,7 +1722,7 @@ const pip_upgrade_post =
     \\for p in outdated:
     \\    blocker = next((f"{who} requires {req}" for who, req in bounds.get(canonicalize_name(p["name"]), [])
     \\                    if not req.specifier.contains(p["latest_version"], prereleases=True)), None)
-    \\    if blocker:
+    \\    if blocker and not PIP_FORCE:
     \\        print(f"held {p['name']} {p['version']} (latest {p['latest_version']}): {blocker}")
     \\    else:
     \\        pkgs.append(p["name"])
@@ -1755,9 +1759,9 @@ const pip_upgrade_post =
     \\
 ;
 
-fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8, state_dir: []const u8, apply: bool) []const []const u8 {
+fn pipUpgradeArgs(gpa: Allocator, skip_packages: []const []const u8, state_dir: []const u8, apply: bool, force: bool) []const []const u8 {
     const head = replaceAll(gpa, pip_upgrade_pre, "STATE_DIR_PLACEHOLDER", replaceAll(gpa, state_dir, "\"", ""));
-    const post = replaceAll(gpa, pip_upgrade_post, "PIP_APPLY", if (apply) "True" else "False");
+    const post = replaceAll(gpa, replaceAll(gpa, pip_upgrade_post, "PIP_APPLY", if (apply or force) "True" else "False"), "PIP_FORCE", if (force) "True" else "False");
     return pyCmd(gpa, concat(gpa, &.{ head, pyList(gpa, skip_packages, true), post }));
 }
 
@@ -2963,7 +2967,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
     add(&tasks, gpa, with(mk("bun", "javascript", &.{"node"}, "bun", &.{"upgrade"}), .{ .skip = node_skip }));
     add(&tasks, gpa, with(mk("deno", "javascript", &.{"node"}, "deno", &.{"upgrade"}), .{ .skip = node_skip }));
     // ── Python ───────────────────────────────────────────────────────────────
-    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli), cli.pip_apply)));
+    add(&tasks, gpa, mk("pip", "python", &.{"python"}, "python", pipUpgradeArgs(gpa, pip_skip.items, getStateDir(gpa, cli), cli.pip_apply, cli.pip_force)));
     add(&tasks, gpa, mk("python-venvs", "python", &.{ "python", "venv" }, "python", pyCmd(gpa, python_venvs_script)));
     add(&tasks, gpa, with(mk("pip-health", "python", &.{ "python", "health" }, "python", pipHealthArgs(gpa, config.pip_ignore_health_packages)), .{
         .skip = if (cli.skip_pip_health) "disabled by --skip-pip-health" else null,
