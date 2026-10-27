@@ -208,6 +208,25 @@ Describe 'ConvertFrom-WingetUpgradeOutput' {
     }
 }
 
+Describe 'Get-WingetInstalledLocation' {
+    It 'returns the unique existing install directory for a display name' {
+        $installRoot = Join-Path $TestDrive 'Battle.net'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'Battle.net'; InstallLocation = $installRoot } }
+
+        Get-WingetInstalledLocation -DisplayName 'Battle.net' | Should -Be $installRoot
+    }
+
+    It 'rejects ambiguous registry matches' {
+        Mock Get-ItemProperty {
+            [pscustomobject]@{ DisplayName = 'Battle.net'; InstallLocation = 'C:\Apps\Battle.net' }
+            [pscustomobject]@{ DisplayName = 'Battle.net'; InstallLocation = 'D:\Apps\Battle.net' }
+        }
+
+        Get-WingetInstalledLocation -DisplayName 'Battle.net' | Should -BeNullOrEmpty
+    }
+}
+
 # ── Test-NameMatch ────────────────────────────────────────────────────────────
 
 Describe 'Test-NameMatch' {

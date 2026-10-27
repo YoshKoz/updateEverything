@@ -954,6 +954,23 @@ function ConvertFrom-WingetUpgradeOutput
     return @($packages)
 }
 
+function Get-WingetInstalledLocation
+{
+    param([Parameter(Mandatory)][string]$DisplayName)
+
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $locations = @(Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq $DisplayName -and $_.InstallLocation } |
+        Select-Object -ExpandProperty InstallLocation -Unique)
+    if ($locations.Count -ne 1) { return $null }
+    if (-not (Test-Path -LiteralPath $locations[0] -PathType Container)) { return $null }
+    return $locations[0]
+}
+
 function Confirm-WingetScan
 {
     param([string[]]$Output)
@@ -1123,6 +1140,7 @@ function Get-UpdateTasks
         }
 
         $failed = [System.Collections.Generic.List[string]]::new()
+        $manual = [System.Collections.Generic.List[string]]::new()
         $unknownStateChanged = $false
         $upgradeIndex = 0
         foreach ($pkg in $toUpgrade)
@@ -1154,7 +1172,37 @@ function Get-UpdateTasks
             } catch
             {
                 $errMsg = $_.Exception.Message
-                if ($errMsg -match '-1978335189|No applicable upgrade found')
+                if ($errMsg -match '-1978335137|install location is required')
+                {
+                    $installLocation = Get-WingetInstalledLocation -DisplayName $pkg.Name
+                    if ($installLocation)
+                    {
+                        Write-Output "  Retrying $id with its registered install location: $installLocation"
+                        $installArgs = @('install', '--id', $id, '--exact', '--source', 'winget', '--include-unknown', '--force', '--location', $installLocation, '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+                        if ($UseSilentInstallers) { $installArgs += '--silent' }
+                        try
+                        {
+                            $null = Invoke-UpdateProcess -FilePath 'winget' -ArgumentList $installArgs -Retries 0 -TimeoutSec 300
+                            if ($pkg.IsUnknown)
+                            {
+                                $unknownState[$id] = [string]$pkg.Available
+                                $unknownStateChanged = $true
+                            }
+                            continue
+                        } catch
+                        {
+                            $errMsg = "location retry failed: $($_.Exception.Message)"
+                        }
+                    } else
+                    {
+                        $errMsg = "$errMsg; no unique registered install location was found"
+                    }
+                }
+                if ($errMsg -match '-1978334956|cannot be upgraded using WinGet')
+                {
+                    Write-Output "  MANUAL ACTION: $id must be updated using the publisher's method."
+                    [void]$manual.Add($id)
+                } elseif ($errMsg -match '-1978335189|No applicable upgrade found')
                 {
                     Write-Output "  Not applicable: $id (newer version exists but is not compatible with this system/architecture)"
                 } else
@@ -1180,8 +1228,16 @@ function Get-UpdateTasks
             }
         }
 
+        if ($manual.Count -gt 0)
+        { Write-Output "winget requires publisher updates: $($manual -join ', ')"
+        }
         if ($failed.Count -gt 0)
-        { Write-Output "winget left unchanged: $($failed -join ', ')"
+        {
+            Write-Output "winget left unchanged: $($failed -join ', ')"
+            Set-TaskStatus -Status 'Failed' -Reason "Winget left packages unchanged: $($failed -join ', ')"
+        } elseif ($manual.Count -gt 0)
+        {
+            Set-TaskStatus -Status 'Partial' -Reason "Winget packages require publisher updates: $($manual -join ', ')"
         }
     }
     $tasks.Add((New-UpdateTask -Name 'winget' -Category 'package-manager' -RequiresCommand 'winget' -TimeoutSec $WingetTimeoutSec -Script $wingetScript -Tags @('windows') -Resources @('winget'))) | Out-Null
@@ -2259,8 +2315,32 @@ fi
             } -Tags @('ruby'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'composer' -Category 'runtime' -RequiresCommand 'composer' -Disabled:$SkipComposer -DisabledReason 'disabled by -SkipComposer' -Script {
+                $iniPath = $null
+                $previousPhprc = $env:PHPRC
                 try
                 {
+                    $phpPath = Get-ToolCommandPath -Name 'php'
+                    if (-not $phpPath) { throw 'PHP executable was not found.' }
+                    $phpDir = Split-Path -Parent $phpPath
+                    $opensslDll = Join-Path $phpDir 'ext\php_openssl.dll'
+                    if (-not (Test-Path -LiteralPath $opensslDll)) { throw "OpenSSL extension not found: $opensslDll" }
+
+                    $loadedIniLine = & $phpPath --ini 2>$null | Where-Object { $_ -match '^\s*Loaded Configuration File:' } | Select-Object -First 1
+                    $loadedIni = if ($loadedIniLine) { ($loadedIniLine -split ':', 2)[1].Trim() } else { $null }
+                    $iniContent = if ($loadedIni -and $loadedIni -ne '(none)' -and (Test-Path -LiteralPath $loadedIni)) {
+                        Get-Content -LiteralPath $loadedIni -Raw
+                    } else {
+                        '[PHP]'
+                    }
+                    if ($iniContent -notmatch '(?im)^\s*extension_dir\s*=') {
+                        $iniContent += "`nextension_dir = `"$(Join-Path $phpDir 'ext')`""
+                    }
+                    if ($iniContent -notmatch '(?im)^\s*extension\s*=\s*[^;\r\n]*openssl') {
+                        $iniContent += "`nextension = php_openssl.dll"
+                    }
+                    $iniPath = Join-Path $env:TEMP ("update-everything-composer-$([guid]::NewGuid().ToString('N')).ini")
+                    Set-Content -LiteralPath $iniPath -Value $iniContent -Encoding utf8NoBOM
+                    $env:PHPRC = $iniPath
                     Invoke-UpdateProcess -FilePath 'composer' -ArgumentList @('self-update', '--no-interaction') -Retries 0 -TimeoutSec 120
                 } catch
                 {
@@ -2276,6 +2356,11 @@ fi
                         Set-TaskStatus -Status 'Warn' -Reason "composer self-update skipped: $errMsg"
                         Write-Output "composer self-update skipped: $errMsg"
                     }
+                } finally
+                {
+                    if ($null -eq $previousPhprc) { Remove-Item Env:PHPRC -ErrorAction SilentlyContinue }
+                    else { $env:PHPRC = $previousPhprc }
+                    if ($iniPath) { Remove-Item -LiteralPath $iniPath -Force -ErrorAction SilentlyContinue }
                 }
             } -Tags @('php'))) | Out-Null
 
@@ -2454,6 +2539,7 @@ fi
                         }
 
                         $failedModules = [System.Collections.Generic.List[string]]::new()
+                        $updatedModules = 0
                         $cmd = Get-Command Update-PSResource -ErrorAction SilentlyContinue
                         foreach ($resource in ($resources | Sort-Object Name -Unique))
                         {
@@ -2465,13 +2551,16 @@ fi
                             { $moduleArgs.TrustRepository = $true
                             }
                             try
-                            { Update-PSResource @moduleArgs | Out-String | Write-Output
+                            { Update-PSResource @moduleArgs | Out-String | Write-Output; $updatedModules++
                             } catch
                             { Write-Output "PowerShell module not updated: $($resource.Name) — $($_.Exception.Message)"; [void]$failedModules.Add($resource.Name)
                             }
                         }
                         if ($failedModules.Count -gt 0)
-                        { Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
+                        {
+                            Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
+                            $status = if ($updatedModules -gt 0) { 'Partial' } else { 'Failed' }
+                            Set-TaskStatus -Status $status -Reason "PowerShell modules not updated: $($failedModules -join ', ')"
                         }
                     } elseif (Get-Command Update-Module -ErrorAction SilentlyContinue)
                     {
@@ -2480,16 +2569,20 @@ fi
                         { Write-Output 'No installed PowerShellGet modules found.'; return
                         }
                         $failedModules = [System.Collections.Generic.List[string]]::new()
+                        $updatedModules = 0
                         $installedModules | ForEach-Object {
                             $moduleName = $_.Name
                             try
-                            { Update-Module -Name $moduleName -Force -ErrorAction Stop
+                            { Update-Module -Name $moduleName -Force -ErrorAction Stop; $updatedModules++
                             } catch
                             { Write-Output "PowerShell module not updated: ${moduleName} — $($_.Exception.Message)"; [void]$failedModules.Add($moduleName)
                             }
                         }
                         if ($failedModules.Count -gt 0)
-                        { Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
+                        {
+                            Write-Output "PowerShell modules left unchanged: $($failedModules -join ', ')"
+                            $status = if ($updatedModules -gt 0) { 'Partial' } else { 'Failed' }
+                            Set-TaskStatus -Status $status -Reason "PowerShell modules not updated: $($failedModules -join ', ')"
                         }
                     } else
                     {
@@ -2938,8 +3031,11 @@ fi
             } -Tags @('windows', 'system'))) | Out-Null
 
     $tasks.Add((New-UpdateTask -Name 'appx-repair' -Category 'system' -Script {
-                Write-Output 'Re-registering packaged app manifests for known-broken store apps...'
-                $appxPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+                $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                $scope = if ($isAdmin) { 'all users' } else { 'current user' }
+                Write-Output "Re-registering packaged app manifests for known-broken store apps ($scope)..."
+                $packages = if ($isAdmin) { Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue } else { Get-AppxPackage -ErrorAction SilentlyContinue }
+                $appxPackages = @($packages | Where-Object {
                     $_.SignatureKind -eq 'Store' -and -not $_.IsFramework -and $_.Name -match '(Microsoft\.WindowsStore|Microsoft\.Store|Microsoft\.WindowsCalculator|Microsoft\.Windows\.Photos|Microsoft\.Windows\.Camera|Microsoft\.People|Microsoft\.Office|Microsoft\.MSPaint|Microsoft\.ScreenSketch|Microsoft\.WindowsNotepad|Microsoft\.WindowsTerminal)'
                 })
                 $repaired = 0
@@ -3196,7 +3292,7 @@ function Start-UpdateTaskJob
     }
     $taskTimeoutSec = [int]$Task.TimeoutSec
     $helperFunctionDefinitions = @()
-    foreach ($functionName in @('ConvertFrom-WingetUpgradeOutput', 'Confirm-WingetScan', 'Confirm-WuaResult'))
+    foreach ($functionName in @('ConvertFrom-WingetUpgradeOutput', 'Get-WingetInstalledLocation', 'Confirm-WingetScan', 'Confirm-WuaResult'))
     {
         $functionCommand = Get-Command -Name $functionName -CommandType Function -ErrorAction SilentlyContinue
         if ($functionCommand)
