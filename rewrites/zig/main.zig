@@ -2742,20 +2742,20 @@ const composer_self_update_script =
     \\try {
     \\    $phpPath = (Get-Command php -ErrorAction Stop).Source
     \\    $phpDir = Split-Path -Parent $phpPath
-    \\    $opensslDll = Join-Path $phpDir 'ext\\php_openssl.dll'
-    \\    if (-not (Test-Path -LiteralPath $opensslDll)) { throw \"OpenSSL extension not found: $opensslDll\" }
-    \\    $loadedIniLine = & $phpPath --ini 2>$null | Where-Object { $_ -match '^\\s*Loaded Configuration File:' } | Select-Object -First 1
+    \\    $opensslDll = Join-Path $phpDir 'ext\php_openssl.dll'
+    \\    if (-not (Test-Path -LiteralPath $opensslDll)) { throw "OpenSSL extension not found: $opensslDll" }
+    \\    $loadedIniLine = & $phpPath --ini 2>$null | Where-Object { $_ -match '^\s*Loaded Configuration File:' } | Select-Object -First 1
     \\    $loadedIni = if ($loadedIniLine) { ($loadedIniLine -split ':', 2)[1].Trim() } else { $null }
     \\    $iniContent = if ($loadedIni -and $loadedIni -ne '(none)' -and (Test-Path -LiteralPath $loadedIni)) { Get-Content -LiteralPath $loadedIni -Raw } else { '[PHP]' }
-    \\    if ($iniContent -notmatch '(?im)^\\s*extension_dir\\s*=') { $iniContent += \"`nextension_dir = `\"$(Join-Path $phpDir 'ext')`\"\" }
-    \\    if ($iniContent -notmatch '(?im)^\\s*extension\\s*=\\s*[^;\\r\\n]*openssl') { $iniContent += \"`nextension = php_openssl.dll\" }
-    \\    $iniPath = Join-Path $env:TEMP (\"update-everything-composer-$([guid]::NewGuid().ToString('N')).ini\")
+    \\    if ($iniContent -notmatch '(?im)^\s*extension_dir\s*=') { $iniContent += "`nextension_dir = `"$(Join-Path $phpDir 'ext')`"" }
+    \\    if ($iniContent -notmatch '(?im)^\s*extension\s*=\s*[^;\r\n]*openssl') { $iniContent += "`nextension = php_openssl.dll" }
+    \\    $iniPath = Join-Path $env:TEMP ("update-everything-composer-$([guid]::NewGuid().ToString('N')).ini")
     \\    Set-Content -LiteralPath $iniPath -Value $iniContent -Encoding utf8NoBOM
     \\    $env:PHPRC = $iniPath
     \\    & composer self-update --no-interaction
     \\    exit $LASTEXITCODE
     \\} catch {
-    \\    Write-Output \"composer self-update failed: $($_.Exception.Message)\"
+    \\    Write-Output "composer self-update failed: $($_.Exception.Message)"
     \\    exit 1
     \\} finally {
     \\    if ($null -eq $previousPhprc) { Remove-Item Env:PHPRC -ErrorAction SilentlyContinue } else { $env:PHPRC = $previousPhprc }
