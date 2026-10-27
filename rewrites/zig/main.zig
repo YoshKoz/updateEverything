@@ -1076,7 +1076,6 @@ const gitlab_artifact_body =
     \\Write-Host "$repo  local=$local  latest=$latest"
     \\if ($local -eq $latest) { Write-Host 'up to date'; exit 0 }
     \\if ($reportOnly) { Write-Host "update available: $local -> $latest  (report only; use --allow-nightly)"; exit 0 }
-
     \\
     \\$enc = [uri]::EscapeDataString($job)
     \\$url = "https://gitlab.com/api/v4/projects/$proj/jobs/artifacts/$ref/download?job=$enc"
@@ -1211,7 +1210,6 @@ const github_release_body =
     \\  Write-Host "up to date"; exit 0
     \\}
     \\if ($reportOnly) { Write-Host "update available: $local -> $latest  (report only; use --allow-nightly)"; exit 0 }
-
     \\
     \\$dl = $rel.assets | Where-Object { $_.name -match $assetRe } | Select-Object -First 1
     \\if (-not $dl) { Write-Host "no asset matched /$assetRe/"; exit 1 }
@@ -1519,7 +1517,7 @@ const winget_per_package_body =
     \\# package is already installed to; give up if the registry does not identify one.
     \\$needsLocation = -1978335137
     \\# The de-elevated pass cannot touch machine-scope packages; the elevated pass covers them.
-    \\$manual = @(-1978335226)
+    \\$manual = @(-1978335226, -1978334956)
     \\$ok = @(); $forced = @(); $skipped = @(); $needsManual = @(); $failed = @()
     \\foreach ($pkg in $pkgs) {
     \\    $id = $pkg.Id
@@ -2716,10 +2714,12 @@ fn windowsFeaturesScript(gpa: Allocator, features: []const []const u8) []const u
     });
 }
 
-const appx_repair_script = "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){" ++
-    "Write-Output 'AppX repair skipped: requires elevation (Get-AppxPackage -AllUsers needs admin).';return};" ++
+const appx_repair_script = "$isAdmin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);" ++
+    "$scope=if($isAdmin){'all users'}else{'current user'};" ++
+    "Write-Output \"Re-registering packaged app manifests for known-broken store apps ($scope)...\";" ++
     "$ErrorActionPreference='Stop';" ++
-    "$pkgs=@(Get-AppxPackage -AllUsers|" ++
+    "$packages=if($isAdmin){Get-AppxPackage -AllUsers -EA SilentlyContinue}else{Get-AppxPackage -EA SilentlyContinue};" ++
+    "$pkgs=@($packages|" ++
     "Where-Object{$_.SignatureKind-eq 'Store'-and-not $_.IsFramework-and" ++
     "$_.Name-match '(Microsoft\\.WindowsStore|Microsoft\\.Store|Microsoft\\.WindowsCalculator|" ++
     "Microsoft\\.Windows\\.Photos|Microsoft\\.Windows\\.Camera|Microsoft\\.People|" ++
@@ -2734,6 +2734,35 @@ const appx_repair_script = "if(-not ([Security.Principal.WindowsPrincipal][Secur
     "else{Write-Output \"AppX repair failed for $($p.Name): $($_.Exception.Message)\";$failed++}}};" ++
     "Write-Output \"AppX re-registration: $repaired package(s) re-registered.\";" ++
     "if($failed){exit 1}";
+
+const composer_self_update_script =
+    \\
+    \\$iniPath = $null
+    \\$previousPhprc = $env:PHPRC
+    \\try {
+    \\    $phpPath = (Get-Command php -ErrorAction Stop).Source
+    \\    $phpDir = Split-Path -Parent $phpPath
+    \\    $opensslDll = Join-Path $phpDir 'ext\\php_openssl.dll'
+    \\    if (-not (Test-Path -LiteralPath $opensslDll)) { throw \"OpenSSL extension not found: $opensslDll\" }
+    \\    $loadedIniLine = & $phpPath --ini 2>$null | Where-Object { $_ -match '^\\s*Loaded Configuration File:' } | Select-Object -First 1
+    \\    $loadedIni = if ($loadedIniLine) { ($loadedIniLine -split ':', 2)[1].Trim() } else { $null }
+    \\    $iniContent = if ($loadedIni -and $loadedIni -ne '(none)' -and (Test-Path -LiteralPath $loadedIni)) { Get-Content -LiteralPath $loadedIni -Raw } else { '[PHP]' }
+    \\    if ($iniContent -notmatch '(?im)^\\s*extension_dir\\s*=') { $iniContent += \"`nextension_dir = `\"$(Join-Path $phpDir 'ext')`\"\" }
+    \\    if ($iniContent -notmatch '(?im)^\\s*extension\\s*=\\s*[^;\\r\\n]*openssl') { $iniContent += \"`nextension = php_openssl.dll\" }
+    \\    $iniPath = Join-Path $env:TEMP (\"update-everything-composer-$([guid]::NewGuid().ToString('N')).ini\")
+    \\    Set-Content -LiteralPath $iniPath -Value $iniContent -Encoding utf8NoBOM
+    \\    $env:PHPRC = $iniPath
+    \\    & composer self-update --no-interaction
+    \\    exit $LASTEXITCODE
+    \\} catch {
+    \\    Write-Output \"composer self-update failed: $($_.Exception.Message)\"
+    \\    exit 1
+    \\} finally {
+    \\    if ($null -eq $previousPhprc) { Remove-Item Env:PHPRC -ErrorAction SilentlyContinue } else { $env:PHPRC = $previousPhprc }
+    \\    if ($iniPath) { Remove-Item -LiteralPath $iniPath -Force -ErrorAction SilentlyContinue }
+    \\}
+    \\
+;
 
 const chocolatey_pre = "if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Write-Output 'Chocolatey skipped: requires elevation (run elevated to upgrade choco packages).';exit 0}; & choco upgrade all -y --no-progress";
 
@@ -2839,6 +2868,7 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .timeout_sec = cli.winget_timeout_sec,
         .codes = &winget_ok_codes,
         .depends_on = &.{ "winget-pin-skip", "winget-git" },
+        .no_retry_patterns = &.{"-1978334956"},
     }));
     // A single per-package pass is authoritative; duplicate passes can replay stale entries.
     // Elevated winget refuses to upgrade user-scope (zip/portable) packages, so a
@@ -2980,7 +3010,8 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .skip = if (cli.skip_go) "disabled by --skip-go" else null,
     }));
     // ── PHP ──────────────────────────────────────────────────────────────────
-    add(&tasks, gpa, with(mk("composer", "runtime", &.{"php"}, "composer", &.{ "self-update", "--no-interaction" }), .{
+    add(&tasks, gpa, with(mk("composer", "runtime", &.{"php"}, "pwsh", pwshCmd(gpa, composer_self_update_script)), .{
+        .requires = "composer",
         .skip = if (cli.skip_composer) "disabled by --skip-composer" else null,
     }));
     // ── Ruby ─────────────────────────────────────────────────────────────────
@@ -3210,13 +3241,13 @@ test "uv-tools waits for the uv self-update" {
 
 // Matches PS1 FastModeSkip
 const fast_skip_ids = [_][]const u8{
-    "chocolatey",       "wsl-distros",       "npm",                "pnpm",            "yarn",
-    "bun",              "deno",              "rustup",             "cargo",           "go",
-    "pip",              "pip-health",        "pipx",               "uv",              "uv-tools",
-    "poetry",           "composer",          "ruby-gems",          "oh-my-posh",      "yt-dlp",
-    "dotnet-tools",     "dotnet-workloads",  "vscode-extensions",  "powershell-modules", "powershell-help",
-    "uv-python",        "ollama-models",     "kubectl",            "starship",        "gitleaks",
-    "trivy",            "cross-manager",
+    "chocolatey",   "wsl-distros",      "npm",               "pnpm",               "yarn",
+    "bun",          "deno",             "rustup",            "cargo",              "go",
+    "pip",          "pip-health",       "pipx",              "uv",                 "uv-tools",
+    "poetry",       "composer",         "ruby-gems",         "oh-my-posh",         "yt-dlp",
+    "dotnet-tools", "dotnet-workloads", "vscode-extensions", "powershell-modules", "powershell-help",
+    "uv-python",    "ollama-models",    "kubectl",           "starship",           "gitleaks",
+    "trivy",        "cross-manager",
 };
 
 // Matches PS1 UltraFastSkip
@@ -4716,7 +4747,7 @@ test "WSL enumeration errors are never used as distro names" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "WSL enumeration failed") != null);
 }
 
-test "user-scope winget fails before launch or wait when scratch creation fails" {
+test "user-scope winget stops after scratch creation fails" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -4727,7 +4758,11 @@ test "user-scope winget fails before launch or wait when scratch creation fails"
         \\function Start-Sleep { throw 'incorrect wait after failure' }
         \\
     ;
-    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, wingetUserscopeScript(gpa, &.{}, false) }));
+    const script = wingetUserscopeScript(gpa, &.{}, false);
+    const admin_guard = "if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Output 'Not elevated: user-scope packages already covered by main winget pass.'; exit 0 }\n";
+    const guard_at = std.mem.indexOf(u8, script, admin_guard) orelse return error.AdminGuardNotFound;
+    const script_without_guard = concat(gpa, &.{ script[0..guard_at], script[guard_at + admin_guard.len ..] });
+    const result = try testPowerShell(gpa, concat(gpa, &.{ fixture, script_without_guard }));
     try std.testing.expect(result.term == .exited and result.term.exited != 0);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "incorrect launch") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "incorrect wait") == null);
