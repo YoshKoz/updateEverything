@@ -78,6 +78,7 @@
   </PropertyGroup>
 
   <Target Name="BuildDashboardBackend" BeforeTargets="PrepareForBuild">
-    <Exec Command="cargo build --release --manifest-path &quot;$(MSBuildProjectDirectory)\ai-token-dashboard\Cargo.toml&quot;" />
+    <!-- VS Code and Dev Kit launch without ~/.cargo/bin on PATH, so cargo exits 9009 during project load. -->
+    <Exec Command="set &quot;PATH=%USERPROFILE%\.cargo\bin;%PATH%&quot; &amp;&amp; cargo build --release --manifest-path &quot;$(MSBuildProjectDirectory)\ai-token-dashboard\Cargo.toml&quot;" />
   </Target>
 </Project>
