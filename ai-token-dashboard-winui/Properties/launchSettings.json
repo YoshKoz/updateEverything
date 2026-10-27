@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AiTokenDashboard (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "AiTokenDashboard (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

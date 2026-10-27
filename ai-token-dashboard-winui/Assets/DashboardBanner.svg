@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="300" viewBox="0 0 620 300">
+  <rect width="620" height="300" fill="#10161B"/>
+  <path d="M0 274H620M0 282H620M0 290H620" stroke="#26323A" stroke-width="1" opacity="0.55"/>
+  <rect x="34" y="34" width="224" height="224" rx="44" fill="#141E24" stroke="#26323A" stroke-width="2"/>
+  <circle cx="117" cy="141" r="51" fill="#182128" stroke="#62D6C7" stroke-width="10"/>
+  <path d="M99 123h36M117 123v39" fill="none" stroke="#E5F5F2" stroke-width="11" stroke-linecap="round"/>
+  <path d="M185 195v-27M209 195v-52M233 195v-76" fill="none" stroke="#E6B85C" stroke-width="14" stroke-linecap="round"/>
+  <path d="M178 211h62" fill="none" stroke="#52616A" stroke-width="4" stroke-linecap="round"/>
+  <path d="M221 80v20M211 90h20" fill="none" stroke="#E6B85C" stroke-width="4" stroke-linecap="round"/>
+  <text x="294" y="88" fill="#62D6C7" font-family="Segoe UI, sans-serif" font-size="13" font-weight="700" letter-spacing="2.5">USAGE / COST / PLANS</text>
+  <text x="290" y="145" fill="#F2F5F4" font-family="Segoe UI Variable Display, Segoe UI, sans-serif" font-size="35" font-weight="650">AI Token</text>
+  <text x="290" y="184" fill="#F2F5F4" font-family="Segoe UI Variable Display, Segoe UI, sans-serif" font-size="35" font-weight="650">Dashboard</text>
+  <text x="292" y="220" fill="#91A0AC" font-family="Segoe UI, sans-serif" font-size="15">Usage and subscription activity in one view</text>
+  <rect x="292" y="244" width="190" height="5" rx="2.5" fill="#26323A"/>
+  <rect x="292" y="244" width="124" height="5" rx="2.5" fill="#62D6C7"/>
+  <circle cx="500" cy="246.5" r="4" fill="#E6B85C"/>
+</svg>
