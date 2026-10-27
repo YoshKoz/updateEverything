@@ -1,14 +1,10 @@
 {
-  "WingetSkipPackages": [
-    "charmbracelet.crush",
-    "Microsoft.Sysinternals.ProcessMonitor",
-    "SDCC.SDCC",
-    "TheStellaTeam.Stella",
-    "VB-Audio.Voicemeeter.Banana"
-  ],
+  "WingetSkipPackages": [],
   "SkipManagers": [],
   "PipSkipPackages": [
-    "sglang"
+    "sglang",
+    "mcp",
+    "anthropic"
   ],
   "GithubNotificationIgnore": [
     "jellyfin/jellyfin",
@@ -58,7 +54,7 @@
     },
     {
       "Repo": "official-stockfish/Stockfish",
-      "Covered": "winget task"
+      "Covered": "GithubTools task"
     },
     {
       "Repo": "microsoft/WSL",
@@ -82,6 +78,13 @@
     "mega-py"
   ],
   "GithubTools": [
+    {
+      "Repo": "official-stockfish/Stockfish",
+      "InstallDir": "C:\\Tools\\stockfish",
+      "AssetRegex": "^stockfish-windows-x86-64-universal\\.zip$",
+      "TagRegex": "^stockfish-dev-\\d{8}-[0-9a-f]+$",
+      "VersionScheme": "date"
+    },
     {
       "Repo": "ikemen-engine/Ikemen-GO",
       "Tag": "nightly",
