@@ -3056,6 +3056,11 @@ fn taskTable(gpa: Allocator, config: Config, cli: Cli) []Task {
         .timeout_sec = 900,
         .skip = if (cli.skip_vscode_extensions) "disabled by --skip-vscode-extensions" else null,
     }));
+    add(&tasks, gpa, with(mk("cursor-extensions", "editor", &.{"cursor"}, "python", pyCmd(gpa, replaceAll(gpa, replaceAll(gpa, replaceAll(gpa, vscode_extensions_script, "[\"code\",", "[shutil.which(\"cursor\"),"), "\"code\"", "\"cursor\""), "code --update-extensions", "cursor --update-extensions"))), .{
+        .requires = "cursor",
+        .timeout_sec = 900,
+        .skip = if (cli.skip_vscode_extensions) "disabled by --skip-vscode-extensions" else null,
+    }));
     // ── Dev tools ────────────────────────────────────────────────────────────
     add(&tasks, gpa, with(mk("git-lfs", "dev-tools", &.{"git"}, "git", &.{ "lfs", "install", "--skip-repo" }), .{
         .requires = "git-lfs",
@@ -3247,7 +3252,7 @@ const fast_skip_ids = [_][]const u8{
     "poetry",       "composer",         "ruby-gems",         "oh-my-posh",         "yt-dlp",
     "dotnet-tools", "dotnet-workloads", "vscode-extensions", "powershell-modules", "powershell-help",
     "uv-python",    "ollama-models",    "kubectl",           "starship",           "gitleaks",
-    "trivy",        "cross-manager",
+    "trivy",        "cross-manager",    "cursor-extensions",
 };
 
 // Matches PS1 UltraFastSkip
