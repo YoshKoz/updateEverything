@@ -17,7 +17,13 @@
     "ast-grep/ast-grep",
     "sharkdp/hyperfine",
     "twpayne/chezmoi",
-    "mozilla/sccache"
+    "mozilla/sccache",
+    "aristocratos/btop",
+    "casey/just",
+    "files-community/Files",
+    "NVIDIA/cuda-rust",
+    "elishacloud/dxwrapper",
+    "ikemen-engine/Ikemen-GO"
   ],
   "GithubNotificationPackages": [
     {
@@ -67,6 +73,26 @@
     {
       "Repo": "Flow-Launcher/Flow.Launcher",
       "Covered": "self-updating"
+    },
+    {
+      "Repo": "beeradmoore/dlss-swapper",
+      "Winget": "beeradmoore.dlss-swapper"
+    },
+    {
+      "Repo": "kovidgoyal/calibre",
+      "Winget": "calibre.calibre"
+    },
+    {
+      "Repo": "mifi/lossless-cut",
+      "Winget": "ch.LosslessCut"
+    },
+    {
+      "Repo": "starship/starship",
+      "Winget": "Starship.Starship"
+    },
+    {
+      "Repo": "ducaale/xh",
+      "Covered": "scoop task"
     }
   ],
   "NpmSkipPackages": [
