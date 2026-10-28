@@ -1484,12 +1484,24 @@ const winget_per_package_body =
     \\        $len = [Math]::Min($verStart - $idStart, $line.Length - $idStart)
     \\        $id = $line.Substring($idStart, $len).Trim()
     \\        $name = $line.Substring(0, $idStart).Trim()
+    \\        $availStart = $lines[$hdr].IndexOf('Available')
+    \\        $srcStart = $lines[$hdr].IndexOf('Source')
+    \\        $installed = $line.Substring($verStart, [Math]::Min($availStart - $verStart, $line.Length - $verStart)).Trim()
+    \\        $avail = if ($line.Length -gt $availStart) { $line.Substring($availStart, [Math]::Min($srcStart - $availStart, $line.Length - $availStart)).Trim() } else { '' }
     \\        if ($name -and $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*\.[A-Za-z0-9][A-Za-z0-9._+-]*$' -and $id -notin $skip) {
-    \\            $pkgs += [pscustomobject]@{ Id = $id; Name = $name }
+    \\            $pkgs += [pscustomobject]@{ Id = $id; Name = $name; Installed = $installed; Avail = $avail }
     \\        }
     \\    }
     \\}
-    \\$pkgs = @($pkgs | Sort-Object Id -Unique)
+    \\# Phantom upgrades: winget cannot read an installed version ("Unknown"), or still lists a
+    \\# version we already installed (stale registry metadata). Reinstalling those every run
+    \\# changes nothing, so skip them; a newer Available version is attempted again.
+    \\$appliedFile = Join-Path $env:LOCALAPPDATA 'UpdateEverything\winget-applied.json'
+    \\$applied = @{}
+    \\if (Test-Path $appliedFile) { (Get-Content -Raw $appliedFile | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $applied[$_.Name] = [string]$_.Value } }
+    \\$phantom = @($pkgs | Where-Object { $_.Installed -eq 'Unknown' -or $applied[$_.Id] -eq $_.Avail })
+    \\foreach ($p in $phantom) { Write-Output ("no real upgrade (unknown/already applied {0}): {1}" -f $p.Avail, $p.Id) }
+    \\$pkgs = @($pkgs | Where-Object { $_.Id -notin $phantom.Id } | Sort-Object Id -Unique)
     \\Write-Output ("winget: {0} package(s) to upgrade" -f $pkgs.Count)
     \\if ($pkgs.Count -eq 0) { Write-Output 'SKIPPED: winget: no eligible packages after filtering'; exit 0 }
     \\$running = @(Get-CimInstance Win32_Process -ErrorAction Stop)
@@ -1579,6 +1591,8 @@ const winget_per_package_body =
     \\        else { $failed += ("{0} ({1}, reinstall {2})" -f $id, $code, $code3) }
     \\    }
     \\}
+    \\foreach ($id in @($ok) + @($forced)) { $applied[$id] = [string]($pkgs | Where-Object Id -eq $id | Select-Object -First 1).Avail }
+    \\if (($ok.Count + $forced.Count) -gt 0) { New-Item -ItemType Directory -Force (Split-Path $appliedFile) | Out-Null; $applied | ConvertTo-Json | Set-Content $appliedFile }
     \\Write-Output ("upgraded ({0}): {1}" -f $ok.Count, ($ok -join ', '))
     \\Write-Output ("upgraded via forced install ({0}): {1}" -f $forced.Count, ($forced -join ', '))
     \\Write-Output ("not applicable ({0}): {1}" -f $skipped.Count, ($skipped -join ', '))
