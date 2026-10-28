@@ -1,5 +1,5 @@
 {
-  "WingetSkipPackages": [],
+  "WingetSkipPackages": ["MSYS2.MSYS2"],
   "SkipManagers": [],
   "PipSkipPackages": [
     "sglang",
