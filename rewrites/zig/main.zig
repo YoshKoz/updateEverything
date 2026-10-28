@@ -1462,31 +1462,31 @@ const winget_per_package_body =
     \\$scanCode = $LASTEXITCODE
     \\if ($scanCode -ne 0 -and $scanCode -notin @(-1978335189, -1978335212)) { Write-Output $raw.Trim(); Write-Output "winget: scan failed (exit $scanCode)"; exit 1 }
     \\$lines = $raw -split "`r?`n"
-    \\$hdr = $null
-    \\for ($i = 0; $i -lt $lines.Count; $i++) {
-    \\    if ($lines[$i] -match '^Name\s+Id\s+Version') { $hdr = $i; break }
-    \\}
-    \\if ($null -eq $hdr) {
+    \\# A second table ("require explicit targeting", e.g. Discord) follows the first; scan both.
+    \\$hdrs = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^Name\s+Id\s+Version') { $i } })
+    \\if ($hdrs.Count -eq 0) {
     \\    Write-Output $raw.Trim()
     \\    if ($raw -match 'No installed package found matching input criteria|No applicable upgrade found|No available upgrade found') { Write-Output 'SKIPPED: winget: no eligible upgrades; pinned packages remain excluded'; exit 0 }
     \\    Write-Output 'winget: unrecognized upgrade output; cannot determine available upgrades'; exit 1
     \\}
-    \\$idStart = $lines[$hdr].IndexOf('Id')
-    \\$verStart = $lines[$hdr].IndexOf('Version')
     \\$pkgs = @()
-    \\for ($i = $hdr + 1; $i -lt $lines.Count; $i++) {
-    \\    $line = $lines[$i]
-    \\    if ($line -match '^-{3,}$') { continue }
-    \\    if ([string]::IsNullOrWhiteSpace($line)) { break }
-    \\    # Trailer prose ("N upgrades available.", "The following packages ...") sits at the
-    \\    # same offsets as the table, so slicing it yields junk ids like "le.".
-    \\    if ($line -match '^\d+ (upgrades|package)' -or $line -match '^The following') { break }
-    \\    if ($line.Length -le $idStart) { continue }
-    \\    $len = [Math]::Min($verStart - $idStart, $line.Length - $idStart)
-    \\    $id = $line.Substring($idStart, $len).Trim()
-    \\    $name = $line.Substring(0, $idStart).Trim()
-    \\    if ($name -and $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*\.[A-Za-z0-9][A-Za-z0-9._+-]*$' -and $id -notin $skip) {
-    \\        $pkgs += [pscustomobject]@{ Id = $id; Name = $name }
+    \\foreach ($hdr in $hdrs) {
+    \\    $idStart = $lines[$hdr].IndexOf('Id')
+    \\    $verStart = $lines[$hdr].IndexOf('Version')
+    \\    for ($i = $hdr + 1; $i -lt $lines.Count; $i++) {
+    \\        $line = $lines[$i]
+    \\        if ($line -match '^-{3,}$') { continue }
+    \\        if ([string]::IsNullOrWhiteSpace($line)) { break }
+    \\        # Trailer prose ("N upgrades available.", "The following packages ...") sits at the
+    \\        # same offsets as the table, so slicing it yields junk ids like "le.".
+    \\        if ($line -match '^\d+ (upgrades|package)' -or $line -match '^The following') { break }
+    \\        if ($line.Length -le $idStart) { continue }
+    \\        $len = [Math]::Min($verStart - $idStart, $line.Length - $idStart)
+    \\        $id = $line.Substring($idStart, $len).Trim()
+    \\        $name = $line.Substring(0, $idStart).Trim()
+    \\        if ($name -and $id -match '^[A-Za-z0-9][A-Za-z0-9._+-]*\.[A-Za-z0-9][A-Za-z0-9._+-]*$' -and $id -notin $skip) {
+    \\            $pkgs += [pscustomobject]@{ Id = $id; Name = $name }
+    \\        }
     \\    }
     \\}
     \\$pkgs = @($pkgs | Sort-Object Id -Unique)
