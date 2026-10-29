@@ -2116,7 +2116,8 @@ const vscode_extensions_script =
     \\# Output goes to a temp file, not a pipe: code leaves helper processes holding
     \\# inherited pipe handles, so a pipe read never reached EOF and hung the task.
     \\with tempfile.TemporaryFile() as f:
-    \\    p = subprocess.Popen(["code", "--update-extensions"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+    \\    # Bare "code" resolves to the GUI Code.exe (its dir is on PATH), which never exits.
+    \\    p = subprocess.Popen([shutil.which("code"), "--update-extensions"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
     \\    try:
     \\        rc = p.wait(timeout=180)
     \\    except subprocess.TimeoutExpired:
@@ -2129,6 +2130,8 @@ const vscode_extensions_script =
     \\    print("SKIPPED: code --update-extensions produced no output; nothing verified")
     \\    sys.exit(rc)
     \\print(out)
+    \\if "No extension to update" in out:
+    \\    sys.exit(0)
     \\sys.exit(rc)
     \\
 ;
