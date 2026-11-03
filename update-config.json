@@ -1,5 +1,5 @@
 {
-  "WingetSkipPackages": ["MSYS2.MSYS2"],
+  "WingetSkipPackages": ["MSYS2.MSYS2", "Microsoft.VisualStudio.2022.BuildTools"],
   "SkipManagers": [],
   "PipSkipPackages": [
     "sglang",

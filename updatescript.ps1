@@ -1916,6 +1916,11 @@ fi
 
     $pipScript = {
         param([string[]]$SkipPackages)
+        & python -m pip --version *> $null
+        if ($LASTEXITCODE -ne 0)
+        { Write-Output 'pip install is broken; restoring via ensurepip'
+            Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'ensurepip', '--upgrade') -Retries 1
+        }
         Invoke-UpdateProcess -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '--upgrade', 'pip') -Retries 1
 
         function Normalize-PipName { param([string]$n) ($n.ToLowerInvariant() -replace '[-_.]', '-') }

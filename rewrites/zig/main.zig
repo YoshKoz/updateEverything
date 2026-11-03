@@ -1685,6 +1685,9 @@ const pip_upgrade_pre =
     \\if os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")):
     \\    print("pip: externally managed environment (PEP 668); skipping")
     \\    sys.exit(0)
+    \\if subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True).returncode != 0:
+    \\    print("pip: install is broken; restoring via ensurepip")
+    \\    subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
     \\BASELINE_DIR = r"STATE_DIR_PLACEHOLDER"
     \\skip = {
 ;
