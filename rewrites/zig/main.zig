@@ -4146,6 +4146,15 @@ fn countStatus(results: []const TaskSummary, status: []const u8) usize {
     return count;
 }
 
+/// The SKIPPED: line can sit anywhere in the tail; tail[0] is often unrelated output.
+fn skipReason(tail: []const []const u8) []const u8 {
+    for (tail) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, skip_prefix)) return std.mem.trim(u8, trimmed[skip_prefix.len..], " \t\r");
+    }
+    return if (tail.len > 0) tail[0] else "";
+}
+
 fn printSummary(gpa: Allocator, io: Io, results: []const TaskSummary, total_duration_ms: u64) void {
     p(io, "\n", .{});
     p(io, "{s}{s}  {s: <26} {s: <12} {s: <8} Exit{s}\n", .{ col(A.bold), G.summary, "Task", "Status", "Time(s)", col(A.reset) });
@@ -4164,7 +4173,7 @@ fn printSummary(gpa: Allocator, io: Io, results: []const TaskSummary, total_dura
     var other: std.ArrayList([]const u8) = .empty;
     for (results) |r| {
         if (!std.mem.eql(u8, r.status, "Skipped")) continue;
-        const reason = if (r.output_tail.len > 0) r.output_tail[0] else "";
+        const reason = skipReason(r.output_tail);
         if (std.mem.startsWith(u8, reason, "missing command: ")) {
             missing.append(gpa, r.id) catch @panic("oom");
         } else {
@@ -4174,9 +4183,20 @@ fn printSummary(gpa: Allocator, io: Io, results: []const TaskSummary, total_dura
     if (missing.items.len > 0) p(io, "{s}skipped, tool not installed: {s}{s}\n", .{ col(A.grey), std.mem.join(gpa, ", ", missing.items) catch @panic("oom"), col(A.reset) });
     if (other.items.len > 0) p(io, "{s}skipped, other: {s}{s}\n", .{ col(A.grey), std.mem.join(gpa, ", ", other.items) catch @panic("oom"), col(A.reset) });
 
+    for (results) |r| {
+        if (!std.mem.eql(u8, r.status, "Failed") and !std.mem.eql(u8, r.status, "TimedOut")) continue;
+        var i = r.output_tail.len;
+        while (i > 0) : (i -= 1) {
+            const line = std.mem.trim(u8, r.output_tail[i - 1], " \t\r");
+            if (line.len == 0) continue;
+            p(io, "{s}{s} {s}: {s}{s}\n", .{ col(A.red), r.status, r.id, line, col(A.reset) });
+            break;
+        }
+    }
+
     const failed = countStatus(results, "Failed");
     const timed_out = countStatus(results, "TimedOut");
-    const tone = if (failed + timed_out > 0) col(A.red) else col(A.green);
+    const tone =if (failed + timed_out > 0) col(A.red) else col(A.green);
     p(io, "{s}{s} done{s}  total={d}  {s}succeeded={d}{s}  {s}failed={d}{s}  {s}timed-out={d}{s}  {s}skipped={d}  dry={d}{s}  duration={d:.1}s\n", .{
         tone,
         G.gear,
