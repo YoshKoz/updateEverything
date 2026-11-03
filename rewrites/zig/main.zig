@@ -364,13 +364,13 @@ const Cli = struct {
     update_ollama_models: bool = false,
     update_powershell_help: bool = false,
     update_github_tools: bool = true,
-    /// gh-notify-releases reports by default; installing from a release notification
-    /// is opt-in because the repo->package mapping can only ever be a guess.
-    notify_apply: bool = false,
+    /// gh-notify-releases installs mapped packages by default; --no-notify-apply reports
+    /// only, since the repo->package mapping can only ever be a guess.
+    notify_apply: bool = true,
     allow_major: bool = false,
     pip_apply: bool = false,
     pip_force: bool = false,
-    allow_nightly: bool = false,
+    allow_nightly: bool = true,
     /// Let a GitHub-release install stop processes that block it, for every tool.
     force_kill: bool = false,
     bypass_protection: bool = false,
@@ -435,11 +435,13 @@ const help_text =
     \\      --update-ollama-models
     \\      --update-powershell-help
     \\      --update-github-tools   [default: on]
-    \\      --notify-apply          install mapped packages found by gh-notify-releases [default: report only]
+    \\      --notify-apply          install mapped packages found by gh-notify-releases [default: on]
+    \\      --no-notify-apply       only report those packages
+    \\      --no-allow-nightly      only report rolling-tag / CI-artifact GitHub tools
     \\      --allow-major           let oh-my-posh cross a major version [default: report only]
     \\      --pip-apply             upgrade global pip packages [default: report only]
     \\      --pip-force             like --pip-apply, ignoring new-conflict guard and dependents' version caps
-    \\      --allow-nightly         install rolling-tag / CI-artifact GitHub tools [default: report only]
+    \\      --allow-nightly         install rolling-tag / CI-artifact GitHub tools [default: on]
     \\      --force-kill            stop processes blocking winget/GitHub installs [default: off]
     \\      --bypass-protection
     \\      --winget-timeout-sec <WINGET_TIMEOUT_SEC>   [default: 600]
@@ -610,6 +612,10 @@ fn parseCli(gpa: Allocator, io: Io, argv: []const [:0]const u8) Cli {
             cli.update_github_tools = true;
         } else if (std.mem.eql(u8, name, "notify-apply")) {
             cli.notify_apply = true;
+        } else if (std.mem.eql(u8, name, "no-notify-apply")) {
+            cli.notify_apply = false;
+        } else if (std.mem.eql(u8, name, "no-allow-nightly")) {
+            cli.allow_nightly = false;
         } else if (std.mem.eql(u8, name, "allow-major")) {
             cli.allow_major = true;
         } else if (std.mem.eql(u8, name, "pip-apply")) {
